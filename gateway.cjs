@@ -50,7 +50,7 @@ const HEALTHY_THRESHOLD = 60 * 1000;
 
 // ── Access Control ──────────────────────────────────────────────────
 
-function defaultAccess() { return { allowFrom: [], allowGroups: false, allowedGroups: [], requireAllowFromInGroups: false }; }
+function defaultAccess() { return { allowFrom: [], allowGroups: false, allowedGroups: [], requireAllowFromInGroups: false, groupTrigger: "" }; }
 function loadAccess() {
   try { return { ...defaultAccess(), ...JSON.parse(fs.readFileSync(ACCESS_FILE, "utf8")) }; }
   catch (err) { if (err.code === "ENOENT") return defaultAccess(); try { fs.renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`); } catch {} return defaultAccess(); }
@@ -58,7 +58,7 @@ function loadAccess() {
 function toJid(phone) { return phone.includes("@") ? phone : `${phone.replace(/[^0-9]/g, "")}@s.whatsapp.net`; }
 function isAllowed(jid, participant) {
   const access = loadAccess();
-  if (jid.endsWith("@g.us")) { if (!access.allowGroups) return false; if (access.allowedGroups.length > 0 && !access.allowedGroups.includes(jid)) return false; if (access.requireAllowFromInGroups && participant) return access.allowFrom.some((a) => toJid(a) === participant || a === participant); return true; }
+  if (jid.endsWith("@g.us")) { if (!access.allowGroups) return false; if (!access.allowedGroups.includes(jid)) return false; if (access.requireAllowFromInGroups && participant) return access.allowFrom.some((a) => toJid(a) === participant || a === participant); return true; }
   if (access.allowFrom.length === 0) return true;
   return access.allowFrom.some((a) => toJid(a) === jid || a === jid);
 }
@@ -205,7 +205,7 @@ async function connectWhatsApp() {
   const authState = await useMultiFileAuthState(AUTH_DIR);
   saveCreds = authState.saveCreds;
   const { version } = await fetchLatestBaileysVersion();
-  sock = makeWASocket({ auth: { creds: authState.state.creds, keys: makeCacheableSignalKeyStore(authState.state.keys, logger) }, version, logger, printQRInTerminal: false, browser: ["Mac OS", "Safari", "1.0.0"], syncFullHistory: false, markOnlineOnConnect: false, getMessage: async (key) => { const c = rawMessages.get(key.id); return c?.message || { conversation: "" }; } });
+  sock = makeWASocket({ auth: { creds: authState.state.creds, keys: makeCacheableSignalKeyStore(authState.state.keys, logger) }, version, logger, printQRInTerminal: false, browser: ["Mac OS", "Safari", "1.0.0"], syncFullHistory: false, markOnlineOnConnect: true, getMessage: async (key) => { const c = rawMessages.get(key.id); return c?.message || { conversation: "" }; } });
 
   sock.ev.on("creds.update", enqueueSaveCreds);
   sock.ev.on("connection.update", (update) => {
@@ -221,7 +221,24 @@ async function connectWhatsApp() {
       setTimeout(connectWhatsApp, computeDelay(retryCount++));
     }
     if (connection === "open") {
-      connectionReady = true; connectedAt = Date.now(); retryCount = 0; log("connected");
+      connectionReady = true; connectedAt = Date.now(); retryCount = 0;
+      // Verify registration status
+      try {
+        const creds = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, "creds.json"), "utf8"));
+        if (creds.registered === false) {
+          log("WARNING: connected but registered=false — device may be deregistered. Re-pair needed.");
+          log("Clear auth dir and restart to show QR code.");
+        }
+      } catch {}
+      log("connected");
+      saveConnTimestamp();
+      // Auto-detach tmux after successful pairing so user doesn't get stuck
+      if (process.env.TMUX) {
+        setTimeout(() => {
+          log("paired successfully — detaching tmux session");
+          execFile("tmux", ["detach-client"], () => {});
+        }, 2000);
+      }
       if (watchdogTimer) clearInterval(watchdogTimer);
       watchdogTimer = setInterval(() => { if (connectionReady && lastInboundAt && Date.now() - lastInboundAt > STALE_TIMEOUT) { log("stale"); connectWhatsApp(); } }, WATCHDOG_INTERVAL);
     }
@@ -232,9 +249,50 @@ async function connectWhatsApp() {
   sock.ev.on("messages.upsert", async ({ messages }) => {
     log(`messages.upsert: ${messages.length} message(s)`);
     for (const msg of messages) {
+      const rjid = msg.key?.remoteJid || "";
+      if (rjid.endsWith("@g.us")) log(`group raw: jid=${rjid} hasMsg=${!!msg.message} fromMe=${msg.key.fromMe} text="${extractText(msg.message||{}).slice(0,50)}"`);
       if (!msg.message || msg.key.fromMe) continue;
-      // Skip poll update messages (votes) — handled by messages.update listener
-      if (msg.message.pollUpdateMessage) continue;
+      // Handle poll votes — match to pending permission polls
+      if (msg.message.pollUpdateMessage) {
+        const pollKey = msg.message.pollUpdateMessage.pollCreationMessageKey;
+        if (pollKey?.id && pendingPolls.has(pollKey.id)) {
+          const pending = pendingPolls.get(pollKey.id);
+          pendingPolls.delete(pollKey.id);
+          // Try to decrypt the vote
+          let behavior = "allow"; // default to allow if we can't decrypt
+          try {
+            const { decryptPollVote } = require("@whiskeysockets/baileys");
+            const pollCreationMsg = rawMessages.get(pollKey.id);
+            if (pollCreationMsg?.message) {
+              const pollCreate = pollCreationMsg.message.pollCreationMessageV3 || pollCreationMsg.message.pollCreationMessage;
+              if (pollCreate?.encKey) {
+                const vote = decryptPollVote(
+                  { encPayload: msg.message.pollUpdateMessage.vote?.encPayload, encIv: msg.message.pollUpdateMessage.vote?.encIv },
+                  { pollCreatorJid: pollKey.remoteJid, pollMsgId: pollKey.id, pollEncKey: pollCreate.encKey, voterJid: msg.key.remoteJid || msg.key.participant }
+                );
+                if (vote?.selectedOptions?.length) {
+                  const selected = vote.selectedOptions.map((o) => Buffer.from(o).toString("utf8"));
+                  if (selected.some((s) => s.includes("Deny"))) behavior = "deny";
+                }
+              }
+            }
+          } catch (e) { log(`poll decrypt error: ${e}`); }
+
+          log(`poll vote: ${behavior} for ${pending.requestId} (user ${pending.userId})`);
+
+          // Write response for bridge
+          fs.writeFileSync(path.join(USERS_DIR, pending.userId, "permissions", `response-${pending.requestId}.json`), JSON.stringify({ request_id: pending.requestId, behavior }));
+          try { fs.unlinkSync(path.join(USERS_DIR, pending.userId, "permissions", `request-${pending.requestId}.json`)); } catch {}
+
+          if (behavior === "deny") {
+            execFile("tmux", ["send-keys", "-t", getUserSessionName(pending.userId), "Escape"], () => {});
+            if (pending.userJid) { try { await sock.sendMessage(pending.userJid, { text: "\u274C The admin denied the request. Please try rephrasing what you need." }); } catch {} }
+          } else {
+            // Don't send status to group — too spammy
+          }
+        }
+        continue;
+      }
       const jid = msg.key.remoteJid;
       if (!jid || jid.endsWith("@broadcast") || jid.endsWith("@status")) continue;
       const msgId = msg.key.id; const participant = msg.key.participant;
@@ -258,7 +316,37 @@ async function connectWhatsApp() {
         }
       }
 
+      // Discover groups before access check — save meta so they appear in the menu
+      if (jid.endsWith("@g.us")) {
+        const gUserId = sanitizeUserId(jid);
+        const gDir = getUserDir(gUserId);
+        const gMeta = path.join(gDir, "meta.json");
+        let gm = {}; try { gm = JSON.parse(fs.readFileSync(gMeta, "utf8")); } catch {}
+        gm.jid = jid; gm.isGroup = true; gm.lastSeen = new Date().toISOString();
+        if (!gm.name) { try { const gInfo = await sock.groupMetadata(jid); if (gInfo?.subject) gm.name = gInfo.subject; } catch {} }
+        fs.writeFileSync(gMeta, JSON.stringify(gm, null, 2) + "\n");
+      }
+
       if (!isAllowed(jid, participant || undefined)) continue;
+
+      // Group messages: only respond when mentioned or trigger prefix used
+      if (jid.endsWith("@g.us")) {
+        const access = loadAccess();
+        const groupText = extractText(msg.message || {});
+        // Strip invisible Unicode chars (WhatsApp inserts LRI/RLI/PDI around mentions)
+        const cleanText = groupText.replace(/[\u2066\u2067\u2068\u2069\u200E\u200F\u200B\u200C\u200D\uFEFF]/g, "");
+        const trigger = (access.groupTrigger || "@ai").toLowerCase();
+        const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.some(
+          (m) => m.includes(PHONE) || (sock?.user?.id && m.includes(sock.user.id.split(":")[0]))
+        );
+        const prefixed = cleanText.toLowerCase().startsWith(trigger);
+        // Also check if trigger appears anywhere (for @mentions mid-sentence)
+        const containsTrigger = cleanText.toLowerCase().includes(trigger);
+        log(`group msg: "${cleanText.slice(0,50)}" | trigger="${trigger}" mentioned=${!!mentioned} prefixed=${prefixed} contains=${containsTrigger}`);
+        if (!mentioned && !prefixed && !containsTrigger) {
+          continue;
+        }
+      }
 
       // Permission replies from admin
       const msgText = extractText(msg.message || {});
@@ -290,27 +378,46 @@ async function connectWhatsApp() {
       try { await sock.readMessages([msg.key]); } catch {}
       lastInboundAt = Date.now(); storeRaw(msg);
 
-      // Route to per-user session
+      // Route to session — groups share one session, DMs get per-user sessions
+      const isGroup = jid.endsWith("@g.us");
       const senderJid = participant || jid;
-      const userId = sanitizeUserId(senderJid);
+      const sessionJid = isGroup ? jid : senderJid;  // groups: use group JID
+      const userId = sanitizeUserId(sessionJid);
       const userDir = getUserDir(userId);
       userActivity.set(userId, Date.now());
       try { sock.sendPresenceUpdate("composing", jid); } catch {}
 
-      // Save/update user meta (push name, jid, last seen)
+      // Save/update meta
       const metaFile = path.join(userDir, "meta.json");
       const pushName = msg.pushName || "";
       let userMeta = {};
       try { userMeta = JSON.parse(fs.readFileSync(metaFile, "utf8")); } catch {}
-      userMeta.jid = senderJid;
+      userMeta.jid = sessionJid;
       userMeta.lastSeen = new Date().toISOString();
-      if (pushName) userMeta.pushName = pushName;
-      // Don't overwrite admin-set name
-      if (!userMeta.name && pushName) userMeta.name = pushName;
+      if (isGroup) {
+        userMeta.isGroup = true;
+        // Try to get group name via sock
+        if (!userMeta.name) {
+          try { const gMeta = await sock.groupMetadata(jid); if (gMeta?.subject) userMeta.name = gMeta.subject; } catch {}
+        }
+      } else {
+        if (pushName) userMeta.pushName = pushName;
+        if (!userMeta.name && pushName) userMeta.name = pushName;
+      }
       fs.writeFileSync(metaFile, JSON.stringify(userMeta, null, 2) + "\n");
 
-      const text = extractText(msg.message); const media = extractMediaInfo(msg.message);
+      let text = extractText(msg.message); const media = extractMediaInfo(msg.message);
+      // Strip invisible Unicode and trigger from group messages
+      if (isGroup && text) {
+        text = text.replace(/[\u2066\u2067\u2068\u2069\u200E\u200F\u200B\u200C\u200D\uFEFF]/g, "");
+        const trigger = (loadAccess().groupTrigger || "@ai");
+        text = text.replace(new RegExp(trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "").trim();
+      }
+      const senderName = pushName || formatJid(senderJid);
+      // In groups, prefix the message with sender name so Claude knows who's talking
+      if (isGroup && text) text = `[${senderName}] ${text}`;
       const meta = { chat_id: jid, message_id: msgId, user: formatJid(senderJid), ts: new Date((Number(msg.messageTimestamp) || Date.now() / 1000) * 1000).toISOString() };
+      if (isGroup) { meta.group = "true"; meta.sender_name = senderName; }
       if (media) { meta.attachment_count = "1"; meta.attachments = `${media.filename || media.type + "." + mimeToExt(media.mimetype)} (${media.mimetype}, ${(media.size / 1024).toFixed(0)}KB)`; }
 
       const inboxMsg = { content: text || (media ? `(${media.type})` : "(empty)"), meta, raw_msg_id: msgId };
@@ -318,13 +425,15 @@ async function connectWhatsApp() {
       const final = path.join(userDir, "inbox", `${Date.now()}-${msgId}.json`);
       fs.writeFileSync(tmp, JSON.stringify(inboxMsg)); fs.renameSync(tmp, final);
 
-      spawnUserSession(userId, senderJid);
+      spawnUserSession(userId, sessionJid);
     }
   });
 
   // ── Poll vote handler (for permission approvals) ────────────────
   sock.ev.on("messages.update", async (updates) => {
+    log(`messages.update: ${updates.length} update(s)`);
     for (const update of updates) {
+      log(`update: key=${update.key?.id} hasPollUpdates=${!!update.update?.pollUpdates}`);
       if (!update.update?.pollUpdates) continue;
       const pollMsgId = update.key?.id;
       const pending = pendingPolls.get(pollMsgId);
@@ -441,7 +550,7 @@ setInterval(async () => {
           // Send poll for approval
           const pollMsg = await sock.sendMessage(admin.jid, {
             poll: {
-              name: `Approve this action?`,
+              name: "Approve this action?",
               selectableCount: 1,
               values: ["\u2705 Allow", "\u274C Deny"],
             },
@@ -449,9 +558,14 @@ setInterval(async () => {
 
           if (pollMsg?.key?.id) {
             pendingPolls.set(pollMsg.key.id, { requestId: d.request_id, userId: uid, userJid: d.user_jid });
+            // Store sent poll so Baileys can decrypt votes via getMessage callback
+            storeRaw(pollMsg);
           }
 
-          if (d.user_jid) { try { await sock.sendMessage(d.user_jid, { text: "\u23F3 Waiting for admin approval..." }); } catch {} }
+          // Don't send "waiting" to groups — too spammy. Only DMs.
+          if (d.user_jid && !d.user_jid.endsWith("@g.us")) {
+            try { await sock.sendMessage(d.user_jid, { text: "\u23F3 Waiting for admin approval..." }); } catch {}
+          }
         } catch (e) { log(`perm relay ${uid}/${f}: ${e}`); }
       }
     }
@@ -476,6 +590,33 @@ process.on("unhandledRejection", (err) => { const m = String(err).toLowerCase();
 process.on("uncaughtException", (err) => log(`exception: ${err}`));
 process.setMaxListeners(50);
 let shuttingDown = false;
-function shutdown() { if (shuttingDown) return; shuttingDown = true; log("shutting down"); cleanupSocket(); setTimeout(() => process.exit(0), 2000); }
-process.on("SIGTERM", shutdown); process.on("SIGINT", shutdown);
-log("starting gateway..."); connectWhatsApp();
+const LAST_CONN_FILE = path.join(STATE_DIR, ".last_connected");
+const RECONNECT_COOLDOWN_MS = 30000; // 30s cooldown between restarts
+
+function saveConnTimestamp() {
+  try { fs.writeFileSync(LAST_CONN_FILE, String(Date.now())); } catch {}
+}
+
+function shutdown() {
+  if (shuttingDown) return; shuttingDown = true;
+  log("shutting down");
+  saveConnTimestamp();
+  cleanupSocket();
+  setTimeout(() => process.exit(0), 2000);
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => { log("SIGINT ignored — use tmux kill-session or SIGTERM to stop"); });
+
+// Startup with cooldown — prevent rapid reconnects that deregister the device
+(async () => {
+  let lastConn = 0;
+  try { lastConn = Number(fs.readFileSync(LAST_CONN_FILE, "utf8")); } catch {}
+  const elapsed = Date.now() - lastConn;
+  if (lastConn > 0 && elapsed < RECONNECT_COOLDOWN_MS) {
+    const wait = RECONNECT_COOLDOWN_MS - elapsed;
+    log(`waiting ${Math.ceil(wait / 1000)}s before reconnecting (cooldown)...`);
+    await new Promise((r) => setTimeout(r, wait));
+  }
+  log("starting gateway...");
+  connectWhatsApp();
+})();

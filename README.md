@@ -146,12 +146,16 @@ No HTTP servers. No webhooks. No third-party relay. All IPC is local filesystem.
 | **Admin system** | Set an admin via OTP, they control all user permissions |
 | **Poll-based approvals** | Admin taps Allow/Deny on WhatsApp polls instead of typing codes |
 | **Display names** | Auto-detected from WhatsApp push name, admin can rename |
+| **Group chat support** | Add the bot to groups — responds when mentioned or triggered with a configurable prefix |
+| **Group trigger prefix** | Set a custom trigger word (default `@ai`) so the bot only responds when addressed |
 | **Idle cleanup** | User sessions killed after 30min idle, respawn on next message |
 | **File sharing** | Send and receive images, documents, audio, video |
 | **Multi-number** | Connect multiple WhatsApp accounts to one server |
 | **Auto-reconnect** | Exponential backoff with jitter, max 30s between retries |
+| **Reconnect cooldown** | 30s startup cooldown prevents rapid reconnects that can deregister the device |
 | **Watchdog** | Detects stale connections after 30min of silence |
 | **Credential backup** | Auto-backup before each save, auto-restore if corrupted |
+| **Registration check** | Warns on connect if device appears deregistered |
 
 ### Tools available to Claude
 
@@ -196,7 +200,8 @@ You can also edit `access.json` directly:
   "allowFrom": ["14155551234", "204406284935400@lid"],
   "allowGroups": false,
   "allowedGroups": [],
-  "requireAllowFromInGroups": false
+  "requireAllowFromInGroups": false,
+  "groupTrigger": "@ai"
 }
 ```
 
@@ -205,6 +210,8 @@ You can also edit `access.json` directly:
 | `allowFrom: []` | Accept messages from anyone |
 | `allowFrom: ["14155551234"]` | Only accept from this number |
 | `allowGroups: true` | Enable group chat support |
+| `allowedGroups: ["120363...@g.us"]` | Only respond in these specific groups (required when groups enabled) |
+| `groupTrigger: "@ai"` | Custom prefix to trigger the bot in groups (default: `@ai`) |
 
 > **Note:** WhatsApp may use LID-based JIDs (e.g., `204406284935400@lid`) instead of phone numbers. OTP verification handles this automatically.
 
@@ -285,6 +292,22 @@ Built on patterns from [OpenClaw's WhatsApp extension](https://github.com/opencl
 ---
 
 ## Changelog
+
+### v0.2.0 (2026-04-09)
+**Group chat support and reliability improvements**
+- **Group chat sessions** — add the bot to WhatsApp groups, each group gets its own shared Claude Code session
+- **Trigger-based activation** — bot only responds in groups when mentioned or when message contains a configurable trigger prefix (default `@ai`)
+- **Group metadata discovery** — auto-detects group names and saves metadata for discovered groups
+- **Sender attribution in groups** — messages are prefixed with `[SenderName]` so Claude knows who's talking
+- **Improved poll vote handling** — poll votes now handled in `messages.upsert` with proper decryption via Baileys' `decryptPollVote`
+- **Reconnect cooldown** — 30s startup cooldown prevents rapid reconnects that can deregister the WhatsApp device
+- **Registration status check** — warns on connect if `registered=false` in credentials, indicating re-pairing is needed
+- **Auto-detach tmux** — after successful pairing, tmux session auto-detaches so users don't get stuck
+- **SIGINT protection** — SIGINT is ignored in the gateway process to prevent accidental termination; use SIGTERM or tmux kill-session
+- **Stricter group ACL** — groups must be explicitly listed in `allowedGroups` (no longer allows all groups when list is empty)
+- **Mark online on connect** — WhatsApp presence now shows online when the bot connects
+- **Group trigger stripping** — trigger prefix and invisible Unicode characters are cleaned from messages before delivery to Claude
+- **Poll message storage** — sent polls are stored in the raw message cache so Baileys can decrypt vote responses
 
 ### v0.1.0 (2026-04-09)
 **Major architecture update: per-user sessions**
