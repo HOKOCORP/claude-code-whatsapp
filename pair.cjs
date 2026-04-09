@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // WhatsApp pairing script
 // Usage: node pair.cjs <phone_number> [state_dir]
-// Example: node pair.cjs 85258080138
-// Example: node pair.cjs 85258080138 /root/.claude/channels/whatsapp-2
+// Example: node pair.cjs 14155551234
+// Example: node pair.cjs 14155551234 /root/.claude/channels/whatsapp-2
 const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, fetchLatestBaileysVersion, DisconnectReason } = require("@whiskeysockets/baileys");
 const qrcode = require("qrcode-terminal");
 const pino = require("pino");
@@ -10,7 +10,7 @@ const pino = require("pino");
 const PHONE = process.argv[2];
 if (!PHONE) {
   console.error("Usage: node pair.cjs <phone_number> [state_dir]");
-  console.error("  phone_number: digits only, with country code (e.g. 85258080138)");
+  console.error("  phone_number: digits only, with country code (e.g. 14155551234)");
   console.error("  state_dir:    optional, defaults to /root/.claude/channels/whatsapp-<phone>");
   process.exit(1);
 }
