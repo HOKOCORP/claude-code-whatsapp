@@ -13,6 +13,7 @@
  * - Creds backup/restore to avoid re-pairing
  */
 
+const { execFile } = require("child_process");
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const { ListToolsRequestSchema, CallToolRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
@@ -37,6 +38,7 @@ const STATE_DIR = process.env.WHATSAPP_STATE_DIR || path.join(os.homedir(), ".cl
 const ACCESS_FILE = path.join(STATE_DIR, "access.json");
 const AUTH_DIR = path.join(STATE_DIR, "auth");
 const INBOX_DIR = path.join(STATE_DIR, "inbox");
+const OTP_LOG_FILE = path.join(STATE_DIR, "otp.log");
 
 fs.mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
 fs.mkdirSync(INBOX_DIR, { recursive: true });
@@ -88,6 +90,64 @@ function isAllowed(jid, participant) {
   }
   if (access.allowFrom.length === 0) return true;
   return access.allowFrom.some((a) => toJid(a) === jid || a === jid);
+}
+
+// ── OTP Verification ───────────────────────────────────────────────
+
+const OTP_FILE = path.join(STATE_DIR, "otp.json");   // { code, expiresAt }
+const ADMIN_FILE = path.join(STATE_DIR, "admin.json"); // { jid }
+const OUTBOX_DIR = path.join(STATE_DIR, "outbox");
+fs.mkdirSync(OUTBOX_DIR, { recursive: true });
+
+function loadAdmin() {
+  try { return JSON.parse(fs.readFileSync(ADMIN_FILE, "utf8")); } catch { return null; }
+}
+
+function addToWhitelist(jid) {
+  const access = loadAccess();
+  if (!access.allowFrom.some((a) => toJid(a) === jid || a === jid)) {
+    access.allowFrom.push(jid);
+    fs.writeFileSync(ACCESS_FILE, JSON.stringify(access, null, 2) + "\n");
+    log(`whitelist: added ${jid}`);
+  }
+}
+
+function loadOtp() {
+  try {
+    const data = JSON.parse(fs.readFileSync(OTP_FILE, "utf8"));
+    if (data.code && data.expiresAt > Date.now()) return data;
+  } catch {}
+  return null;
+}
+
+async function handleUnknown(msg, jid) {
+  const text = extractText(msg.message || {}).trim().toUpperCase();
+
+  // Check if there's an active OTP and the message matches
+  const otp = loadOtp();
+  if (otp && text === otp.code) {
+    if (otp.type === "admin") {
+      // Admin verification — save as admin and whitelist
+      fs.writeFileSync(ADMIN_FILE, JSON.stringify({ jid }) + "\n");
+      addToWhitelist(jid);
+      try { fs.unlinkSync(OTP_FILE); } catch {}
+      try { await sock.sendMessage(jid, { text: "✅ You are now the admin of this agent." }); } catch {}
+      const verifyMsg = `otp: ${formatJid(jid)} set as admin`;
+      log(verifyMsg);
+      try { fs.appendFileSync(OTP_LOG_FILE, `${new Date().toISOString()} ${verifyMsg}\n`); } catch {}
+    } else {
+      // Regular whitelist verification
+      addToWhitelist(jid);
+      try { fs.unlinkSync(OTP_FILE); } catch {}
+      try { await sock.sendMessage(jid, { text: "✅ You've been verified! You can now message this agent." }); } catch {}
+      const verifyMsg = `otp: ${formatJid(jid)} verified successfully`;
+      log(verifyMsg);
+      try { fs.appendFileSync(OTP_LOG_FILE, `${new Date().toISOString()} ${verifyMsg}\n`); } catch {}
+    }
+    return;
+  }
+
+  // Not a valid OTP — ignore silently
 }
 
 // ── Path safety ─────────────────────────────────────────────────────
@@ -336,7 +396,75 @@ async function connectWhatsApp() {
       const participant = msg.key.participant;
 
       if (msgId && isDuplicate(`${jid}:${msgId}`)) continue;
-      if (!isAllowed(jid, participant || undefined)) continue;
+
+      // Check OTP before whitelist — OTP works for anyone (known or unknown)
+      if (!jid.endsWith("@g.us")) {
+        const otp = loadOtp();
+        if (otp) {
+          const text = extractText(msg.message || {}).trim().toUpperCase();
+          if (text === otp.code) {
+            await handleUnknown(msg, jid);
+            continue;
+          }
+        }
+      }
+
+      if (!isAllowed(jid, participant || undefined)) {
+        if (!jid.endsWith("@g.us")) await handleUnknown(msg, jid);
+        continue;
+      }
+
+      // Intercept permission replies before they reach Claude
+      const msgText = extractText(msg.message || {});
+      const permMatch = PERMISSION_REPLY_RE.exec(msgText);
+      if (permMatch) {
+        try { await sock.readMessages([msg.key]); } catch {}
+        const behavior = permMatch[1].toLowerCase().startsWith("y") ? "allow" : "deny";
+        if (behavior === "deny") {
+          lastDenyAt = Date.now();
+          // Send deny, then abort Claude Code by sending Escape to the tmux session
+          mcp.notification({
+            method: "notifications/claude/channel/permission",
+            params: { request_id: permMatch[2].toLowerCase(), behavior: "deny" },
+          }).catch(() => {});
+          try {
+            await sock.sendMessage(jid, { react: { text: "❌", key: msg.key } });
+          } catch {}
+          // Edit status message to inform user
+          if (pendingStatusMsg) {
+            try {
+              await sock.sendMessage(pendingStatusMsg.jid, {
+                text: "❌ The admin denied the request. Please try rephrasing what you need.",
+                edit: pendingStatusMsg.key,
+              });
+            } catch {
+              if (lastSender?.jid) {
+                try { await sock.sendMessage(lastSender.jid, { text: "❌ The admin denied the request. Please try rephrasing what you need." }); } catch {}
+              }
+            }
+            pendingStatusMsg = null;
+          }
+          // Send Escape to abort Claude Code's current task
+          const phone = path.basename(STATE_DIR).replace("whatsapp-", "");
+          execFile("tmux", ["send-keys", "-t", `cc-ch-wa-${phone}`, "Escape"], () => {});
+          continue;
+        }
+        // Allow
+        mcp.notification({
+          method: "notifications/claude/channel/permission",
+          params: { request_id: permMatch[2].toLowerCase(), behavior: "allow" },
+        }).catch((e) => log(`permission reply failed: ${e}`));
+        try {
+          await sock.sendMessage(jid, { react: { text: "✅", key: msg.key } });
+        } catch {}
+        if (pendingStatusMsg) {
+          try {
+            await sock.sendMessage(pendingStatusMsg.jid, { text: "✅ Approved, processing...", edit: pendingStatusMsg.key });
+          } catch {}
+          startTyping(pendingStatusMsg.jid);
+        }
+        continue;
+      }
 
       try { await sock.readMessages([msg.key]); } catch {}
 
@@ -346,6 +474,29 @@ async function connectWhatsApp() {
     }
   });
 }
+
+// ── Outbox processor (file-based message sending for external scripts) ──
+
+let outboxProcessing = false;
+setInterval(async () => {
+  if (!sock || !connectionReady || outboxProcessing) return;
+  outboxProcessing = true;
+  try {
+    const files = fs.readdirSync(OUTBOX_DIR).filter((f) => f.endsWith(".json"));
+    for (const file of files) {
+      const fp = path.join(OUTBOX_DIR, file);
+      try {
+        const data = fs.readFileSync(fp, "utf8");
+        fs.unlinkSync(fp);
+        const { jid: toJid, text } = JSON.parse(data);
+        if (toJid && text) await sock.sendMessage(toJid, { text });
+      } catch (e) {
+        log(`outbox error (${file}): ${e}`);
+      }
+    }
+  } catch {}
+  outboxProcessing = false;
+}, 2000);
 
 // ── Message helpers ─────────────────────────────────────────────────
 
@@ -382,6 +533,22 @@ function formatJid(jid) {
   return jid.replace(/@s\.whatsapp\.net$/, "").replace(/@g\.us$/, "").replace(/@lid$/, "").replace(/:\d+$/, "");
 }
 
+// Track last message sender for permission context
+let lastSender = null;
+let typingInterval = null;
+let pendingStatusMsg = null; // { jid, key } — "waiting for approval" message to delete later
+
+function startTyping(jid) {
+  stopTyping();
+  const send = () => { try { sock?.sendPresenceUpdate("composing", jid); } catch {} };
+  send();
+  typingInterval = setInterval(send, 4000); // refresh every 4s (WA expires after ~5s)
+}
+
+function stopTyping() {
+  if (typingInterval) { clearInterval(typingInterval); typingInterval = null; }
+}
+
 // ── Inbound handler ─────────────────────────────────────────────────
 
 async function handleInbound(msg, jid, participant) {
@@ -392,6 +559,8 @@ async function handleInbound(msg, jid, participant) {
   const isGroup = jid.endsWith("@g.us");
   const senderJid = participant || jid;
   const senderNumber = formatJid(senderJid);
+  lastSender = { jid: senderJid, number: senderNumber, text: text || "(media)" };
+  startTyping(jid);
 
   storeRecent(jid, {
     id: msgId, from: senderNumber,
@@ -399,20 +568,6 @@ async function handleInbound(msg, jid, participant) {
     ts: (Number(msg.messageTimestamp) || Date.now() / 1000) * 1000,
     hasMedia: !!media, mediaType: media?.type,
   });
-
-  // Permission relay: intercept yes/no replies
-  const permMatch = PERMISSION_REPLY_RE.exec(text);
-  if (permMatch) {
-    const behavior = permMatch[1].toLowerCase().startsWith("y") ? "allow" : "deny";
-    mcp.notification({
-      method: "notifications/claude/channel/permission",
-      params: { request_id: permMatch[2].toLowerCase(), behavior },
-    }).catch((e) => log(`permission reply failed: ${e}`));
-    try {
-      await sock.sendMessage(jid, { react: { text: behavior === "allow" ? "✅" : "❌", key: msg.key } });
-    } catch {}
-    return;
-  }
 
   const content = text || (media ? `(${media.type})` : "(empty)");
   const meta = {
@@ -451,7 +606,10 @@ const mcp = new Server(
   }
 );
 
-// Permission relay: CC → WhatsApp (outbound)
+// Permission relay: CC → WhatsApp (admin only)
+let lastDenyAt = 0;
+const DENY_COOLDOWN_MS = 30000; // 30s — auto-deny after admin denies once
+
 mcp.setNotificationHandler(
   z.object({
     method: z.literal("notifications/claude/channel/permission_request"),
@@ -464,16 +622,53 @@ mcp.setNotificationHandler(
   }),
   async ({ params }) => {
     if (!sock || !connectionReady) return;
-    const access = loadAccess();
-    const text = `🔐 Permission request [${params.request_id}]\n\n` +
-      `${params.tool_name}: ${params.description}\n` +
-      `${params.input_preview}\n\n` +
-      `Reply "yes ${params.request_id}" or "no ${params.request_id}"`;
-    for (const phone of access.allowFrom) {
-      const jid = toJid(phone);
-      sock.sendMessage(jid, { text }).catch((e) => {
-        log(`permission_request send to ${jid} failed: ${e}`);
-      });
+    const admin = loadAdmin();
+    if (!admin?.jid) return;
+
+    // Skip if already aborting from a recent deny
+    if (Date.now() - lastDenyAt < DENY_COOLDOWN_MS) return;
+
+    // Build human-friendly description
+    const sender = lastSender ? lastSender.number : "unknown";
+    const senderMsg = lastSender ? lastSender.text : "";
+
+    let action = "";
+    const tool = params.tool_name || "";
+    try {
+      const preview = JSON.parse(params.input_preview);
+      if (tool.includes("reply") || tool.includes("whatsapp")) {
+        action = `Send reply: "${preview.text || ""}"`;
+      } else if (tool.includes("Bash") || tool.includes("bash")) {
+        const cmd = preview.command || params.input_preview;
+        action = `Run command: ${typeof cmd === "string" ? cmd.slice(0, 150) : params.input_preview.slice(0, 150)}`;
+      } else {
+        action = `${params.description}: ${params.input_preview.slice(0, 150)}`;
+      }
+    } catch {
+      if (tool.toLowerCase().includes("bash")) {
+        action = `Run command: ${params.input_preview.slice(0, 150)}`;
+      } else {
+        action = `${params.description}`;
+      }
+    }
+
+    const text = `🔐 *Permission Request*\n\n` +
+      `👤 Triggered by: ${sender}\n` +
+      (senderMsg ? `💬 Their message: "${senderMsg.slice(0, 100)}"\n\n` : "\n") +
+      `⚡ ${action}\n\n` +
+      `Reply *yes ${params.request_id}* to allow\n` +
+      `Reply *no ${params.request_id}* to deny`;
+    sock.sendMessage(admin.jid, { text }).catch((e) => {
+      log(`permission_request send to admin failed: ${e}`);
+    });
+
+    // Send "waiting" message to the user and keep track of it for deletion later
+    if (lastSender?.jid) {
+      stopTyping();
+      try {
+        const statusMsg = await sock.sendMessage(lastSender.jid, { text: "⏳ Waiting for admin approval..." });
+        pendingStatusMsg = { jid: lastSender.jid, key: statusMsg.key };
+      } catch {}
     }
   },
 );
@@ -534,6 +729,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const chatId = args.chat_id;
         const text = args.text;
         const files = args.files || [];
+        stopTyping();
+        // Delete status message ("waiting for approval" / "approved, processing...")
+        if (pendingStatusMsg) {
+          try { await sock.sendMessage(pendingStatusMsg.jid, { delete: pendingStatusMsg.key }); } catch {}
+          pendingStatusMsg = null;
+        }
         for (const f of files) {
           assertSendable(f);
           if (fs.statSync(f).size > 64 * 1024 * 1024) throw new Error(`file too large: ${f}`);
