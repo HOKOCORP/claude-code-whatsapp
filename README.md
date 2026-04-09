@@ -5,16 +5,18 @@
 [![Claude Code 2.1.80+](https://img.shields.io/badge/Claude_Code-2.1.80%2B-6B4FBB)](https://docs.anthropic.com/en/docs/claude-code)
 [![Security Audited](https://img.shields.io/badge/Security-Audited-brightgreen)]()
 
-> Talk to Claude Code from WhatsApp. Send a message from your phone, Claude does the work on your server, and replies back to your chat.
+> Talk to Claude Code from WhatsApp. Each user gets their own isolated Claude Code session, with admin approval for sensitive operations via WhatsApp polls.
 
-Built on [Baileys](https://github.com/WhiskeySockets/Baileys) v7 (WhatsApp Web Multi-Device protocol) and [Claude Code Channels](https://docs.anthropic.com/en/docs/claude-code/channels). Fork of [diogo85/claude-code-whatsapp](https://github.com/diogo85/claude-code-whatsapp) with multi-number support and security hardening.
+Built on [Baileys](https://github.com/WhiskeySockets/Baileys) v7 (WhatsApp Web Multi-Device protocol) and [Claude Code Channels](https://docs.anthropic.com/en/docs/claude-code/channels). Fork of [diogo85/claude-code-whatsapp](https://github.com/diogo85/claude-code-whatsapp) with multi-user sessions, OTP verification, admin controls, and security hardening.
 
 ---
 
 ## Why use this?
 
 - **Code from anywhere** — fix a bug from your phone while walking the dog
-- **Approve tool calls remotely** — Claude asks permission via WhatsApp, you reply "yes" or "no"
+- **Per-user sessions** — each WhatsApp user gets their own isolated Claude Code instance
+- **OTP verification** — admin generates a code, shares a link, users tap to whitelist themselves
+- **Admin controls** — approve or deny tool calls via WhatsApp polls (tap, don't type)
 - **Multiple numbers** — connect personal and work WhatsApp to the same server
 - **Runs 24/7** — production-grade reconnection, never crashes on transient errors
 - **Private** — runs on your machine, no data goes through third-party servers
@@ -50,31 +52,39 @@ Wait for "Connected!" before closing.
 
 > **Tip:** If you get error 515, wait 5-10 minutes and try once. WhatsApp rate-limits rapid attempts. IP-level rate limits may require trying from a different IP.
 
-### Step 3 — Configure MCP
+### Step 3 — Launch the gateway
 
-Add to your `.mcp.json` (or `~/.mcp.json` for global):
-
-```json
-{
-  "mcpServers": {
-    "whatsapp": {
-      "command": "node",
-      "args": ["/path/to/claude-code-whatsapp/server.cjs"],
-      "env": {
-        "WHATSAPP_STATE_DIR": "~/.claude/channels/whatsapp-14155551234"
-      }
-    }
-  }
-}
+```bash
+WHATSAPP_STATE_DIR=~/.claude/channels/whatsapp-14155551234 node gateway.cjs
 ```
 
-### Step 4 — Launch
+That's it. The gateway handles everything:
+- Receives WhatsApp messages
+- Spawns a per-user Claude Code session for each sender
+- Routes messages to the right session via the bridge MCP server
+- Sends replies back to WhatsApp
+
+### Architecture
+
+```
+Your phone (WhatsApp)
+    ↕  Baileys v7 — WhatsApp Web Multi-Device protocol
+gateway.cjs — standalone daemon, routes messages per-user
+    ↕  filesystem IPC (inbox/outbox directories)
+bridge.cjs — per-user MCP server (one per user session)
+    ↕  notifications/claude/channel (stdio)
+Claude Code — one instance per user, isolated sessions
+```
+
+### Legacy single-session mode
+
+If you prefer the old single-session setup (all users share one Claude Code):
 
 ```bash
 claude --dangerously-load-development-channels "server:whatsapp"
 ```
 
-That's it. Send a message from WhatsApp and Claude will respond.
+With `server.cjs` configured in `.mcp.json`. See the v0.0.4 README for details.
 
 ---
 
@@ -114,17 +124,16 @@ claude --dangerously-load-development-channels "server:whatsapp-us,server:whatsa
 
 ## How It Works
 
-```
-Your phone (WhatsApp)
-    ↕  Baileys v7 — WhatsApp Web Multi-Device protocol
-server.cjs — MCP server with channel + permission relay
-    ↕  notifications/claude/channel (stdio)
-Claude Code — receives messages, does the work, replies back
-```
+The gateway runs as a standalone daemon with a single WhatsApp connection. When a message arrives from a whitelisted user, the gateway:
 
-The plugin runs as an MCP server alongside Claude Code. Baileys maintains a persistent WebSocket connection to WhatsApp's servers (the same protocol WhatsApp Web uses). When you send a message, it arrives via that WebSocket, gets pushed to Claude Code as a channel notification, and Claude's reply is sent back through the same connection.
+1. Creates a per-user directory with inbox/outbox/permissions folders
+2. Writes the message to the user's inbox
+3. Spawns a dedicated Claude Code tmux session if not already running
+4. The bridge MCP server (one per user) reads from inbox, delivers to Claude Code
+5. Claude Code's reply goes through the bridge to the user's outbox
+6. The gateway picks up outbox messages and sends them via WhatsApp
 
-No HTTP servers. No webhooks. No polling. No third-party relay.
+No HTTP servers. No webhooks. No third-party relay. All IPC is local filesystem.
 
 ---
 
@@ -132,14 +141,17 @@ No HTTP servers. No webhooks. No polling. No third-party relay.
 
 | Feature | Details |
 |---------|---------|
-| **Remote coding** | Send tasks from WhatsApp, get results back |
-| **Permission relay** | Approve or deny Claude's tool calls from your phone |
+| **Per-user sessions** | Each WhatsApp user gets their own isolated Claude Code instance |
+| **OTP whitelist** | Admin generates code, shares wa.me link — user taps to verify |
+| **Admin system** | Set an admin via OTP, they control all user permissions |
+| **Poll-based approvals** | Admin taps Allow/Deny on WhatsApp polls instead of typing codes |
+| **Display names** | Auto-detected from WhatsApp push name, admin can rename |
+| **Idle cleanup** | User sessions killed after 30min idle, respawn on next message |
 | **File sharing** | Send and receive images, documents, audio, video |
 | **Multi-number** | Connect multiple WhatsApp accounts to one server |
 | **Auto-reconnect** | Exponential backoff with jitter, max 30s between retries |
 | **Watchdog** | Detects stale connections after 30min of silence |
 | **Credential backup** | Auto-backup before each save, auto-restore if corrupted |
-| **Graceful shutdown** | Clean exit on SIGTERM/SIGINT |
 
 ### Tools available to Claude
 
@@ -150,31 +162,38 @@ No HTTP servers. No webhooks. No polling. No third-party relay.
 | `download_attachment` | Save media from a received message to disk |
 | `fetch_messages` | List recent messages from the session cache |
 
-### Permission relay in action
+### Permission relay
 
-When Claude needs to run something that requires approval:
+When Claude needs approval for a sensitive operation, the admin receives:
 
-```
-Permission request [tbxkq]
-Bash: rm -rf /tmp/foo
-Reply "yes tbxkq" or "no tbxkq"
-```
+1. A context message showing who triggered it and what the action is
+2. A WhatsApp poll with **Allow** and **Deny** options — just tap
 
-Reply from your phone. Claude proceeds or stops. You stay in control even when you're away from your desk.
+If denied, Claude Code's current task is aborted (Escape sent to the session) and the user is notified.
+
+Text-based `yes <code>` / `no <code>` replies also work as a fallback.
 
 ---
 
 ## Access Control
 
-Restrict who can message your Claude instance. Create `access.json` in your state directory:
+### OTP Verification (recommended)
 
-```bash
-# Example: ~/.claude/channels/whatsapp-14155551234/access.json
-```
+The gateway supports OTP-based whitelisting. The admin generates a code, and shares a `wa.me` link with the user. The user taps the link, WhatsApp opens with the code pre-filled, they hit send, and they're whitelisted.
+
+OTP codes are written to `otp.json` in the state directory. The gateway checks incoming messages against the active OTP before checking the whitelist, so it works for unknown numbers too.
+
+### Admin system
+
+Set an admin via OTP — the admin's WhatsApp number receives all permission requests and can approve/deny via polls. The admin is stored in `admin.json`.
+
+### Manual access control
+
+You can also edit `access.json` directly:
 
 ```json
 {
-  "allowFrom": ["14155551234"],
+  "allowFrom": ["14155551234", "204406284935400@lid"],
   "allowGroups": false,
   "allowedGroups": [],
   "requireAllowFromInGroups": false
@@ -186,7 +205,8 @@ Restrict who can message your Claude instance. Create `access.json` in your stat
 | `allowFrom: []` | Accept messages from anyone |
 | `allowFrom: ["14155551234"]` | Only accept from this number |
 | `allowGroups: true` | Enable group chat support |
-| `allowedGroups: ["id@g.us"]` | Limit to specific groups |
+
+> **Note:** WhatsApp may use LID-based JIDs (e.g., `204406284935400@lid`) instead of phone numbers. OTP verification handles this automatically.
 
 ---
 
@@ -197,7 +217,7 @@ This plugin has been **independently security audited**. Here's what was checked
 | Check | Result |
 |-------|--------|
 | Data exfiltration | **None.** Zero outbound HTTP calls. Only WhatsApp WebSocket + local MCP stdio. |
-| Backdoors | **None.** No `eval()`, no `child_process`, no remote code execution. |
+| Backdoors | **None.** No dynamic code execution. execFile used only for tmux management with hardcoded arguments. |
 | Credential theft | **None.** Env vars only read for state directory path. No access to `~/.ssh`, `.env`, or system files. |
 | Obfuscated code | **None.** No base64 strings, no encoded URLs, no hidden logic. |
 | Supply chain | **Clean.** All dependencies are well-known packages from npmjs.org. No typosquatting. |
@@ -265,6 +285,19 @@ Built on patterns from [OpenClaw's WhatsApp extension](https://github.com/opencl
 ---
 
 ## Changelog
+
+### v0.1.0 (2026-04-09)
+**Major architecture update: per-user sessions**
+- **Gateway/bridge split** — `gateway.cjs` handles WhatsApp connection and routing, `bridge.cjs` is a lightweight per-user MCP server
+- **Per-user Claude Code sessions** — each WhatsApp user gets an isolated Claude Code instance in its own tmux session
+- **OTP verification** — admin generates a code, shares a `wa.me` click-to-send link, users verify with one tap
+- **Admin system** — set an admin via OTP, they receive all permission requests
+- **Poll-based permission approvals** — admin taps Allow/Deny on WhatsApp polls instead of typing codes
+- **Display names** — auto-detected from WhatsApp push name, admin can rename via SSH menu
+- **Typing indicators** — users see "typing..." while Claude processes their message
+- **Idle session cleanup** — user sessions killed after 30min idle, respawn on next message
+- **Abort on deny** — when admin denies a permission, Claude Code's task is aborted (Escape sent), with 30s cooldown to prevent retry spam
+- **User session menu** — SSH login menu shows active user sessions, selectable to attach and observe
 
 ### v0.0.4 (2026-04-09)
 - `pair.cjs` now takes phone number as a CLI argument — no more hardcoded numbers
