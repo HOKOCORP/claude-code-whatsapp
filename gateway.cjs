@@ -233,6 +233,8 @@ async function connectWhatsApp() {
     log(`messages.upsert: ${messages.length} message(s)`);
     for (const msg of messages) {
       if (!msg.message || msg.key.fromMe) continue;
+      // Skip poll update messages (votes) — handled by messages.update listener
+      if (msg.message.pollUpdateMessage) continue;
       const jid = msg.key.remoteJid;
       if (!jid || jid.endsWith("@broadcast") || jid.endsWith("@status")) continue;
       const msgId = msg.key.id; const participant = msg.key.participant;
@@ -319,6 +321,46 @@ async function connectWhatsApp() {
       spawnUserSession(userId, senderJid);
     }
   });
+
+  // ── Poll vote handler (for permission approvals) ────────────────
+  sock.ev.on("messages.update", async (updates) => {
+    for (const update of updates) {
+      if (!update.update?.pollUpdates) continue;
+      const pollMsgId = update.key?.id;
+      const pending = pendingPolls.get(pollMsgId);
+      if (!pending) continue;
+
+      // Get the votes
+      for (const pollUpdate of update.update.pollUpdates) {
+        const vote = pollUpdate.vote;
+        if (!vote?.selectedOptions?.length) continue;
+
+        // Decode the selected option
+        const selected = vote.selectedOptions.map((o) => Buffer.from(o).toString("utf8"));
+        const isAllow = selected.some((s) => s.includes("Allow"));
+        const isDeny = selected.some((s) => s.includes("Deny"));
+
+        if (!isAllow && !isDeny) continue;
+
+        const behavior = isAllow ? "allow" : "deny";
+        const { requestId, userId: uid, userJid } = pending;
+        pendingPolls.delete(pollMsgId);
+
+        // Write response for bridge
+        const respFile = path.join(USERS_DIR, uid, "permissions", `response-${requestId}.json`);
+        fs.writeFileSync(respFile, JSON.stringify({ request_id: requestId, behavior }));
+        // Clean up request file
+        try { fs.unlinkSync(path.join(USERS_DIR, uid, "permissions", `request-${requestId}.json`)); } catch {}
+
+        if (behavior === "deny") {
+          execFile("tmux", ["send-keys", "-t", getUserSessionName(uid), "Escape"], () => {});
+          if (userJid) { try { await sock.sendMessage(userJid, { text: "\u274C The admin denied the request. Please try rephrasing what you need." }); } catch {} }
+        }
+
+        log(`poll vote: ${behavior} for request ${requestId} (user ${uid})`);
+      }
+    }
+  });
 }
 
 // ── Per-user outbox processor ───────────────────────────────────────
@@ -368,7 +410,10 @@ setInterval(async () => {
   outboxBusy = false;
 }, 1500);
 
-// ── Permission request relay ────────────────────────────────────────
+// ── Permission request relay (via polls) ────────────────────────────
+
+// Map poll message IDs to { requestId, userId, userJid }
+const pendingPolls = new Map();
 
 setInterval(async () => {
   if (!sock || !connectionReady) return;
@@ -382,13 +427,30 @@ setInterval(async () => {
           const d = JSON.parse(fs.readFileSync(path.join(pdir, f), "utf8"));
           if (d._sent) continue; d._sent = true;
           fs.writeFileSync(path.join(pdir, f), JSON.stringify(d));
+
           let action = d.description || "";
-          try { const p = JSON.parse(d.input_preview); if ((d.tool_name||"").includes("reply")||(d.tool_name||"").includes("whatsapp")) action = `Send reply: "${p.text||""}"`.slice(0,200); else if ((d.tool_name||"").toLowerCase().includes("bash")) action = `Run command: ${(p.command||d.input_preview).slice(0,150)}`; else action = `${d.description}: ${d.input_preview.slice(0,150)}`; } catch { if ((d.tool_name||"").toLowerCase().includes("bash")) action = `Run command: ${d.input_preview.slice(0,150)}`; }
-          // Read display name from meta.json
+          try { const p = JSON.parse(d.input_preview); if ((d.tool_name||"").includes("reply")||(d.tool_name||"").includes("whatsapp")) action = `Send reply: "${(p.text||"").slice(0,100)}"`; else if ((d.tool_name||"").toLowerCase().includes("bash")) action = `Run command: ${(p.command||d.input_preview).slice(0,100)}`; else action = `${d.description}: ${d.input_preview.slice(0,100)}`; } catch { if ((d.tool_name||"").toLowerCase().includes("bash")) action = `Run command: ${d.input_preview.slice(0,100)}`; }
+
           let displayName = d.user_number || uid;
           try { const meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8")); if (meta.name) displayName = meta.name; } catch {}
-          const text = `\uD83D\uDD10 *Permission Request*\n\n\uD83D\uDC64 From: ${displayName}\n${d.user_message ? `\uD83D\uDCAC Message: "${d.user_message.slice(0,100)}"\n\n` : "\n"}\u26A1 ${action}\n\nReply *yes ${d.request_id}* to allow\nReply *no ${d.request_id}* to deny`;
-          await sock.sendMessage(admin.jid, { text });
+
+          // Send context message first
+          const contextText = `\uD83D\uDD10 *Permission Request*\n\n\uD83D\uDC64 From: ${displayName}\n${d.user_message ? `\uD83D\uDCAC "${d.user_message.slice(0,100)}"\n` : ""}\n\u26A1 ${action}`;
+          await sock.sendMessage(admin.jid, { text: contextText });
+
+          // Send poll for approval
+          const pollMsg = await sock.sendMessage(admin.jid, {
+            poll: {
+              name: `Approve this action?`,
+              selectableCount: 1,
+              values: ["\u2705 Allow", "\u274C Deny"],
+            },
+          });
+
+          if (pollMsg?.key?.id) {
+            pendingPolls.set(pollMsg.key.id, { requestId: d.request_id, userId: uid, userJid: d.user_jid });
+          }
+
           if (d.user_jid) { try { await sock.sendMessage(d.user_jid, { text: "\u23F3 Waiting for admin approval..." }); } catch {} }
         } catch (e) { log(`perm relay ${uid}/${f}: ${e}`); }
       }
