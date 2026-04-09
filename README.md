@@ -144,7 +144,7 @@ No HTTP servers. No webhooks. No third-party relay. All IPC is local filesystem.
 | **Per-user sessions** | Each WhatsApp user gets their own isolated Claude Code instance |
 | **OTP whitelist** | Admin generates code, shares wa.me link — user taps to verify |
 | **Admin system** | Set an admin via OTP, they control all user permissions |
-| **Poll-based approvals** | Admin taps Allow/Deny on WhatsApp polls instead of typing codes |
+| **Poll-based approvals** | Admin taps Allow, Always Allow (pattern-based), or Deny via WhatsApp polls |
 | **Display names** | Auto-detected from WhatsApp push name, admin can rename |
 | **Group chat support** | Add the bot to groups — responds when mentioned or triggered with a configurable prefix |
 | **Group trigger prefix** | Set a custom trigger word (default `@ai`) so the bot only responds when addressed |
@@ -170,10 +170,13 @@ No HTTP servers. No webhooks. No third-party relay. All IPC is local filesystem.
 
 When Claude needs approval for a sensitive operation, the admin receives:
 
-1. A context message showing who triggered it and what the action is
-2. A WhatsApp poll with **Allow** and **Deny** options — just tap
+1. A context message showing who triggered it, their message, and what the action is
+2. A WhatsApp poll with three options:
+   - **Allow** — approve this one command
+   - **Always allow `<command>`** — pattern-based auto-approve (e.g., "Always allow curl" approves all future `curl` commands from this user)
+   - **Deny** — deny and abort the current task
 
-If denied, Claude Code's current task is aborted (Escape sent to the session) and the user is notified.
+If denied, Claude Code's current task is aborted (Escape sent to the session). Status messages ("waiting for approval") are only sent to DMs, not groups.
 
 Text-based `yes <code>` / `no <code>` replies also work as a fallback.
 
@@ -308,6 +311,9 @@ Built on patterns from [OpenClaw's WhatsApp extension](https://github.com/opencl
 - **Mark online on connect** — WhatsApp presence now shows online when the bot connects
 - **Group trigger stripping** — trigger prefix and invisible Unicode characters are cleaned from messages before delivery to Claude
 - **Poll message storage** — sent polls are stored in the raw message cache so Baileys can decrypt vote responses
+- **Pattern-based auto-approve** — "Always allow `<command>`" poll option saves the command prefix, auto-approves matching future commands (like Claude Code's batch mode)
+- **No group spam** — "waiting for approval" and "approved" status messages only sent to DMs, not groups
+- **Auto-detach only on pairing** — tmux auto-detach now only triggers after QR code pairing, not on normal reconnects
 
 ### v0.1.0 (2026-04-09)
 **Major architecture update: per-user sessions**
@@ -315,11 +321,12 @@ Built on patterns from [OpenClaw's WhatsApp extension](https://github.com/opencl
 - **Per-user Claude Code sessions** — each WhatsApp user gets an isolated Claude Code instance in its own tmux session
 - **OTP verification** — admin generates a code, shares a `wa.me` click-to-send link, users verify with one tap
 - **Admin system** — set an admin via OTP, they receive all permission requests
-- **Poll-based permission approvals** — admin taps Allow/Deny on WhatsApp polls instead of typing codes
+- **Poll-based permission approvals** — admin taps Allow/Always Allow/Deny via WhatsApp polls
+- **Pattern-based auto-approve** — after tapping "Always allow curl", all future `curl` commands auto-approve
 - **Display names** — auto-detected from WhatsApp push name, admin can rename via SSH menu
 - **Typing indicators** — users see "typing..." while Claude processes their message
 - **Idle session cleanup** — user sessions killed after 30min idle, respawn on next message
-- **Abort on deny** — when admin denies a permission, Claude Code's task is aborted (Escape sent), with 30s cooldown to prevent retry spam
+- **Abort on deny** — when admin denies a permission, Claude Code's task is aborted (Escape sent)
 - **User session menu** — SSH login menu shows active user sessions, selectable to attach and observe
 
 ### v0.0.4 (2026-04-09)

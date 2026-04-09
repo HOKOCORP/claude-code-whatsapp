@@ -196,7 +196,7 @@ function enqueueSaveCreds() {
 
 // ── WhatsApp Connection ─────────────────────────────────────────────
 
-let sock = null; let connectionReady = false; let retryCount = 0; let connectedAt = 0; let lastInboundAt = 0; let watchdogTimer = null;
+let sock = null; let connectionReady = false; let retryCount = 0; let connectedAt = 0; let lastInboundAt = 0; let watchdogTimer = null; let wasPairing = false;
 function computeDelay(n) { const b = Math.min(RECONNECT.initialMs * Math.pow(RECONNECT.factor, n), RECONNECT.maxMs); return Math.max(250, Math.round(b + b * RECONNECT.jitter * (Math.random() * 2 - 1))); }
 function cleanupSocket() { if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; } if (sock) { try { sock.ev.removeAllListeners(); } catch {} try { sock.end(undefined); } catch {} sock = null; } connectionReady = false; }
 
@@ -210,7 +210,7 @@ async function connectWhatsApp() {
   sock.ev.on("creds.update", enqueueSaveCreds);
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
-    if (qr) { qrcode.generate(qr, { small: true }, (code) => { log("scan QR code"); process.stderr.write(code + "\n"); }); }
+    if (qr) { wasPairing = true; qrcode.generate(qr, { small: true }, (code) => { log("scan QR code"); process.stderr.write(code + "\n"); }); }
     if (connection === "close") {
       connectionReady = false; const reason = lastDisconnect?.error?.output?.statusCode;
       if (reason === 440) { log("session conflict (440)"); return; }
@@ -232,12 +232,15 @@ async function connectWhatsApp() {
       } catch {}
       log("connected");
       saveConnTimestamp();
-      // Auto-detach tmux after successful pairing so user doesn't get stuck
-      if (process.env.TMUX) {
-        setTimeout(() => {
-          log("paired successfully — detaching tmux session");
-          execFile("tmux", ["detach-client"], () => {});
-        }, 2000);
+      // Auto-detach tmux only after fresh QR pairing (not on reconnects)
+      if (wasPairing) {
+        wasPairing = false;
+        if (process.env.TMUX) {
+          setTimeout(() => {
+            log("paired successfully — detaching tmux session");
+            execFile("tmux", ["detach-client"], () => {});
+          }, 2000);
+        }
       }
       if (watchdogTimer) clearInterval(watchdogTimer);
       watchdogTimer = setInterval(() => { if (connectionReady && lastInboundAt && Date.now() - lastInboundAt > STALE_TIMEOUT) { log("stale"); connectWhatsApp(); } }, WATCHDOG_INTERVAL);
@@ -247,10 +250,10 @@ async function connectWhatsApp() {
 
   // ── Message handler ─────────────────────────────────────────────
   sock.ev.on("messages.upsert", async ({ messages }) => {
-    log(`messages.upsert: ${messages.length} message(s)`);
+    // log(`messages.upsert: ${messages.length} message(s)`);
     for (const msg of messages) {
       const rjid = msg.key?.remoteJid || "";
-      if (rjid.endsWith("@g.us")) log(`group raw: jid=${rjid} hasMsg=${!!msg.message} fromMe=${msg.key.fromMe} text="${extractText(msg.message||{}).slice(0,50)}"`);
+      // Debug: if (rjid.endsWith("@g.us")) log(`group: ${rjid} text="${extractText(msg.message||{}).slice(0,30)}"`);
       if (!msg.message || msg.key.fromMe) continue;
       // Handle poll votes — match to pending permission polls
       if (msg.message.pollUpdateMessage) {
@@ -273,22 +276,26 @@ async function connectWhatsApp() {
                 if (vote?.selectedOptions?.length) {
                   const selected = vote.selectedOptions.map((o) => Buffer.from(o).toString("utf8"));
                   if (selected.some((s) => s.includes("Deny"))) behavior = "deny";
+                  else if (selected.some((s) => s.includes("Always"))) behavior = "always";
                 }
               }
             }
           } catch (e) { log(`poll decrypt error: ${e}`); }
 
+          const actualBehavior = behavior === "always" ? "allow" : behavior;
           log(`poll vote: ${behavior} for ${pending.requestId} (user ${pending.userId})`);
 
           // Write response for bridge
-          fs.writeFileSync(path.join(USERS_DIR, pending.userId, "permissions", `response-${pending.requestId}.json`), JSON.stringify({ request_id: pending.requestId, behavior }));
+          fs.writeFileSync(path.join(USERS_DIR, pending.userId, "permissions", `response-${pending.requestId}.json`), JSON.stringify({ request_id: pending.requestId, behavior: actualBehavior }));
           try { fs.unlinkSync(path.join(USERS_DIR, pending.userId, "permissions", `request-${pending.requestId}.json`)); } catch {}
 
           if (behavior === "deny") {
             execFile("tmux", ["send-keys", "-t", getUserSessionName(pending.userId), "Escape"], () => {});
-            if (pending.userJid) { try { await sock.sendMessage(pending.userJid, { text: "\u274C The admin denied the request. Please try rephrasing what you need." }); } catch {} }
-          } else {
-            // Don't send status to group — too spammy
+          } else if (behavior === "always" && pending.patternSig) {
+            // Save pattern for auto-approve
+            if (!approvedPatterns.has(pending.userId)) approvedPatterns.set(pending.userId, []);
+            approvedPatterns.get(pending.userId).push({ tool: pending.toolName, pattern: pending.patternSig });
+            log(`pattern saved: ${pending.toolName}:${pending.patternSig} for ${pending.userId}`);
           }
         }
         continue;
@@ -342,7 +349,7 @@ async function connectWhatsApp() {
         const prefixed = cleanText.toLowerCase().startsWith(trigger);
         // Also check if trigger appears anywhere (for @mentions mid-sentence)
         const containsTrigger = cleanText.toLowerCase().includes(trigger);
-        log(`group msg: "${cleanText.slice(0,50)}" | trigger="${trigger}" mentioned=${!!mentioned} prefixed=${prefixed} contains=${containsTrigger}`);
+        // log(`group: "${cleanText.slice(0,30)}" trigger=${prefixed||containsTrigger} mentioned=${!!mentioned}`);
         if (!mentioned && !prefixed && !containsTrigger) {
           continue;
         }
@@ -366,7 +373,6 @@ async function connectWhatsApp() {
               fs.unlinkSync(reqFile);
               if (behavior === "deny") {
                 execFile("tmux", ["send-keys", "-t", getUserSessionName(uid), "Escape"], () => {});
-                if (reqData.user_jid) { try { await sock.sendMessage(reqData.user_jid, { text: "\u274C The admin denied the request. Please try rephrasing what you need." }); } catch {} }
               }
               break;
             }
@@ -431,9 +437,7 @@ async function connectWhatsApp() {
 
   // ── Poll vote handler (for permission approvals) ────────────────
   sock.ev.on("messages.update", async (updates) => {
-    log(`messages.update: ${updates.length} update(s)`);
     for (const update of updates) {
-      log(`update: key=${update.key?.id} hasPollUpdates=${!!update.update?.pollUpdates}`);
       if (!update.update?.pollUpdates) continue;
       const pollMsgId = update.key?.id;
       const pending = pendingPolls.get(pollMsgId);
@@ -523,6 +527,8 @@ setInterval(async () => {
 
 // Map poll message IDs to { requestId, userId, userJid }
 const pendingPolls = new Map();
+// Pattern-based auto-approve: userId → [{ tool, pattern }]
+const approvedPatterns = new Map();
 
 setInterval(async () => {
   if (!sock || !connectionReady) return;
@@ -534,7 +540,31 @@ setInterval(async () => {
       for (const f of files) {
         try {
           const d = JSON.parse(fs.readFileSync(path.join(pdir, f), "utf8"));
-          if (d._sent) continue; d._sent = true;
+          if (d._sent) continue;
+
+          // Check if this matches an already-approved pattern
+          const patterns = approvedPatterns.get(uid) || [];
+          const toolName = d.tool_name || "";
+          let inputSig = "";
+          try {
+            const p = JSON.parse(d.input_preview);
+            if (toolName.toLowerCase().includes("bash")) inputSig = p.command || d.input_preview;
+            else inputSig = d.input_preview;
+          } catch { inputSig = d.input_preview; }
+
+          const matched = patterns.some((p) => {
+            if (p.tool !== toolName) return false;
+            if (p.pattern === "*") return true;
+            return inputSig.startsWith(p.pattern);
+          });
+          if (matched) {
+            log(`auto-approved ${d.request_id} for ${uid} (pattern match)`);
+            fs.writeFileSync(path.join(pdir, `response-${d.request_id}.json`), JSON.stringify({ request_id: d.request_id, behavior: "allow" }));
+            fs.unlinkSync(path.join(pdir, f));
+            continue;
+          }
+
+          d._sent = true;
           fs.writeFileSync(path.join(pdir, f), JSON.stringify(d));
 
           let action = d.description || "";
@@ -543,26 +573,37 @@ setInterval(async () => {
           let displayName = d.user_number || uid;
           try { const meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8")); if (meta.name) displayName = meta.name; } catch {}
 
-          // Send context message first
+          // Send context + poll to admin
           const contextText = `\uD83D\uDD10 *Permission Request*\n\n\uD83D\uDC64 From: ${displayName}\n${d.user_message ? `\uD83D\uDCAC "${d.user_message.slice(0,100)}"\n` : ""}\n\u26A1 ${action}`;
           await sock.sendMessage(admin.jid, { text: contextText });
 
-          // Send poll for approval
+          // Build a signature for "allow all similar" pattern
+          let patternSig = "";
+          try {
+            const p = JSON.parse(d.input_preview);
+            if (toolName.toLowerCase().includes("bash")) {
+              // Use the command prefix (first word or up to first space)
+              const cmd = p.command || d.input_preview;
+              patternSig = cmd.split(" ")[0]; // e.g. "curl", "cat", "npm"
+            } else {
+              patternSig = toolName;
+            }
+          } catch { patternSig = toolName; }
+
           const pollMsg = await sock.sendMessage(admin.jid, {
             poll: {
-              name: "Approve this action?",
+              name: "Approve?",
               selectableCount: 1,
-              values: ["\u2705 Allow", "\u274C Deny"],
+              values: ["\u2705 Allow", `\u2705 Always allow ${patternSig}`, "\u274C Deny"],
             },
           });
 
           if (pollMsg?.key?.id) {
-            pendingPolls.set(pollMsg.key.id, { requestId: d.request_id, userId: uid, userJid: d.user_jid });
-            // Store sent poll so Baileys can decrypt votes via getMessage callback
+            pendingPolls.set(pollMsg.key.id, { requestId: d.request_id, userId: uid, userJid: d.user_jid, toolName, patternSig });
             storeRaw(pollMsg);
           }
 
-          // Don't send "waiting" to groups — too spammy. Only DMs.
+          // Only send "waiting" to DMs, not groups
           if (d.user_jid && !d.user_jid.endsWith("@g.us")) {
             try { await sock.sendMessage(d.user_jid, { text: "\u23F3 Waiting for admin approval..." }); } catch {}
           }
