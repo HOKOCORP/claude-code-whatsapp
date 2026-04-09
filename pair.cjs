@@ -1,13 +1,29 @@
 #!/usr/bin/env node
-// Standalone WhatsApp pairing — run from plugin dir for node_modules
-// Usage: cd ~/.claude/plugins/cache/nexus-plugins/whatsapp/0.0.1 && node ~/nexus/scripts/whatsapp-pair.cjs
+// WhatsApp pairing script
+// Usage: node pair.cjs <phone_number> [state_dir]
+// Example: node pair.cjs 85258080138
+// Example: node pair.cjs 85258080138 /root/.claude/channels/whatsapp-2
 const { default: makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, fetchLatestBaileysVersion, DisconnectReason } = require("@whiskeysockets/baileys");
 const qrcode = require("qrcode-terminal");
 const pino = require("pino");
 
-const AUTH_DIR = "/Users/stent/.claude/channels/whatsapp/auth";
+const PHONE = process.argv[2];
+if (!PHONE) {
+  console.error("Usage: node pair.cjs <phone_number> [state_dir]");
+  console.error("  phone_number: digits only, with country code (e.g. 85258080138)");
+  console.error("  state_dir:    optional, defaults to /root/.claude/channels/whatsapp-<phone>");
+  process.exit(1);
+}
 
-console.log("WhatsApp pairing — auth dir:", AUTH_DIR);
+const STATE_DIR = process.argv[3] || process.env.WHATSAPP_STATE_DIR || "/root/.claude/channels/whatsapp-" + PHONE;
+const AUTH_DIR = STATE_DIR + "/auth";
+
+const fs = require("fs");
+fs.mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
+
+console.log("WhatsApp pairing");
+console.log("  Phone:    +" + PHONE);
+console.log("  Auth dir: " + AUTH_DIR);
 console.log("Connecting...\n");
 
 (async () => {
@@ -26,11 +42,10 @@ console.log("Connecting...\n");
 
   sock.ev.on("creds.update", saveCreds);
 
-  // Request pairing code (phone-based, no QR scan needed)
   if (!state.creds.registered) {
     setTimeout(async () => {
       try {
-        const code = await sock.requestPairingCode("556281955400");
+        const code = await sock.requestPairingCode(PHONE);
         console.log(`\n📱 PAIRING CODE: ${code}\n`);
         console.log("WhatsApp > Linked Devices > Link a Device > Link with phone number");
         console.log("Enter the code above.\n");
