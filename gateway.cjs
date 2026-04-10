@@ -231,7 +231,7 @@ async function connectWhatsApp() {
     if (qr) { wasPairing = true; qrcode.generate(qr, { small: true }, (code) => { log("scan QR code"); process.stderr.write(code + "\n"); }); }
     if (connection === "close") {
       connectionReady = false; const reason = lastDisconnect?.error?.output?.statusCode;
-      if (reason === 440) { log("session conflict (440)"); return; }
+      if (reason === 440) { log("session conflict (440) — exiting to let launcher restart with cooldown"); saveConnTimestamp(); cleanupSocket(); process.exit(1); }
       if (reason === DisconnectReason.loggedOut) { log("logged out (401)"); return; }
       if (reason === 515) { log("restart (515)"); setTimeout(connectWhatsApp, 2000); return; }
       if (connectedAt && Date.now() - connectedAt > HEALTHY_THRESHOLD) retryCount = 0;
