@@ -261,7 +261,17 @@ async function connectWhatsApp() {
         }
       }
       if (watchdogTimer) clearInterval(watchdogTimer);
-      watchdogTimer = setInterval(() => { if (connectionReady && lastInboundAt && Date.now() - lastInboundAt > STALE_TIMEOUT) { log("stale"); connectWhatsApp(); } }, WATCHDOG_INTERVAL);
+      watchdogTimer = setInterval(() => {
+        if (!connectionReady || !lastInboundAt) return;
+        if (Date.now() - lastInboundAt <= STALE_TIMEOUT) return;
+        // Don't reconnect if device is deregistered — reconnecting won't help, just burns credentials
+        try {
+          const c = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, "creds.json"), "utf8"));
+          if (c.registered === false) return;
+        } catch {}
+        log("stale — reconnecting");
+        connectWhatsApp();
+      }, WATCHDOG_INTERVAL);
     }
   });
   if (sock.ws && typeof sock.ws.on === "function") sock.ws.on("error", (err) => log(`ws error: ${err}`));
@@ -521,6 +531,8 @@ setInterval(async () => {
         const fp = path.join(odir, f);
         try {
           const d = fs.readFileSync(fp, "utf8"); fs.unlinkSync(fp); const a = JSON.parse(d);
+          // Track outbound activity so active sessions don't get killed as idle
+          userActivity.set(uid, Date.now());
           if (a.action === "reply") {
             if (a.text) { const q = a.reply_to ? rawMessages.get(a.reply_to) : undefined; await sock.sendMessage(a.chat_id, { text: a.text }, q ? { quoted: q } : undefined); }
             for (const file of (a.files || [])) {
@@ -643,10 +655,19 @@ setInterval(async () => {
 setInterval(() => {
   const now = Date.now();
   for (const [uid, last] of userActivity) {
-    if (now - last > SESSION_IDLE_MS) {
-      execFile("tmux", ["kill-session", "-t", getUserSessionName(uid)], () => {});
-      userActivity.delete(uid); log(`killed idle session for ${uid}`);
-    }
+    if (now - last <= SESSION_IDLE_MS) continue;
+    // Check if there are pending permission requests — don't kill if admin might still approve
+    try {
+      const permDir = path.join(USERS_DIR, uid, "permissions");
+      const pending = fs.readdirSync(permDir).filter((f) => f.startsWith("request-"));
+      if (pending.length > 0) {
+        log(`session ${uid} idle but has pending permission — skipping kill`);
+        continue;
+      }
+    } catch {}
+    execFile("tmux", ["kill-session", "-t", getUserSessionName(uid)], () => {});
+    userActivity.delete(uid);
+    log(`killed idle session for ${uid}`);
   }
 }, 60000);
 
