@@ -159,10 +159,28 @@ function spawnUserSession(userId, userJid) {
   const sessionName = getUserSessionName(userId);
   if (isSessionRunning(sessionName)) return;
 
-  // Launcher script — pass --allowedTools to auto-approve MCP tools
+  // Launcher script — use acceptEdits + broad allowedTools
+  // Covers file ops and common commands; dangerous ops still go to admin poll
   const launcher = path.join(userDir, "launch.sh");
-  const allowedTools = "mcp__whatsapp__reply mcp__whatsapp__react mcp__whatsapp__download_attachment mcp__whatsapp__fetch_messages";
-  fs.writeFileSync(launcher, `#!/bin/bash\ncd "${userWorkDir}"\nexec cc-watchdog --dangerously-load-development-channels "server:whatsapp" --allowedTools ${allowedTools}\n`);
+  const allowedTools = [
+    "mcp__whatsapp__reply", "mcp__whatsapp__react", "mcp__whatsapp__download_attachment", "mcp__whatsapp__fetch_messages",
+    "Read", "Write", "Edit", "Glob", "Grep", "LS",
+    '"Bash(git:*)"', '"Bash(ls:*)"', '"Bash(cat:*)"', '"Bash(find:*)"', '"Bash(head:*)"', '"Bash(tail:*)"',
+    '"Bash(echo:*)"', '"Bash(pwd:*)"', '"Bash(wc:*)"', '"Bash(sort:*)"', '"Bash(grep:*)"',
+    '"Bash(npm:*)"', '"Bash(node:*)"', '"Bash(python3:*)"', '"Bash(pip:*)"',
+    '"Bash(curl:*)"', '"Bash(wget:*)"', '"Bash(which:*)"', '"Bash(whoami:*)"',
+    '"Bash(date:*)"', '"Bash(uname:*)"', '"Bash(df:*)"', '"Bash(du:*)"', '"Bash(free:*)"',
+    '"Bash(ps:*)"', '"Bash(top:*)"', '"Bash(env:*)"', '"Bash(printenv:*)"',
+    '"Bash(mkdir:*)"', '"Bash(cp:*)"', '"Bash(mv:*)"', '"Bash(touch:*)"',
+    '"Bash(chmod:*)"', '"Bash(chown:*)"', '"Bash(stat:*)"', '"Bash(file:*)"',
+    '"Bash(tar:*)"', '"Bash(zip:*)"', '"Bash(unzip:*)"',
+    '"Bash(apt:*)"', '"Bash(apt-get:*)"', '"Bash(dpkg:*)"',
+    '"Bash(systemctl:*)"', '"Bash(journalctl:*)"',
+    '"Bash(docker:*)"', '"Bash(ssh:*)"', '"Bash(scp:*)"',
+    '"Bash(make:*)"', '"Bash(gcc:*)"', '"Bash(cargo:*)"', '"Bash(go:*)"',
+    '"Bash(gh:*)"',
+  ].join(" ");
+  fs.writeFileSync(launcher, `#!/bin/bash\ncd "${userWorkDir}"\nexec cc-watchdog --dangerously-load-development-channels "server:whatsapp" --permission-mode acceptEdits --allowedTools ${allowedTools}\n`);
   fs.chmodSync(launcher, 0o755);
 
   execFile("tmux", ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50", launcher], (err) => {
@@ -217,7 +235,7 @@ async function connectWhatsApp() {
       if (reason === DisconnectReason.loggedOut) { log("logged out (401)"); return; }
       if (reason === 515) { log("restart (515)"); setTimeout(connectWhatsApp, 2000); return; }
       if (connectedAt && Date.now() - connectedAt > HEALTHY_THRESHOLD) retryCount = 0;
-      if (retryCount >= 15) { retryCount = 0; setTimeout(connectWhatsApp, 300000); return; }
+      if (retryCount >= 5) { log("max retries (5) — waiting 5 min"); retryCount = 0; setTimeout(connectWhatsApp, 300000); return; }
       setTimeout(connectWhatsApp, computeDelay(retryCount++));
     }
     if (connection === "open") {
@@ -336,21 +354,28 @@ async function connectWhatsApp() {
 
       if (!isAllowed(jid, participant || undefined)) continue;
 
-      // Group messages: only respond when mentioned or trigger prefix used
+      // Group messages: only respond when triggered
       if (jid.endsWith("@g.us")) {
         const access = loadAccess();
         const groupText = extractText(msg.message || {});
-        // Strip invisible Unicode chars (WhatsApp inserts LRI/RLI/PDI around mentions)
         const cleanText = groupText.replace(/[\u2066\u2067\u2068\u2069\u200E\u200F\u200B\u200C\u200D\uFEFF]/g, "");
         const trigger = (access.groupTrigger || "@ai").toLowerCase();
         const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.some(
           (m) => m.includes(PHONE) || (sock?.user?.id && m.includes(sock.user.id.split(":")[0]))
         );
         const prefixed = cleanText.toLowerCase().startsWith(trigger);
-        // Also check if trigger appears anywhere (for @mentions mid-sentence)
         const containsTrigger = cleanText.toLowerCase().includes(trigger);
-        // log(`group: "${cleanText.slice(0,30)}" trigger=${prefixed||containsTrigger} mentioned=${!!mentioned}`);
-        if (!mentioned && !prefixed && !containsTrigger) {
+        // Check if replying to a message from the bot
+        const quotedCtx = msg.message?.extendedTextMessage?.contextInfo || {};
+        const quotedParticipant = quotedCtx.participant || "";
+        const botId = sock?.user?.id || "";
+        const botLid = sock?.user?.lid || "";
+        const isReplyToBot = !!quotedCtx.stanzaId && (
+          quotedParticipant.includes(PHONE) ||
+          (botId && quotedParticipant.includes(botId.split(":")[0])) ||
+          (botLid && quotedParticipant.includes(botLid.split(":")[0]))
+        );
+        if (!mentioned && !prefixed && !containsTrigger && !isReplyToBot) {
           continue;
         }
       }

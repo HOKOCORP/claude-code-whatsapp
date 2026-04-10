@@ -314,6 +314,10 @@ Built on patterns from [OpenClaw's WhatsApp extension](https://github.com/opencl
 - **Pattern-based auto-approve** — "Always allow `<command>`" poll option saves the command prefix, auto-approves matching future commands (like Claude Code's batch mode)
 - **No group spam** — "waiting for approval" and "approved" status messages only sent to DMs, not groups
 - **Auto-detach only on pairing** — tmux auto-detach now only triggers after QR code pairing, not on normal reconnects
+- **Reply-to-bot trigger** — in groups, swipe-replying to the bot's message also triggers a response (no need to type `@ai`)
+- **Broad allowedTools list** — common file ops and commands (git, curl, npm, etc.) auto-approve via `--allowedTools` flag
+- **Max 5 retries** — reduced from 15 to match proven patterns from production bots, reducing deregistration risk
+- **No permission timeout** — admin can approve polls anytime (was 5 min auto-deny), useful when asleep or away
 
 ### v0.1.0 (2026-04-09)
 **Major architecture update: per-user sessions**

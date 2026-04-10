@@ -124,20 +124,10 @@ mcp.setNotificationHandler(
       user_jid: USER_JID,
     }));
 
-    // Poll for response from gateway
-    const deadline = Date.now() + 5 * 60 * 1000; // 5 min timeout
+    // Poll for response from gateway — no timeout, admin can approve anytime
     const respFile = path.join(PERM_DIR, `response-${params.request_id}.json`);
 
     const poll = () => {
-      if (Date.now() > deadline) {
-        // Timeout — auto-deny
-        mcp.notification({
-          method: "notifications/claude/channel/permission",
-          params: { request_id: params.request_id, behavior: "deny" },
-        }).catch(() => {});
-        try { fs.unlinkSync(reqFile); } catch {}
-        return;
-      }
       try {
         if (fs.existsSync(respFile)) {
           const resp = JSON.parse(fs.readFileSync(respFile, "utf8"));
