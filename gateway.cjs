@@ -159,8 +159,27 @@ function spawnUserSession(userId, userJid) {
   const sessionName = getUserSessionName(userId);
   if (isSessionRunning(sessionName)) return;
 
-  // Launcher script — use acceptEdits + broad allowedTools
-  // Covers file ops and common commands; dangerous ops still go to admin poll
+  // Launcher script — bypassPermissions so Claude can run any tool call
+  // without a WhatsApp poll round-trip on every compound command.
+  //
+  // Was: --permission-mode acceptEdits
+  // Now: --permission-mode bypassPermissions
+  //
+  // Rationale: acceptEdits only auto-allows Edit tool calls. Bash tool
+  // calls (even whitelisted ones like `ls`) still go through the
+  // permission system, and compound bash commands (e.g. `ls | head;
+  // echo ---; ls | head`) are treated as single compound commands that
+  // need explicit approval even when every sub-command is on the
+  // allowlist. The result is death by a thousand polls — Claude can't
+  // explore a project without the admin tapping Allow on every step.
+  //
+  // bypassPermissions is safe here because: (a) the WhatsApp whitelist
+  // is the real access control — only admin-approved JIDs can send
+  // messages at all, (b) each per-user Claude session runs in its own
+  // workspace directory with the process's own uid, (c) the bot is
+  // single-admin by design. The permission poll system is still
+  // available for any tool call the model decides to escalate
+  // manually, but routine file exploration is no longer gated.
   const launcher = path.join(userDir, "launch.sh");
   const allowedTools = [
     "mcp__whatsapp__reply", "mcp__whatsapp__react", "mcp__whatsapp__download_attachment", "mcp__whatsapp__fetch_messages",
@@ -180,7 +199,7 @@ function spawnUserSession(userId, userJid) {
     '"Bash(make:*)"', '"Bash(gcc:*)"', '"Bash(cargo:*)"', '"Bash(go:*)"',
     '"Bash(gh:*)"',
   ].join(" ");
-  fs.writeFileSync(launcher, `#!/bin/bash\ncd "${userWorkDir}"\nexec cc-watchdog --dangerously-load-development-channels "server:whatsapp" --permission-mode acceptEdits --allowedTools ${allowedTools}\n`);
+  fs.writeFileSync(launcher, `#!/bin/bash\ncd "${userWorkDir}"\nexec cc-watchdog --dangerously-load-development-channels "server:whatsapp" --permission-mode bypassPermissions --allowedTools ${allowedTools}\n`);
   fs.chmodSync(launcher, 0o755);
 
   execFile("tmux", ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50", launcher], (err) => {
@@ -270,6 +289,12 @@ async function connectWhatsApp() {
           if (c.registered === false) return;
         } catch {}
         log("stale — reconnecting");
+        // Reset lastInboundAt so the new connection gets a full
+        // STALE_TIMEOUT window to receive messages. Otherwise the
+        // watchdog fires every WATCHDOG_INTERVAL (60s) forever because
+        // lastInboundAt never advances while inbound traffic is idle,
+        // burning reconnects and spamming the log.
+        lastInboundAt = Date.now();
         connectWhatsApp();
       }, WATCHDOG_INTERVAL);
     }
