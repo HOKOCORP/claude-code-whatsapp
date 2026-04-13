@@ -110,6 +110,60 @@ function ensureUserConfig(userId, userJid) {
   const userWorkDir = path.join(userDir, "workspace");
   fs.mkdirSync(userWorkDir, { recursive: true });
 
+  // Per-user CLAUDE.md — security boundary for channel sessions.
+  // Tells Claude what this session can/cannot access.
+  const admin = loadAdmin();
+  const isUserAdmin = admin && (admin.jid === userJid || toJid(admin.jid) === userJid);
+  const claudeMdPath = path.join(userWorkDir, "CLAUDE.md");
+  const claudeMdContent = isUserAdmin
+    ? [
+        "# Channel Session (Admin)",
+        "",
+        "You are running inside a WhatsApp channel session as the **admin** user.",
+        "",
+        "## Credentials — NEVER print in chat",
+        "",
+        "**NEVER** output API keys, tokens, passwords, or secret values in your replies.",
+        "Chat messages are stored in message history and are effectively public.",
+        "",
+        "If the user asks to see a credential value:",
+        '- Say: "For security, credentials can only be viewed via SSH. Run `ccm` → Settings on the server."',
+        "- You may check if a token is set: `[ -n \"$VAR_NAME\" ] && echo set || echo not-set`",
+        "- NEVER print the actual value, even partially masked.",
+        "",
+      ].join("\n")
+    : [
+        "# Channel Session (User)",
+        "",
+        "You are running inside a WhatsApp channel session as a **non-admin** user.",
+        "",
+        "## Security Boundaries",
+        "",
+        "**You MUST NOT read, access, or reference any of these files or directories:**",
+        "- `~/.env` or `$HOME/.env` — contains server credentials",
+        "- `~/.claude/channels/` — contains channel state and admin config",
+        "- `~/.ccm/` — contains menu system modules",
+        "- `~/.cc-login.sh` — contains menu system loader",
+        "- `~/.ssh/` — contains SSH keys",
+        "- Any `.env` file outside the current workspace",
+        "- Any `admin.json`, `access.json`, or `otp.json` file",
+        "",
+        "**You MUST NOT:**",
+        "- Read environment variables that contain tokens or secrets",
+        "- Attempt to access credentials, API keys, or tokens in any way",
+        "- Read other users' workspace directories",
+        "- Read Claude conversation history files (*.jsonl)",
+        "",
+        "If the user asks about credentials or tokens, say:",
+        '"You don\'t have access to server credentials. Contact the admin."',
+        "",
+        "## Workspace",
+        "",
+        "You may only work within the current directory and its subdirectories.",
+        "",
+      ].join("\n");
+  fs.writeFileSync(claudeMdPath, claudeMdContent);
+
   // Per-user MCP config
   fs.writeFileSync(path.join(userWorkDir, ".mcp.json"), JSON.stringify({
     mcpServers: { whatsapp: { command: "node", args: [path.join(__dirname, "bridge.cjs")], env: { BRIDGE_USER_DIR: userDir, BRIDGE_USER_JID: userJid, BRIDGE_PHONE: PHONE } } }
@@ -191,7 +245,10 @@ function spawnUserSession(userId, userJid) {
   const allowedTools = [
     "mcp__whatsapp__reply", "mcp__whatsapp__react", "mcp__whatsapp__download_attachment", "mcp__whatsapp__fetch_messages",
     "Read", "Write", "Edit", "Glob", "Grep", "LS",
-    '"Bash(git:*)"', '"Bash(ls:*)"', '"Bash(cat:*)"', '"Bash(find:*)"', '"Bash(head:*)"', '"Bash(tail:*)"',
+    '"Bash(git:*)"', '"Bash(ls:*)"',
+    // cat/head/tail can read arbitrary files — admin only
+    ...(isAdmin ? ['"Bash(cat:*)"', '"Bash(head:*)"', '"Bash(tail:*)"'] : []),
+    '"Bash(find:*)"',
     '"Bash(echo:*)"', '"Bash(pwd:*)"', '"Bash(wc:*)"', '"Bash(sort:*)"', '"Bash(grep:*)"',
     '"Bash(npm:*)"', '"Bash(node:*)"', '"Bash(python3:*)"', '"Bash(pip:*)"',
     '"Bash(curl:*)"', '"Bash(wget:*)"', '"Bash(which:*)"', '"Bash(whoami:*)"',
