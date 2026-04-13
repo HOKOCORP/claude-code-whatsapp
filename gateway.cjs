@@ -245,16 +245,13 @@ function spawnUserSession(userId, userJid) {
   const allowedTools = [
     "mcp__whatsapp__reply", "mcp__whatsapp__react", "mcp__whatsapp__download_attachment", "mcp__whatsapp__fetch_messages",
     "Read", "Write", "Edit", "Glob", "Grep", "LS",
-    '"Bash(git:*)"', '"Bash(ls:*)"',
-    // cat/head/tail can read arbitrary files — admin only
-    ...(isAdmin ? ['"Bash(cat:*)"', '"Bash(head:*)"', '"Bash(tail:*)"'] : []),
-    '"Bash(find:*)"',
+    '"Bash(git:*)"', '"Bash(ls:*)"', '"Bash(cat:*)"', '"Bash(find:*)"', '"Bash(head:*)"', '"Bash(tail:*)"',
     '"Bash(echo:*)"', '"Bash(pwd:*)"', '"Bash(wc:*)"', '"Bash(sort:*)"', '"Bash(grep:*)"',
     '"Bash(npm:*)"', '"Bash(node:*)"', '"Bash(python3:*)"', '"Bash(pip:*)"',
     '"Bash(curl:*)"', '"Bash(wget:*)"', '"Bash(which:*)"', '"Bash(whoami:*)"',
     '"Bash(date:*)"', '"Bash(uname:*)"', '"Bash(df:*)"', '"Bash(du:*)"', '"Bash(free:*)"',
     '"Bash(ps:*)"', '"Bash(top:*)"',
-    // env/printenv only for admin — non-admin could use these to dump tokens
+    // env/printenv admin-only — these directly dump all environment variables
     ...(isAdmin ? ['"Bash(env:*)"', '"Bash(printenv:*)"'] : []),
     '"Bash(mkdir:*)"', '"Bash(cp:*)"', '"Bash(mv:*)"', '"Bash(touch:*)"',
     '"Bash(chmod:*)"', '"Bash(chown:*)"', '"Bash(stat:*)"', '"Bash(file:*)"',
