@@ -135,16 +135,14 @@ function syncUserUsage(userId) {
   const today = todayKey();
   const usage = loadUserUsage(userId);
 
+  const ZERO_USAGE = { input_tokens: 0, output_tokens: 0, cache_5m: 0, cache_1h: 0, cache_read: 0, models: {} };
   if (!usage.months) usage.months = {};
-  if (!usage.months[month]) {
-    usage.months[month] = { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0, daily: {} };
-  }
+  if (!usage.months[month]) usage.months[month] = { ...ZERO_USAGE, daily: {} };
   const mo = usage.months[month];
   if (!mo.daily) mo.daily = {};
-  if (!mo.daily[today]) {
-    mo.daily[today] = { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0 };
-  }
+  if (!mo.daily[today]) mo.daily[today] = { ...ZERO_USAGE };
   const day = mo.daily[today];
+  if (!mo.models) mo.models = {};
   if (!usage.offsets) usage.offsets = {};
 
   let newBillable = 0;
@@ -165,17 +163,30 @@ function syncUserUsage(userId) {
       try {
         const d = JSON.parse(line);
         if (d.type !== "message" && d.message?.type !== "message") continue;
-        const u = (d.message || d).usage;
+        const msg = d.message || d;
+        const u = msg.usage;
         if (!u) continue;
         const inp = u.input_tokens || 0;
         const out = u.output_tokens || 0;
-        const cc = u.cache_creation_input_tokens || 0;
+        const c5m = u.cache_creation?.ephemeral_5m_input_tokens || 0;
+        const c1h = u.cache_creation?.ephemeral_1h_input_tokens || 0;
         const cr = u.cache_read_input_tokens || 0;
+        const model = msg.model || "unknown";
+
+        // Accumulate into monthly + daily
         mo.input_tokens += inp;   day.input_tokens += inp;
         mo.output_tokens += out;  day.output_tokens += out;
-        mo.cache_creation += cc;  day.cache_creation += cc;
-        mo.cache_read += cr;      day.cache_read += cr;
-        newBillable += inp + out + cc;
+        mo.cache_5m = (mo.cache_5m || 0) + c5m;   day.cache_5m = (day.cache_5m || 0) + c5m;
+        mo.cache_1h = (mo.cache_1h || 0) + c1h;   day.cache_1h = (day.cache_1h || 0) + c1h;
+        mo.cache_read = (mo.cache_read || 0) + cr; day.cache_read = (day.cache_read || 0) + cr;
+
+        // Per-model tracking
+        if (!mo.models[model]) mo.models[model] = { input_tokens: 0, output_tokens: 0, cache_5m: 0, cache_1h: 0, cache_read: 0 };
+        const mm = mo.models[model];
+        mm.input_tokens += inp; mm.output_tokens += out; mm.cache_5m += c5m; mm.cache_1h += c1h; mm.cache_read += cr;
+
+        // Billable = input + output + cache writes (not reads)
+        newBillable += inp + out + c5m + c1h;
       } catch {}
     }
     usage.offsets[file] = stat.size;
@@ -751,21 +762,60 @@ async function connectWhatsApp() {
         const u = syncUserUsage(userId);
         const adminCheck = loadAdmin();
         const isAdminUser = adminCheck && userId === sanitizeUserId(adminCheck.jid);
-        const mo = u.months?.[monthKey()] || { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0 };
-        const billable = mo.input_tokens + mo.output_tokens + mo.cache_creation;
-        const fmtN = (n) => Math.abs(n) >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : Math.abs(n) >= 1e3 ? `${Math.round(n / 1e3)}K` : String(n);
-        const lines = isAdminUser
-          ? [
-              `Token Usage (Admin — Unlimited)`,
-              `This month: ${fmtN(billable)} billable`,
-              `All time: ${fmtN(u.total_used || 0)} used`,
-            ]
-          : [
-              `Token Usage`,
-              `Balance: ${fmtN(u.balance)} tokens${u.balance <= 0 ? " (no tokens — ask admin)" : ""}`,
-              `This month: ${fmtN(billable)} billable`,
-              `All time: ${fmtN(u.total_used || 0)} used`,
-            ];
+        const mo = u.months?.[monthKey()] || { input_tokens: 0, output_tokens: 0, cache_5m: 0, cache_1h: 0, cache_read: 0, models: {} };
+
+        // Formatting helpers
+        const fmtN = (n) => { const a = Math.abs(n); return a >= 1e6 ? `${(n/1e6).toFixed(1)}M` : a >= 1e3 ? `${Math.round(n/1e3)}K` : String(n); };
+        const fmtUSD = (n) => n < 0.01 ? `<$0.01` : `$${n.toFixed(2)}`;
+
+        // API pricing per million tokens (current Anthropic rates)
+        const PRICING = {
+          "claude-opus-4-6":   { input: 15, output: 75, cache_5m: 18.75, cache_1h: 22.50, cache_read: 1.50 },
+          "claude-sonnet-4-6": { input: 3, output: 15, cache_5m: 3.75, cache_1h: 4.50, cache_read: 0.30 },
+          "claude-haiku-4-5":  { input: 0.80, output: 4, cache_5m: 1.00, cache_1h: 1.20, cache_read: 0.08 },
+        };
+        // Match model name to pricing tier (e.g., "claude-opus-4-6[1m]" → "claude-opus-4-6")
+        const matchPricing = (model) => {
+          for (const key of Object.keys(PRICING)) { if (model.startsWith(key)) return PRICING[key]; }
+          return PRICING["claude-sonnet-4-6"]; // default
+        };
+
+        // Calculate cost per model
+        let totalCost = 0;
+        const modelLines = [];
+        for (const [model, mu] of Object.entries(mo.models || {})) {
+          const p = matchPricing(model);
+          const cost = (mu.input_tokens * p.input + mu.output_tokens * p.output + mu.cache_5m * p.cache_5m + mu.cache_1h * p.cache_1h + mu.cache_read * p.cache_read) / 1e6;
+          totalCost += cost;
+          const shortName = model.replace("claude-", "").replace(/\[.*\]/, "");
+          modelLines.push(`  ${shortName}: in=${fmtN(mu.input_tokens)} out=${fmtN(mu.output_tokens)} 5m=${fmtN(mu.cache_5m)} 1h=${fmtN(mu.cache_1h)} read=${fmtN(mu.cache_read)} → ${fmtUSD(cost)}`);
+        }
+
+        const billable = (mo.input_tokens || 0) + (mo.output_tokens || 0) + (mo.cache_5m || 0) + (mo.cache_1h || 0);
+
+        const lines = [
+          isAdminUser ? `📊 Token Usage (Admin — Unlimited)` : `📊 Token Usage`,
+        ];
+        if (!isAdminUser) {
+          lines.push(`Balance: ${fmtN(u.balance)} tokens${u.balance <= 0 ? " ⚠️" : ""}`);
+        }
+        lines.push(``);
+        lines.push(`This month (${monthKey()}):`);
+        lines.push(`  Input:       ${fmtN(mo.input_tokens || 0)}`);
+        lines.push(`  Output:      ${fmtN(mo.output_tokens || 0)}`);
+        lines.push(`  Cache 5m:    ${fmtN(mo.cache_5m || 0)}`);
+        lines.push(`  Cache 1h:    ${fmtN(mo.cache_1h || 0)}`);
+        lines.push(`  Cache read:  ${fmtN(mo.cache_read || 0)}`);
+        lines.push(`  Billable:    ${fmtN(billable)}`);
+        if (modelLines.length > 0) {
+          lines.push(``);
+          lines.push(`Per model:`);
+          lines.push(...modelLines);
+        }
+        lines.push(``);
+        lines.push(`Est. API cost: ${fmtUSD(totalCost)}`);
+        lines.push(`All time: ${fmtN(u.total_used || 0)} used`);
+
         try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
         continue;
       }
