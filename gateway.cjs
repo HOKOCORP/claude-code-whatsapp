@@ -745,16 +745,9 @@ async function connectWhatsApp() {
         const trigger = (loadAccess().groupTrigger || "@ai");
         text = text.replace(new RegExp(trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "").trim();
       }
-      const senderName = pushName || formatJid(senderJid);
-      // In groups, prefix the message with sender name so Claude knows who's talking
-      if (isGroup && text) text = `[${senderName}] ${text}`;
-      const meta = { chat_id: jid, message_id: msgId, user: formatJid(senderJid), ts: new Date((Number(msg.messageTimestamp) || Date.now() / 1000) * 1000).toISOString() };
-      if (isGroup) { meta.group = "true"; meta.sender_name = senderName; }
-      if (media) { meta.attachment_count = "1"; meta.attachments = `${media.filename || media.type + "." + mimeToExt(media.mimetype)} (${media.mimetype}, ${(media.size / 1024).toFixed(0)}KB)`; }
-
-      // /usage command — reply with balance info, skip dispatch
-      const rawText = extractText(msg.message);
-      if (rawText && rawText.trim().toLowerCase() === "/usage") {
+      // /usage command — check BEFORE sender prefix so it works in groups too
+      // (text has already been trigger-stripped at this point, e.g. "@ai /usage" → "/usage")
+      if (text && text.trim().toLowerCase() === "/usage") {
         const u = syncUserUsage(userId);
         const mo = u.months?.[monthKey()] || { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0 };
         const billable = mo.input_tokens + mo.output_tokens + mo.cache_creation;
@@ -771,6 +764,13 @@ async function connectWhatsApp() {
         try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
         continue;
       }
+
+      const senderName = pushName || formatJid(senderJid);
+      // In groups, prefix the message with sender name so Claude knows who's talking
+      if (isGroup && text) text = `[${senderName}] ${text}`;
+      const meta = { chat_id: jid, message_id: msgId, user: formatJid(senderJid), ts: new Date((Number(msg.messageTimestamp) || Date.now() / 1000) * 1000).toISOString() };
+      if (isGroup) { meta.group = "true"; meta.sender_name = senderName; }
+      if (media) { meta.attachment_count = "1"; meta.attachments = `${media.filename || media.type + "." + mimeToExt(media.mimetype)} (${media.mimetype}, ${(media.size / 1024).toFixed(0)}KB)`; }
 
       const inboxMsg = { content: text || (media ? `(${media.type})` : "(empty)"), meta, raw_msg_id: msgId };
       const tmp = path.join(userDir, "inbox", `.${Date.now()}-${msgId}.tmp`);
