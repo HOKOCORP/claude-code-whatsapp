@@ -779,6 +779,41 @@ async function connectWhatsApp() {
       }
       // /usage command — check BEFORE sender prefix so it works in groups too
       // (text has already been trigger-stripped at this point, e.g. "@ai /usage" → "/usage")
+      if (text && /^\/usage\s+history$/i.test(text.trim())) {
+        const u = syncUserUsage(userId);
+        const fmtN = (n) => { const a = Math.abs(n); return a >= 1e6 ? `${(n/1e6).toFixed(1)}M` : a >= 1e3 ? `${Math.round(n/1e3)}K` : String(n); };
+        const fmtUSD = (n) => n < 0 ? `-$${Math.abs(n).toFixed(2)}` : `$${n.toFixed(2)}`;
+
+        const lines = [`📋 Usage History`];
+
+        // Monthly summaries
+        const months = Object.keys(u.months || {}).sort().reverse();
+        if (months.length > 0) {
+          lines.push(``);
+          lines.push(`Monthly:`);
+          for (const m of months) {
+            const mo = u.months[m];
+            const billable = (mo.input_tokens || 0) + (mo.output_tokens || 0) + (mo.cache_5m || 0) + (mo.cache_1h || 0);
+            lines.push(`  ${m}: ${fmtN(billable)} tokens`);
+          }
+        }
+
+        // Top-up history
+        if (u.history && u.history.length > 0) {
+          lines.push(``);
+          lines.push(`Top-ups:`);
+          for (const h of u.history.slice(-10)) {
+            const note = h.note ? ` — ${h.note}` : "";
+            lines.push(`  ${h.date}: ${fmtUSD(h.amount)}${note}`);
+          }
+        }
+
+        lines.push(``);
+        lines.push(`Balance: ${fmtUSD(u.balance || 0)} | Total added: ${fmtUSD(u.total_added || 0)} | Total spent: ${fmtUSD(u.total_cost || 0)}`);
+
+        try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
+        continue;
+      }
       if (text && text.trim().toLowerCase() === "/usage") {
         const u = syncUserUsage(userId);
         const adminCheck = loadAdmin();
