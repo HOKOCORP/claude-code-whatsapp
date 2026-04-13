@@ -197,18 +197,28 @@ function syncUserUsage(userId) {
 
 /**
  * Check if a user can send messages. Balance must be > 0.
- * Returns { allowed, balance, warned }
+ * Admin users are always allowed (unlimited usage).
+ * Returns { allowed, balance, warned, isAdmin }
  */
 function checkUserLimit(userId) {
+  // Always sync usage (for tracking), even for admin
   const usage = syncUserUsage(userId);
   const config = loadUsageConfig();
   const balance = usage.balance || 0;
   const warnAt = config.warn_balance || 50000;
 
+  // Admin is unlimited — still track usage but never block
+  const admin = loadAdmin();
+  const isAdmin = admin && userId === sanitizeUserId(admin.jid);
+  if (isAdmin) {
+    return { allowed: true, balance, warned: false, isAdmin: true, total_added: usage.total_added || 0, total_used: usage.total_used || 0 };
+  }
+
   return {
     allowed: balance > 0,
     balance,
     warned: balance > 0 && balance <= warnAt,
+    isAdmin: false,
     total_added: usage.total_added || 0,
     total_used: usage.total_used || 0,
   };
@@ -741,6 +751,26 @@ async function connectWhatsApp() {
       const meta = { chat_id: jid, message_id: msgId, user: formatJid(senderJid), ts: new Date((Number(msg.messageTimestamp) || Date.now() / 1000) * 1000).toISOString() };
       if (isGroup) { meta.group = "true"; meta.sender_name = senderName; }
       if (media) { meta.attachment_count = "1"; meta.attachments = `${media.filename || media.type + "." + mimeToExt(media.mimetype)} (${media.mimetype}, ${(media.size / 1024).toFixed(0)}KB)`; }
+
+      // /usage command — reply with balance info, skip dispatch
+      const rawText = extractText(msg.message);
+      if (rawText && rawText.trim().toLowerCase() === "/usage") {
+        const u = syncUserUsage(userId);
+        const mo = u.months?.[monthKey()] || { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0 };
+        const billable = mo.input_tokens + mo.output_tokens + mo.cache_creation;
+        const fmtBal = u.balance >= 1e6 ? `${(u.balance / 1e6).toFixed(1)}M` : u.balance >= 1e3 ? `${Math.round(u.balance / 1e3)}K` : String(u.balance);
+        const fmtUsed = billable >= 1e6 ? `${(billable / 1e6).toFixed(1)}M` : billable >= 1e3 ? `${Math.round(billable / 1e3)}K` : String(billable);
+        const fmtTotal = (u.total_used || 0) >= 1e6 ? `${((u.total_used || 0) / 1e6).toFixed(1)}M` : (u.total_used || 0) >= 1e3 ? `${Math.round((u.total_used || 0) / 1e3)}K` : String(u.total_used || 0);
+        const status = u.balance <= 0 ? "BLOCKED" : "Active";
+        const lines = [
+          `Token Usage`,
+          `Balance: ${fmtBal} tokens (${status})`,
+          `This month: ${fmtUsed} billable`,
+          `All time: ${fmtTotal} used`,
+        ];
+        try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
+        continue;
+      }
 
       const inboxMsg = { content: text || (media ? `(${media.type})` : "(empty)"), meta, raw_msg_id: msgId };
       const tmp = path.join(userDir, "inbox", `.${Date.now()}-${msgId}.tmp`);
