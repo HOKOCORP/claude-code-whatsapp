@@ -111,7 +111,9 @@ function ensureUserConfig(userId, userJid) {
   fs.mkdirSync(userWorkDir, { recursive: true });
 
   // Per-user CLAUDE.md — security boundary for channel sessions.
-  // Tells Claude what this session can/cannot access.
+  // Rewritten on EVERY message dispatch (not just first creation) so
+  // edits by the user are overwritten. This is a soft defense — the hard
+  // defense is env stripping and tool restrictions in the launcher.
   const admin = loadAdmin();
   const isUserAdmin = admin && (admin.jid === userJid || toJid(admin.jid) === userJid);
   const claudeMdPath = path.join(userWorkDir, "CLAUDE.md");
@@ -244,9 +246,7 @@ function spawnUserSession(userId, userJid) {
 
   const allowedTools = [
     "mcp__whatsapp__reply", "mcp__whatsapp__react", "mcp__whatsapp__download_attachment", "mcp__whatsapp__fetch_messages",
-    "Read", "Glob", "Grep", "LS",
-    // Write/Edit admin-only — non-admin could rewrite CLAUDE.md to remove security rules
-    ...(isAdmin ? ["Write", "Edit"] : []),
+    "Read", "Write", "Edit", "Glob", "Grep", "LS",
     '"Bash(git:*)"', '"Bash(ls:*)"',
     // cat/head/tail can read arbitrary files — admin only
     ...(isAdmin ? ['"Bash(cat:*)"', '"Bash(head:*)"', '"Bash(tail:*)"'] : []),
