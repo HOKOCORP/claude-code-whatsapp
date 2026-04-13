@@ -1,17 +1,18 @@
 #!/usr/bin/env node
 /**
- * cc-usage-monitor — Token wallet management for channel users.
+ * cc-usage-monitor — USD wallet management for channel users.
  *
- * New users start at 0 tokens (blocked). Admin adds tokens.
- * Usage deducts from balance. Balance can go negative on overshoot.
+ * New users start at $0 (blocked). Admin tops up in USD.
+ * Each API call deducts estimated cost based on Anthropic model pricing.
+ * Balance can go negative on overshoot.
  *
  * Commands:
  *   cc-usage-monitor status                       All users' balances
  *   cc-usage-monitor check <userId>               Detailed view
- *   cc-usage-monitor add <userId> <tokens> [note]  Add tokens to balance
- *   cc-usage-monitor daily <userId>               Daily breakdown (current month)
+ *   cc-usage-monitor add <userId> <usd> [note]    Top up wallet (USD)
+ *   cc-usage-monitor daily <userId>               Daily breakdown
  *   cc-usage-monitor history <userId>             Admin action log
- *   cc-usage-monitor set-warn <tokens>             Low-balance warning threshold
+ *   cc-usage-monitor set-warn <usd>               Low-balance warning ($)
  *
  * Data: ~/.ccm/usage/
  */
@@ -26,25 +27,30 @@ fs.mkdirSync(USAGE_DIR, { recursive: true });
 
 function loadConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")); }
-  catch { return { warn_balance: 50000 }; }
+  catch { return { warn_balance: 1.00 }; }
 }
 function saveConfig(c) { fs.writeFileSync(CONFIG_FILE, JSON.stringify(c, null, 2)); }
 
 function loadUsage(userId) {
   try { return JSON.parse(fs.readFileSync(path.join(USAGE_DIR, `${userId}.json`), "utf8")); }
-  catch { return { userId, balance: 0, total_added: 0, total_used: 0, history: [], months: {} }; }
+  catch { return { userId, balance: 0, total_added: 0, total_cost: 0, history: [], months: {} }; }
 }
 function saveUsage(userId, u) { fs.writeFileSync(path.join(USAGE_DIR, `${userId}.json`), JSON.stringify(u, null, 2)); }
 
 function monthKey() { return new Date().toISOString().slice(0, 7); }
 function todayKey() { return new Date().toISOString().slice(0, 10); }
 
-function fmt(n) {
-  const abs = Math.abs(n);
-  const sign = n < 0 ? "-" : "";
-  if (abs >= 1_000_000) return `${sign}${(abs / 1_000_000).toFixed(1)}M`;
-  if (abs >= 1_000) return `${sign}${(abs / 1_000).toFixed(0)}K`;
+function fmtTok(n) {
+  const a = Math.abs(n);
+  const s = n < 0 ? "-" : "";
+  if (a >= 1e6) return `${s}${(a / 1e6).toFixed(1)}M`;
+  if (a >= 1e3) return `${s}${Math.round(a / 1e3)}K`;
   return String(n);
+}
+
+function fmtUSD(n) {
+  if (n < 0) return `-$${Math.abs(n).toFixed(2)}`;
+  return `$${n.toFixed(2)}`;
 }
 
 // ── Commands ──
@@ -54,63 +60,59 @@ function cmdStatus() {
   const files = fs.readdirSync(USAGE_DIR).filter(f => f.endsWith(".json") && f !== "limits.json");
 
   if (files.length === 0) {
-    console.log("No users yet. Use: cc-usage-monitor add <userId> <tokens>");
+    console.log("No users yet. Use: cc-usage-monitor add <userId> <usd>");
     return;
   }
 
-  console.log(`\n  Token Balances\n`);
-  console.log(`  ${"User".padEnd(25)} ${"Balance".padStart(12)} ${"Total Added".padStart(12)} ${"Total Used".padStart(12)} ${"Status".padStart(10)}`);
-  console.log(`  ${"─".repeat(25)} ${"─".repeat(12)} ${"─".repeat(12)} ${"─".repeat(12)} ${"─".repeat(10)}`);
+  console.log(`\n  Wallet Balances\n`);
+  console.log(`  ${"User".padEnd(25)} ${"Balance".padStart(10)} ${"Added".padStart(10)} ${"Spent".padStart(10)} ${"Status".padStart(10)}`);
+  console.log(`  ${"─".repeat(25)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)}`);
 
   for (const f of files) {
     const userId = f.replace(".json", "");
     const u = loadUsage(userId);
     let status = "ok";
-    if (u.balance <= 0) status = u.balance < 0 ? "NEGATIVE" : "EMPTY";
-    else if (u.balance <= (config.warn_balance || 50000)) status = "LOW";
+    if ((u.balance || 0) <= 0) status = u.balance < 0 ? "NEGATIVE" : "EMPTY";
+    else if ((u.balance || 0) <= (config.warn_balance || 1)) status = "LOW";
 
-    console.log(`  ${userId.padEnd(25)} ${fmt(u.balance).padStart(12)} ${fmt(u.total_added || 0).padStart(12)} ${fmt(u.total_used || 0).padStart(12)} ${status.padStart(10)}`);
+    console.log(`  ${userId.padEnd(25)} ${fmtUSD(u.balance || 0).padStart(10)} ${fmtUSD(u.total_added || 0).padStart(10)} ${fmtUSD(u.total_cost || 0).padStart(10)} ${status.padStart(10)}`);
   }
-  console.log(`\n  Low-balance warning: ${fmt(config.warn_balance || 50000)} tokens\n`);
+  console.log(`\n  Low-balance warning: ${fmtUSD(config.warn_balance || 1)}\n`);
 }
 
 function cmdCheck(userId) {
   const u = loadUsage(userId);
   const month = monthKey();
-  const mo = u.months?.[month] || { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0 };
+  const mo = u.months?.[month] || { input_tokens: 0, output_tokens: 0, cache_5m: 0, cache_1h: 0, cache_read: 0, models: {} };
 
   console.log(`\n  User: ${userId}`);
   console.log(`  ──────────────────────────────`);
-  console.log(`  Balance:         ${u.balance.toLocaleString()} tokens${u.balance <= 0 ? " (BLOCKED)" : ""}`);
-  console.log(`  Total added:     ${(u.total_added || 0).toLocaleString()}`);
-  console.log(`  Total used:      ${(u.total_used || 0).toLocaleString()}`);
+  console.log(`  Balance:    ${fmtUSD(u.balance || 0)}${(u.balance || 0) <= 0 ? " (BLOCKED)" : ""}`);
+  console.log(`  Added:      ${fmtUSD(u.total_added || 0)}`);
+  console.log(`  Spent:      ${fmtUSD(u.total_cost || 0)}`);
   console.log(`  ──────────────────────────────`);
   console.log(`  This month (${month}):`);
-  console.log(`    Input:         ${mo.input_tokens.toLocaleString()}`);
-  console.log(`    Output:        ${mo.output_tokens.toLocaleString()}`);
-  console.log(`    Cache create:  ${mo.cache_creation.toLocaleString()}`);
-  console.log(`    Cache read:    ${(mo.cache_read || 0).toLocaleString()}`);
-  console.log(`    Billable:      ${(mo.input_tokens + mo.output_tokens + mo.cache_creation).toLocaleString()}`);
+  console.log(`    Input:       ${fmtTok(mo.input_tokens || 0)}`);
+  console.log(`    Output:      ${fmtTok(mo.output_tokens || 0)}`);
+  console.log(`    Cache 5m:    ${fmtTok(mo.cache_5m || 0)}`);
+  console.log(`    Cache 1h:    ${fmtTok(mo.cache_1h || 0)}`);
+  console.log(`    Cache read:  ${fmtTok(mo.cache_read || 0)}`);
 
-  // Previous months
-  const prevMonths = Object.keys(u.months || {}).filter(m => m !== month).sort().reverse();
-  if (prevMonths.length > 0) {
+  if (mo.models && Object.keys(mo.models).length > 0) {
     console.log(`  ──────────────────────────────`);
-    console.log(`  Previous months:`);
-    for (const pm of prevMonths) {
-      const pmo = u.months[pm];
-      const pb = pmo.input_tokens + pmo.output_tokens + pmo.cache_creation;
-      console.log(`    ${pm}: ${fmt(pb)} billable`);
+    console.log(`  Per model this month:`);
+    for (const [model, mu] of Object.entries(mo.models)) {
+      const short = model.replace("claude-", "").replace(/\[.*\]/, "");
+      console.log(`    ${short}: in=${fmtTok(mu.input_tokens)} out=${fmtTok(mu.output_tokens)} 5m=${fmtTok(mu.cache_5m || 0)} 1h=${fmtTok(mu.cache_1h || 0)} read=${fmtTok(mu.cache_read || 0)}`);
     }
   }
 
-  // Last 3 admin actions
   if (u.history && u.history.length > 0) {
     console.log(`  ──────────────────────────────`);
-    console.log(`  Recent admin actions:`);
-    for (const h of u.history.slice(-3)) {
+    console.log(`  Recent:`);
+    for (const h of u.history.slice(-5)) {
       const note = h.note ? ` — ${h.note}` : "";
-      console.log(`    ${h.date} ${h.action} ${fmt(h.amount)}${note}`);
+      console.log(`    ${h.date} ${h.action} ${fmtUSD(h.amount)}${note}`);
     }
   }
   console.log();
@@ -118,15 +120,15 @@ function cmdCheck(userId) {
 
 function cmdAdd(userId, amount, note) {
   const u = loadUsage(userId);
-  const before = u.balance;
-  u.balance += amount;
-  u.total_added = (u.total_added || 0) + amount;
+  const before = u.balance || 0;
+  u.balance = Math.round((before + amount) * 10000) / 10000;
+  u.total_added = Math.round(((u.total_added || 0) + amount) * 10000) / 10000;
   if (!u.history) u.history = [];
-  u.history.push({ date: todayKey(), action: "add", amount, note: note || "" });
+  u.history.push({ date: todayKey(), action: "top-up", amount, note: note || "" });
   saveUsage(userId, u);
 
-  console.log(`  Added ${fmt(amount)} tokens to ${userId}`);
-  console.log(`  Balance: ${fmt(before)} → ${fmt(u.balance)}`);
+  console.log(`  Added ${fmtUSD(amount)} to ${userId}`);
+  console.log(`  Balance: ${fmtUSD(before)} → ${fmtUSD(u.balance)}`);
   if (before <= 0 && u.balance > 0) console.log(`  User is now UNBLOCKED`);
 }
 
@@ -141,44 +143,40 @@ function cmdDaily(userId) {
   }
 
   console.log(`\n  Daily Breakdown — ${userId} — ${month}\n`);
-  console.log(`  ${"Date".padEnd(14)} ${"Input".padStart(10)} ${"Output".padStart(10)} ${"Cache Cr.".padStart(10)} ${"Billable".padStart(10)}`);
-  console.log(`  ${"─".repeat(14)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)}`);
+  console.log(`  ${"Date".padEnd(14)} ${"Input".padStart(10)} ${"Output".padStart(10)} ${"Cache 5m".padStart(10)} ${"Cache 1h".padStart(10)} ${"Cache Rd".padStart(10)}`);
+  console.log(`  ${"─".repeat(14)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)}`);
 
   const days = Object.keys(mo.daily).sort();
   for (const d of days) {
     const dd = mo.daily[d];
-    const billable = dd.input_tokens + dd.output_tokens + dd.cache_creation;
-    if (billable === 0) continue;
-    console.log(`  ${d.padEnd(14)} ${fmt(dd.input_tokens).padStart(10)} ${fmt(dd.output_tokens).padStart(10)} ${fmt(dd.cache_creation).padStart(10)} ${fmt(billable).padStart(10)}`);
+    const total = (dd.input_tokens || 0) + (dd.output_tokens || 0) + (dd.cache_5m || 0) + (dd.cache_1h || 0);
+    if (total === 0) continue;
+    console.log(`  ${d.padEnd(14)} ${fmtTok(dd.input_tokens || 0).padStart(10)} ${fmtTok(dd.output_tokens || 0).padStart(10)} ${fmtTok(dd.cache_5m || 0).padStart(10)} ${fmtTok(dd.cache_1h || 0).padStart(10)} ${fmtTok(dd.cache_read || 0).padStart(10)}`);
   }
-
-  const total = mo.input_tokens + mo.output_tokens + mo.cache_creation;
-  console.log(`  ${"─".repeat(14)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)}`);
-  console.log(`  ${"TOTAL".padEnd(14)} ${fmt(mo.input_tokens).padStart(10)} ${fmt(mo.output_tokens).padStart(10)} ${fmt(mo.cache_creation).padStart(10)} ${fmt(total).padStart(10)}`);
-  console.log(`\n  Balance: ${fmt(u.balance)}\n`);
+  console.log(`\n  Balance: ${fmtUSD(u.balance || 0)} | Total spent: ${fmtUSD(u.total_cost || 0)}\n`);
 }
 
 function cmdHistory(userId) {
   const u = loadUsage(userId);
   if (!u.history || u.history.length === 0) {
-    console.log(`No admin actions for ${userId}.`);
+    console.log(`No history for ${userId}.`);
     return;
   }
 
-  console.log(`\n  Admin Action History — ${userId}\n`);
-  console.log(`  ${"Date".padEnd(14)} ${"Action".padEnd(8)} ${"Amount".padStart(12)} ${"Note"}`);
-  console.log(`  ${"─".repeat(14)} ${"─".repeat(8)} ${"─".repeat(12)} ${"─".repeat(30)}`);
+  console.log(`\n  Wallet History — ${userId}\n`);
+  console.log(`  ${"Date".padEnd(14)} ${"Action".padEnd(10)} ${"Amount".padStart(10)} ${"Note"}`);
+  console.log(`  ${"─".repeat(14)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(30)}`);
   for (const h of u.history) {
-    console.log(`  ${h.date.padEnd(14)} ${h.action.padEnd(8)} ${fmt(h.amount).padStart(12)} ${h.note || ""}`);
+    console.log(`  ${h.date.padEnd(14)} ${h.action.padEnd(10)} ${fmtUSD(h.amount).padStart(10)} ${h.note || ""}`);
   }
-  console.log(`\n  Current balance: ${fmt(u.balance)}\n`);
+  console.log(`\n  Balance: ${fmtUSD(u.balance || 0)}\n`);
 }
 
-function cmdSetWarn(tokens) {
+function cmdSetWarn(usd) {
   const config = loadConfig();
-  config.warn_balance = parseInt(tokens, 10);
+  config.warn_balance = parseFloat(usd);
   saveConfig(config);
-  console.log(`Low-balance warning: ${fmt(config.warn_balance)} tokens`);
+  console.log(`Low-balance warning: ${fmtUSD(config.warn_balance)}`);
 }
 
 // ── Main ──
@@ -191,8 +189,8 @@ switch (cmd) {
     if (!args[0]) { console.error("Usage: cc-usage-monitor check <userId>"); process.exit(1); }
     cmdCheck(args[0]); break;
   case "add":
-    if (!args[0] || !args[1]) { console.error("Usage: cc-usage-monitor add <userId> <tokens> [note]"); process.exit(1); }
-    cmdAdd(args[0], parseInt(args[1], 10), args.slice(2).join(" ")); break;
+    if (!args[0] || !args[1]) { console.error("Usage: cc-usage-monitor add <userId> <usd> [note]"); process.exit(1); }
+    cmdAdd(args[0], parseFloat(args[1]), args.slice(2).join(" ")); break;
   case "daily":
     if (!args[0]) { console.error("Usage: cc-usage-monitor daily <userId>"); process.exit(1); }
     cmdDaily(args[0]); break;
@@ -200,21 +198,22 @@ switch (cmd) {
     if (!args[0]) { console.error("Usage: cc-usage-monitor history <userId>"); process.exit(1); }
     cmdHistory(args[0]); break;
   case "set-warn":
-    if (!args[0]) { console.error("Usage: cc-usage-monitor set-warn <tokens>"); process.exit(1); }
+    if (!args[0]) { console.error("Usage: cc-usage-monitor set-warn <usd>"); process.exit(1); }
     cmdSetWarn(args[0]); break;
   default:
-    console.log("cc-usage-monitor — Token wallet for channel users\n");
-    console.log("New users start at 0 tokens (blocked). Admin adds tokens.\n");
+    console.log("cc-usage-monitor — USD wallet for channel users\n");
+    console.log("New users start at $0 (blocked). Admin tops up in USD.\n");
     console.log("Commands:");
     console.log("  status                       All users' balances");
-    console.log("  check <userId>               Detailed view for one user");
-    console.log("  add <userId> <tokens> [note]  Add tokens to balance");
-    console.log("  daily <userId>               Daily breakdown (current month)");
-    console.log("  history <userId>             Admin action log");
-    console.log("  set-warn <tokens>            Low-balance warning threshold");
+    console.log("  check <userId>               Detailed view");
+    console.log("  add <userId> <usd> [note]    Top up wallet in USD");
+    console.log("  daily <userId>               Daily token breakdown");
+    console.log("  history <userId>             Wallet transaction log");
+    console.log("  set-warn <usd>               Low-balance warning threshold");
     console.log("\nExamples:");
-    console.log("  cc-usage-monitor add 85258080138 1000000 'April allocation'");
-    console.log("  cc-usage-monitor add 85258080138 500000 'Client paid for extra'");
+    console.log("  cc-usage-monitor add 85258080138 50 'April project'");
+    console.log("  cc-usage-monitor add 120363XXXXX 100 'Client X group'");
     console.log("  cc-usage-monitor status");
-    console.log("\nData: ~/.ccm/usage/");
+    console.log("\nPricing based on current Anthropic API rates.");
+    console.log("Data: ~/.ccm/usage/");
 }

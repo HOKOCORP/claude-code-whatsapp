@@ -45,20 +45,41 @@ fs.mkdirSync(USAGE_DIR, { recursive: true });
 const logger = pino({ level: "silent" });
 const log = (msg) => process.stderr.write(`wa-gateway: ${msg}\n`);
 
-// ── Token wallet ───────────────────────────────────────────────────
-// Pay-as-you-go token balance per user. New users start at 0 (blocked).
-// Admin adds tokens via cc-usage-monitor. Usage deducts from balance.
-// Balance can go negative if a single call overshoots — the debt is
-// absorbed when admin next adds tokens.
+// ── USD wallet ─────────────────────────────────────────────────────
+// Pay-as-you-go USD balance per user. New users start at $0 (blocked).
+// Admin tops up in USD via cc-usage-monitor. Each API call deducts the
+// estimated cost based on model-specific Anthropic pricing.
+// Balance can go negative if a single call overshoots.
 //
-// Config:  ~/.ccm/usage/limits.json   (warn_balance threshold)
-// Data:    ~/.ccm/usage/<userId>.json (balance, history, monthly breakdown)
-//
-// Billable tokens = input + output + cache_creation (not cache reads).
+// Config:  ~/.ccm/usage/limits.json   (warn_balance in USD)
+// Data:    ~/.ccm/usage/<userId>.json (balance in USD, history, monthly breakdown)
+
+// API pricing: dollars per million tokens (current Anthropic rates)
+const MODEL_PRICING = {
+  "claude-opus-4-6":   { input: 15, output: 75, cache_5m: 18.75, cache_1h: 22.50, cache_read: 1.50 },
+  "claude-sonnet-4-6": { input: 3, output: 15, cache_5m: 3.75, cache_1h: 4.50, cache_read: 0.30 },
+  "claude-haiku-4-5":  { input: 0.80, output: 4, cache_5m: 1.00, cache_1h: 1.20, cache_read: 0.08 },
+};
+
+function getModelPricing(model) {
+  for (const key of Object.keys(MODEL_PRICING)) { if (model.startsWith(key)) return MODEL_PRICING[key]; }
+  return MODEL_PRICING["claude-sonnet-4-6"]; // default fallback
+}
+
+/** Calculate USD cost for a single API call's token usage */
+function calcCallCost(usage, model) {
+  const p = getModelPricing(model);
+  const inp = usage.input_tokens || 0;
+  const out = usage.output_tokens || 0;
+  const c5m = usage.cache_creation?.ephemeral_5m_input_tokens || 0;
+  const c1h = usage.cache_creation?.ephemeral_1h_input_tokens || 0;
+  const cr = usage.cache_read_input_tokens || 0;
+  return (inp * p.input + out * p.output + c5m * p.cache_5m + c1h * p.cache_1h + cr * p.cache_read) / 1e6;
+}
 
 function loadUsageConfig() {
   try { return JSON.parse(fs.readFileSync(USAGE_LIMITS_FILE, "utf8")); }
-  catch { return { warn_balance: 50000 }; } // warn when balance drops below 50K
+  catch { return { warn_balance: 1.00 }; } // warn when balance drops below $1.00
 }
 
 function getUserUsageFile(userId) {
@@ -70,11 +91,11 @@ function loadUserUsage(userId) {
   catch {
     return {
       userId,
-      balance: 0,        // current token balance (can be negative)
-      total_added: 0,    // lifetime tokens added by admin
-      total_used: 0,     // lifetime billable tokens consumed
+      balance: 0,        // current USD balance (can be negative)
+      total_added: 0,    // lifetime USD added by admin
+      total_cost: 0,     // lifetime estimated API cost in USD
       history: [],       // admin actions: [{ date, action, amount, note }]
-      months: {},        // { "2026-04": { input_tokens, output_tokens, cache_creation, cache_read, daily: {} } }
+      months: {},        // per-month token breakdown + cost
       offsets: {},       // incremental .jsonl scan offsets
     };
   }
@@ -145,7 +166,7 @@ function syncUserUsage(userId) {
   if (!mo.models) mo.models = {};
   if (!usage.offsets) usage.offsets = {};
 
-  let newBillable = 0;
+  let newCost = 0; // USD cost of new API calls since last scan
   const files = findUserSessionFiles(userId);
   for (const file of files) {
     let stat;
@@ -185,17 +206,20 @@ function syncUserUsage(userId) {
         const mm = mo.models[model];
         mm.input_tokens += inp; mm.output_tokens += out; mm.cache_5m += c5m; mm.cache_1h += c1h; mm.cache_read += cr;
 
-        // Billable = input + output + cache writes (not reads)
-        newBillable += inp + out + c5m + c1h;
+        // Calculate USD cost for this call
+        newCost += calcCallCost(u, model);
       } catch {}
     }
     usage.offsets[file] = stat.size;
   }
 
-  // Deduct new usage from balance
-  if (newBillable > 0) {
-    usage.balance -= newBillable;
-    usage.total_used = (usage.total_used || 0) + newBillable;
+  // Deduct estimated cost from USD balance
+  if (newCost > 0) {
+    usage.balance = (usage.balance || 0) - newCost;
+    usage.total_cost = (usage.total_cost || 0) + newCost;
+    // Round to avoid floating point drift
+    usage.balance = Math.round(usage.balance * 10000) / 10000;
+    usage.total_cost = Math.round(usage.total_cost * 10000) / 10000;
   }
 
   // Keep last 3 months
@@ -212,17 +236,16 @@ function syncUserUsage(userId) {
  * Returns { allowed, balance, warned, isAdmin }
  */
 function checkUserLimit(userId) {
-  // Always sync usage (for tracking), even for admin
   const usage = syncUserUsage(userId);
   const config = loadUsageConfig();
   const balance = usage.balance || 0;
-  const warnAt = config.warn_balance || 50000;
+  const warnAt = config.warn_balance || 1.00; // warn at $1.00
 
-  // Admin is unlimited — still track usage but never block
+  // Admin is unlimited — still track cost but never block
   const admin = loadAdmin();
   const isAdmin = admin && userId === sanitizeUserId(admin.jid);
   if (isAdmin) {
-    return { allowed: true, balance, warned: false, isAdmin: true, total_added: usage.total_added || 0, total_used: usage.total_used || 0 };
+    return { allowed: true, balance, warned: false, isAdmin: true };
   }
 
   return {
@@ -230,8 +253,6 @@ function checkUserLimit(userId) {
     balance,
     warned: balance > 0 && balance <= warnAt,
     isAdmin: false,
-    total_added: usage.total_added || 0,
-    total_used: usage.total_used || 0,
   };
 }
 
@@ -794,10 +815,10 @@ async function connectWhatsApp() {
         const billable = (mo.input_tokens || 0) + (mo.output_tokens || 0) + (mo.cache_5m || 0) + (mo.cache_1h || 0);
 
         const lines = [
-          isAdminUser ? `📊 Token Usage (Admin — Unlimited)` : `📊 Token Usage`,
+          isAdminUser ? `📊 Usage (Admin — Unlimited)` : `📊 Usage`,
         ];
         if (!isAdminUser) {
-          lines.push(`Balance: ${fmtN(u.balance)} tokens${u.balance <= 0 ? " ⚠️" : ""}`);
+          lines.push(`💰 Balance: $${(u.balance || 0).toFixed(2)}${u.balance <= 0 ? " ⚠️" : ""}`);
         }
         lines.push(``);
         lines.push(`This month (${monthKey()}):`);
@@ -806,15 +827,14 @@ async function connectWhatsApp() {
         lines.push(`  Cache 5m:    ${fmtN(mo.cache_5m || 0)}`);
         lines.push(`  Cache 1h:    ${fmtN(mo.cache_1h || 0)}`);
         lines.push(`  Cache read:  ${fmtN(mo.cache_read || 0)}`);
-        lines.push(`  Billable:    ${fmtN(billable)}`);
         if (modelLines.length > 0) {
           lines.push(``);
           lines.push(`Per model:`);
           lines.push(...modelLines);
         }
         lines.push(``);
-        lines.push(`Est. API cost: ${fmtUSD(totalCost)}`);
-        lines.push(`All time: ${fmtN(u.total_used || 0)} used`);
+        lines.push(`Month cost: ${fmtUSD(totalCost)}`);
+        lines.push(`All time: ${fmtUSD(u.total_cost || 0)} spent`);
 
         try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
         continue;
@@ -835,19 +855,17 @@ async function connectWhatsApp() {
       // Check token balance before dispatching
       const usageCheck = checkUserLimit(userId);
       if (!usageCheck.allowed) {
-        log(`user ${userId} blocked — balance: ${usageCheck.balance.toLocaleString()} tokens`);
+        log(`user ${userId} blocked — balance: $${usageCheck.balance.toFixed(2)}`);
         try { fs.unlinkSync(final); } catch {}
         const balStr = usageCheck.balance < 0
-          ? `Negative balance: ${usageCheck.balance.toLocaleString()} tokens (overshoot from last call).`
-          : "No tokens allocated.";
-        const limitMsg = `${balStr} Ask admin to add tokens to continue.`;
-        try { await sock.sendMessage(jid, { text: limitMsg }); } catch (e) { log(`failed to send limit msg: ${e}`); }
+          ? `Negative balance: $${usageCheck.balance.toFixed(2)} (overshoot from last call).`
+          : "No credit. Ask admin to top up your wallet.";
+        try { await sock.sendMessage(jid, { text: balStr }); } catch (e) { log(`failed to send limit msg: ${e}`); }
         continue;
       }
       if (usageCheck.warned) {
-        const fmtBal = usageCheck.balance >= 1e6 ? `${(usageCheck.balance / 1e6).toFixed(1)}M` : `${Math.round(usageCheck.balance / 1000)}K`;
-        log(`user ${userId} low balance: ${usageCheck.balance.toLocaleString()} tokens`);
-        try { await sock.sendMessage(jid, { text: `[Low token balance: ${fmtBal} remaining]` }); } catch {}
+        log(`user ${userId} low balance: $${usageCheck.balance.toFixed(2)}`);
+        try { await sock.sendMessage(jid, { text: `[Low balance: $${usageCheck.balance.toFixed(2)} remaining]` }); } catch {}
       }
 
       spawnUserSession(userId, sessionJid);
