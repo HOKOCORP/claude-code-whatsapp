@@ -110,61 +110,59 @@ function ensureUserConfig(userId, userJid) {
   const userWorkDir = path.join(userDir, "workspace");
   fs.mkdirSync(userWorkDir, { recursive: true });
 
-  // Per-user CLAUDE.md — security boundary for channel sessions.
-  // Rewritten on EVERY message dispatch (not just first creation) so
-  // edits by the user are overwritten. This is a soft defense — the hard
-  // defense is env stripping and tool restrictions in the launcher.
-  const admin = loadAdmin();
-  const isUserAdmin = admin && (admin.jid === userJid || toJid(admin.jid) === userJid);
-  const claudeMdPath = path.join(userWorkDir, "CLAUDE.md");
-  const claudeMdContent = isUserAdmin
-    ? [
-        "# Channel Session (Admin)",
-        "",
-        "You are running inside a WhatsApp channel session as the **admin** user.",
-        "",
-        "## Credentials — NEVER print in chat",
-        "",
-        "**NEVER** output API keys, tokens, passwords, or secret values in your replies.",
-        "Chat messages are stored in message history and are effectively public.",
-        "",
-        "If the user asks to see a credential value:",
-        '- Say: "For security, credentials can only be viewed via SSH. Run `ccm` → Settings on the server."',
-        "- You may check if a token is set: `[ -n \"$VAR_NAME\" ] && echo set || echo not-set`",
-        "- NEVER print the actual value, even partially masked.",
-        "",
-      ].join("\n")
-    : [
-        "# Channel Session (User)",
-        "",
-        "You are running inside a WhatsApp channel session as a **non-admin** user.",
-        "",
-        "## Security Boundaries",
-        "",
-        "**You MUST NOT read, access, or reference any of these files or directories:**",
-        "- `~/.env` or `$HOME/.env` — contains server credentials",
-        "- `~/.claude/channels/` — contains channel state and admin config",
-        "- `~/.ccm/` — contains menu system modules",
-        "- `~/.cc-login.sh` — contains menu system loader",
-        "- `~/.ssh/` — contains SSH keys",
-        "- Any `.env` file outside the current workspace",
-        "- Any `admin.json`, `access.json`, or `otp.json` file",
-        "",
-        "**You MUST NOT:**",
-        "- Read environment variables that contain tokens or secrets",
-        "- Attempt to access credentials, API keys, or tokens in any way",
-        "- Read other users' workspace directories",
-        "- Read Claude conversation history files (*.jsonl)",
-        "",
-        "If the user asks about credentials or tokens, say:",
-        '"You don\'t have access to server credentials. Contact the admin."',
-        "",
-        "## Workspace",
-        "",
-        "You may only work within the current directory and its subdirectories.",
-        "",
-      ].join("\n");
-  fs.writeFileSync(claudeMdPath, claudeMdContent);
+  // Security rules go in .claude/CLAUDE.md (hidden directory) — written once
+  // on first creation only. This leaves the visible CLAUDE.md free for
+  // project-specific instructions and team memory. Claude Code reads both.
+  // The user-global ~/.claude/CLAUDE.md also has "never print tokens" rules.
+  const securityDir = path.join(userWorkDir, ".claude");
+  const securityMdPath = path.join(securityDir, "CLAUDE.md");
+  if (!fs.existsSync(securityMdPath)) {
+    fs.mkdirSync(securityDir, { recursive: true });
+    const adminCheck = loadAdmin();
+    const isUserAdmin = adminCheck && (adminCheck.jid === userJid || toJid(adminCheck.jid) === userJid);
+    const securityContent = isUserAdmin
+      ? [
+          "# Security Rules (Channel Session — Admin)",
+          "",
+          "## Credentials — NEVER print in chat",
+          "",
+          "**NEVER** output API keys, tokens, passwords, or secret values in your replies.",
+          "Chat messages are stored in message history and are effectively public.",
+          "",
+          "If the user asks to see a credential value:",
+          '- Say: "For security, credentials can only be viewed via SSH. Run `ccm` → Settings on the server."',
+          "- You may check if a token is set: `[ -n \"$VAR_NAME\" ] && echo set || echo not-set`",
+          "- NEVER print the actual value, even partially masked.",
+          "",
+        ].join("\n")
+      : [
+          "# Security Rules (Channel Session — User)",
+          "",
+          "## File Access Boundaries",
+          "",
+          "**Do NOT read, access, or reference any of these files or directories:**",
+          "- `~/.env` or `$HOME/.env` — server credentials",
+          "- `~/.claude/channels/` — channel state and admin config",
+          "- `~/.ccm/` — menu system modules",
+          "- `~/.ssh/` — SSH keys",
+          "- Any `.env` file outside the current workspace",
+          "- Any `admin.json`, `access.json`, or `otp.json` file",
+          "- Other users' workspace directories",
+          "- Claude conversation history files (*.jsonl)",
+          "",
+          "## Credentials",
+          "",
+          "Do not read or output environment variables containing tokens or secrets.",
+          "If asked about credentials, say:",
+          '"You don\'t have access to server credentials. Contact the admin."',
+          "",
+          "## Workspace Scope",
+          "",
+          "Work within the current directory and its subdirectories only.",
+          "",
+        ].join("\n");
+    fs.writeFileSync(securityMdPath, securityContent);
+  }
 
   // Per-user MCP config
   fs.writeFileSync(path.join(userWorkDir, ".mcp.json"), JSON.stringify({
