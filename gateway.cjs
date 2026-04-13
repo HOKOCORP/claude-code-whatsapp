@@ -45,19 +45,20 @@ fs.mkdirSync(USAGE_DIR, { recursive: true });
 const logger = pino({ level: "silent" });
 const log = (msg) => process.stderr.write(`wa-gateway: ${msg}\n`);
 
-// ── Token usage tracking ───────────────────────────────────────────
-// Reads Claude Code .jsonl session files to count actual API token usage
-// per user per month. Enforces monthly budgets for pay-as-you-go billing.
+// ── Token wallet ───────────────────────────────────────────────────
+// Pay-as-you-go token balance per user. New users start at 0 (blocked).
+// Admin adds tokens via cc-usage-monitor. Usage deducts from balance.
+// Balance can go negative if a single call overshoots — the debt is
+// absorbed when admin next adds tokens.
 //
-// Limits config: ~/.ccm/usage/limits.json
-// Per-user data:  ~/.ccm/usage/<userId>.json
+// Config:  ~/.ccm/usage/limits.json   (warn_balance threshold)
+// Data:    ~/.ccm/usage/<userId>.json (balance, history, monthly breakdown)
 //
 // Billable tokens = input + output + cache_creation (not cache reads).
 
-function loadUsageLimits() {
+function loadUsageConfig() {
   try { return JSON.parse(fs.readFileSync(USAGE_LIMITS_FILE, "utf8")); }
-  catch { return { default_monthly_tokens: 0, warn_percent: 80, users: {} }; }
-  // 0 = unlimited. warn_percent = soft warning threshold.
+  catch { return { warn_balance: 50000 }; } // warn when balance drops below 50K
 }
 
 function getUserUsageFile(userId) {
@@ -66,20 +67,25 @@ function getUserUsageFile(userId) {
 
 function loadUserUsage(userId) {
   try { return JSON.parse(fs.readFileSync(getUserUsageFile(userId), "utf8")); }
-  catch { return { userId, months: {} }; }
+  catch {
+    return {
+      userId,
+      balance: 0,        // current token balance (can be negative)
+      total_added: 0,    // lifetime tokens added by admin
+      total_used: 0,     // lifetime billable tokens consumed
+      history: [],       // admin actions: [{ date, action, amount, note }]
+      months: {},        // { "2026-04": { input_tokens, output_tokens, cache_creation, cache_read, daily: {} } }
+      offsets: {},       // incremental .jsonl scan offsets
+    };
+  }
 }
 
 function saveUserUsage(userId, usage) {
   fs.writeFileSync(getUserUsageFile(userId), JSON.stringify(usage, null, 2));
 }
 
-function monthKey() {
-  return new Date().toISOString().slice(0, 7); // "2026-04"
-}
-
-function todayKey() {
-  return new Date().toISOString().slice(0, 10); // "2026-04-13"
-}
+function monthKey() { return new Date().toISOString().slice(0, 7); }
+function todayKey() { return new Date().toISOString().slice(0, 10); }
 
 /**
  * Find all .jsonl session files for a user's workspace.
@@ -121,34 +127,32 @@ function findUserSessionFiles(userId) {
 }
 
 /**
- * Scan .jsonl files incrementally. Accumulates into monthly + daily buckets.
+ * Scan .jsonl files incrementally. Deducts new usage from balance.
+ * Keeps monthly + daily breakdown for billing reports.
  */
-function scanUsageIncremental(userId) {
+function syncUserUsage(userId) {
   const month = monthKey();
   const today = todayKey();
   const usage = loadUserUsage(userId);
 
+  if (!usage.months) usage.months = {};
   if (!usage.months[month]) {
-    usage.months[month] = {
-      input_tokens: 0,
-      output_tokens: 0,
-      cache_creation: 0,
-      cache_read: 0,
-      daily: {},       // { "2026-04-13": { input_tokens, output_tokens, ... } }
-      offsets: {},
-    };
+    usage.months[month] = { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0, daily: {} };
   }
   const mo = usage.months[month];
+  if (!mo.daily) mo.daily = {};
   if (!mo.daily[today]) {
     mo.daily[today] = { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0 };
   }
   const day = mo.daily[today];
+  if (!usage.offsets) usage.offsets = {};
 
+  let newBillable = 0;
   const files = findUserSessionFiles(userId);
   for (const file of files) {
     let stat;
     try { stat = fs.statSync(file); } catch { continue; }
-    const lastOffset = mo.offsets[file] || 0;
+    const lastOffset = usage.offsets[file] || 0;
     if (stat.size <= lastOffset) continue;
 
     const fd = fs.openSync(file, "r");
@@ -167,44 +171,46 @@ function scanUsageIncremental(userId) {
         const out = u.output_tokens || 0;
         const cc = u.cache_creation_input_tokens || 0;
         const cr = u.cache_read_input_tokens || 0;
-        // Accumulate into both monthly total and daily breakdown
         mo.input_tokens += inp;   day.input_tokens += inp;
         mo.output_tokens += out;  day.output_tokens += out;
         mo.cache_creation += cc;  day.cache_creation += cc;
         mo.cache_read += cr;      day.cache_read += cr;
+        newBillable += inp + out + cc;
       } catch {}
     }
-    mo.offsets[file] = stat.size;
+    usage.offsets[file] = stat.size;
   }
 
-  // Keep last 3 months of data
+  // Deduct new usage from balance
+  if (newBillable > 0) {
+    usage.balance -= newBillable;
+    usage.total_used = (usage.total_used || 0) + newBillable;
+  }
+
+  // Keep last 3 months
   const months = Object.keys(usage.months).sort();
   while (months.length > 3) delete usage.months[months.shift()];
 
   saveUserUsage(userId, usage);
-  return { month: mo, day };
+  return usage;
 }
 
 /**
- * Check if a user has exceeded their monthly budget.
- * Returns { over, warned, used, limit, remaining, percent }
+ * Check if a user can send messages. Balance must be > 0.
+ * Returns { allowed, balance, warned }
  */
 function checkUserLimit(userId) {
-  const limits = loadUsageLimits();
-  const userLimit = limits.users?.[userId]?.monthly_tokens ?? limits.default_monthly_tokens ?? 0;
-  if (userLimit === 0) return { over: false, warned: false, used: 0, limit: 0, remaining: Infinity, percent: 0 };
+  const usage = syncUserUsage(userId);
+  const config = loadUsageConfig();
+  const balance = usage.balance || 0;
+  const warnAt = config.warn_balance || 50000;
 
-  const { month } = scanUsageIncremental(userId);
-  const used = month.input_tokens + month.output_tokens + month.cache_creation;
-  const percent = Math.round((used / userLimit) * 100);
-  const warnPct = limits.warn_percent || 80;
   return {
-    over: used >= userLimit,
-    warned: percent >= warnPct && used < userLimit,
-    used,
-    limit: userLimit,
-    remaining: Math.max(0, userLimit - used),
-    percent,
+    allowed: balance > 0,
+    balance,
+    warned: balance > 0 && balance <= warnAt,
+    total_added: usage.total_added || 0,
+    total_used: usage.total_used || 0,
   };
 }
 
@@ -741,23 +747,22 @@ async function connectWhatsApp() {
       const final = path.join(userDir, "inbox", `${Date.now()}-${msgId}.json`);
       fs.writeFileSync(tmp, JSON.stringify(inboxMsg)); fs.renameSync(tmp, final);
 
-      // Check monthly token budget before dispatching
+      // Check token balance before dispatching
       const usageCheck = checkUserLimit(userId);
-      if (usageCheck.over) {
-        log(`user ${userId} over monthly limit (${usageCheck.used.toLocaleString()} / ${usageCheck.limit.toLocaleString()} tokens, ${usageCheck.percent}%)`);
+      if (!usageCheck.allowed) {
+        log(`user ${userId} blocked — balance: ${usageCheck.balance.toLocaleString()} tokens`);
         try { fs.unlinkSync(final); } catch {}
-        const fmtUsed = usageCheck.used >= 1e6 ? `${(usageCheck.used / 1e6).toFixed(1)}M` : `${Math.round(usageCheck.used / 1000)}K`;
-        const fmtLimit = usageCheck.limit >= 1e6 ? `${(usageCheck.limit / 1e6).toFixed(1)}M` : `${Math.round(usageCheck.limit / 1000)}K`;
-        const limitMsg = `Monthly token budget exceeded (${fmtUsed} / ${fmtLimit} used). Contact admin to increase your budget or wait until next month.`;
+        const balStr = usageCheck.balance < 0
+          ? `Negative balance: ${usageCheck.balance.toLocaleString()} tokens (overshoot from last call).`
+          : "No tokens allocated.";
+        const limitMsg = `${balStr} Ask admin to add tokens to continue.`;
         try { await sock.sendMessage(jid, { text: limitMsg }); } catch (e) { log(`failed to send limit msg: ${e}`); }
         continue;
       }
       if (usageCheck.warned) {
-        const fmtUsed = usageCheck.used >= 1e6 ? `${(usageCheck.used / 1e6).toFixed(1)}M` : `${Math.round(usageCheck.used / 1000)}K`;
-        const fmtLimit = usageCheck.limit >= 1e6 ? `${(usageCheck.limit / 1e6).toFixed(1)}M` : `${Math.round(usageCheck.limit / 1000)}K`;
-        log(`user ${userId} at ${usageCheck.percent}% of monthly budget`);
-        try { await sock.sendMessage(jid, { text: `[${usageCheck.percent}% of monthly budget used: ${fmtUsed} / ${fmtLimit} tokens]` }); } catch {}
-        // Don't block — just warn, then proceed to dispatch
+        const fmtBal = usageCheck.balance >= 1e6 ? `${(usageCheck.balance / 1e6).toFixed(1)}M` : `${Math.round(usageCheck.balance / 1000)}K`;
+        log(`user ${userId} low balance: ${usageCheck.balance.toLocaleString()} tokens`);
+        try { await sock.sendMessage(jid, { text: `[Low token balance: ${fmtBal} remaining]` }); } catch {}
       }
 
       spawnUserSession(userId, sessionJid);
