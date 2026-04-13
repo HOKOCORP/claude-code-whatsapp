@@ -47,11 +47,17 @@ const log = (msg) => process.stderr.write(`wa-gateway: ${msg}\n`);
 
 // ── Token usage tracking ───────────────────────────────────────────
 // Reads Claude Code .jsonl session files to count actual API token usage
-// per user per day. Enforces daily limits set in ~/.ccm/usage/limits.json.
+// per user per month. Enforces monthly budgets for pay-as-you-go billing.
+//
+// Limits config: ~/.ccm/usage/limits.json
+// Per-user data:  ~/.ccm/usage/<userId>.json
+//
+// Billable tokens = input + output + cache_creation (not cache reads).
 
 function loadUsageLimits() {
   try { return JSON.parse(fs.readFileSync(USAGE_LIMITS_FILE, "utf8")); }
-  catch { return { default_daily_tokens: 0, users: {} }; } // 0 = unlimited
+  catch { return { default_monthly_tokens: 0, warn_percent: 80, users: {} }; }
+  // 0 = unlimited. warn_percent = soft warning threshold.
 }
 
 function getUserUsageFile(userId) {
@@ -60,11 +66,15 @@ function getUserUsageFile(userId) {
 
 function loadUserUsage(userId) {
   try { return JSON.parse(fs.readFileSync(getUserUsageFile(userId), "utf8")); }
-  catch { return { userId, days: {} }; }
+  catch { return { userId, months: {} }; }
 }
 
 function saveUserUsage(userId, usage) {
   fs.writeFileSync(getUserUsageFile(userId), JSON.stringify(usage, null, 2));
+}
+
+function monthKey() {
+  return new Date().toISOString().slice(0, 7); // "2026-04"
 }
 
 function todayKey() {
@@ -73,15 +83,12 @@ function todayKey() {
 
 /**
  * Find all .jsonl session files for a user's workspace.
- * Claude Code stores sessions at ~/.claude/projects/<slug>/*.jsonl
- * where slug is the workspace path with / replaced by -.
  */
 function findUserSessionFiles(userId) {
   const userWorkDir = path.join(USERS_DIR, userId, "workspace");
   const projectsDir = path.join(os.homedir(), ".claude", "projects");
   if (!fs.existsSync(projectsDir)) return [];
 
-  // Try multiple slug encodings (same as ensureUserConfig)
   const slugs = new Set([
     userWorkDir.replace(/\//g, "-"),
     userWorkDir.replace(/[/.]/g, "-"),
@@ -96,7 +103,6 @@ function findUserSessionFiles(userId) {
       for (const f of fs.readdirSync(projDir)) {
         if (f.endsWith(".jsonl")) files.push(path.join(projDir, f));
       }
-      // Also check subagents/
       const subDir = path.join(projDir, "subagents");
       if (fs.existsSync(subDir)) {
         for (const sub of fs.readdirSync(subDir)) {
@@ -111,86 +117,94 @@ function findUserSessionFiles(userId) {
       }
     } catch {}
   }
-  return [...new Set(files)]; // dedupe
+  return [...new Set(files)];
 }
 
 /**
- * Scan .jsonl files for token usage, reading incrementally from last offset.
- * Returns { input_tokens, output_tokens, cache_creation, cache_read }
+ * Scan .jsonl files incrementally. Accumulates into monthly + daily buckets.
  */
 function scanUsageIncremental(userId) {
+  const month = monthKey();
   const today = todayKey();
   const usage = loadUserUsage(userId);
 
-  // Reset if day changed
-  if (!usage.days[today]) {
-    usage.days[today] = {
+  if (!usage.months[month]) {
+    usage.months[month] = {
       input_tokens: 0,
       output_tokens: 0,
       cache_creation: 0,
       cache_read: 0,
-      offsets: {}, // { filepath: byte_offset }
+      daily: {},       // { "2026-04-13": { input_tokens, output_tokens, ... } }
+      offsets: {},
     };
   }
-  const day = usage.days[today];
+  const mo = usage.months[month];
+  if (!mo.daily[today]) {
+    mo.daily[today] = { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0 };
+  }
+  const day = mo.daily[today];
 
   const files = findUserSessionFiles(userId);
   for (const file of files) {
     let stat;
     try { stat = fs.statSync(file); } catch { continue; }
-    const lastOffset = day.offsets[file] || 0;
-    if (stat.size <= lastOffset) continue; // no new data
+    const lastOffset = mo.offsets[file] || 0;
+    if (stat.size <= lastOffset) continue;
 
-    // Read new bytes
     const fd = fs.openSync(file, "r");
     const buf = Buffer.alloc(stat.size - lastOffset);
     fs.readSync(fd, buf, 0, buf.length, lastOffset);
     fs.closeSync(fd);
 
-    const lines = buf.toString("utf8").split("\n");
-    for (const line of lines) {
+    for (const line of buf.toString("utf8").split("\n")) {
       if (!line.includes('"type":"message"')) continue;
       try {
         const d = JSON.parse(line);
         if (d.type !== "message" && d.message?.type !== "message") continue;
         const u = (d.message || d).usage;
         if (!u) continue;
-        day.input_tokens += u.input_tokens || 0;
-        day.output_tokens += u.output_tokens || 0;
-        day.cache_creation += u.cache_creation_input_tokens || 0;
-        day.cache_read += u.cache_read_input_tokens || 0;
+        const inp = u.input_tokens || 0;
+        const out = u.output_tokens || 0;
+        const cc = u.cache_creation_input_tokens || 0;
+        const cr = u.cache_read_input_tokens || 0;
+        // Accumulate into both monthly total and daily breakdown
+        mo.input_tokens += inp;   day.input_tokens += inp;
+        mo.output_tokens += out;  day.output_tokens += out;
+        mo.cache_creation += cc;  day.cache_creation += cc;
+        mo.cache_read += cr;      day.cache_read += cr;
       } catch {}
     }
-    day.offsets[file] = stat.size;
+    mo.offsets[file] = stat.size;
   }
 
-  // Clean up old days (keep last 7)
-  const keys = Object.keys(usage.days).sort();
-  while (keys.length > 7) {
-    delete usage.days[keys.shift()];
-  }
+  // Keep last 3 months of data
+  const months = Object.keys(usage.months).sort();
+  while (months.length > 3) delete usage.months[months.shift()];
 
   saveUserUsage(userId, usage);
-  return day;
+  return { month: mo, day };
 }
 
 /**
- * Check if a user has exceeded their daily token limit.
- * Returns { over: boolean, used, limit, remaining }
+ * Check if a user has exceeded their monthly budget.
+ * Returns { over, warned, used, limit, remaining, percent }
  */
 function checkUserLimit(userId) {
   const limits = loadUsageLimits();
-  const userLimit = limits.users?.[userId]?.daily_tokens ?? limits.default_daily_tokens ?? 0;
-  if (userLimit === 0) return { over: false, used: 0, limit: 0, remaining: Infinity }; // unlimited
+  const userLimit = limits.users?.[userId]?.monthly_tokens ?? limits.default_monthly_tokens ?? 0;
+  if (userLimit === 0) return { over: false, warned: false, used: 0, limit: 0, remaining: Infinity, percent: 0 };
 
-  const day = scanUsageIncremental(userId);
-  // Count billable tokens (input + output + cache creation, not cache reads)
-  const used = day.input_tokens + day.output_tokens + day.cache_creation;
+  const { month } = scanUsageIncremental(userId);
+  const used = month.input_tokens + month.output_tokens + month.cache_creation;
+  const percent = Math.round((used / userLimit) * 100);
+  const warnPct = limits.warn_percent || 80;
   return {
     over: used >= userLimit,
+    warned: percent >= warnPct && used < userLimit,
     used,
     limit: userLimit,
     remaining: Math.max(0, userLimit - used),
+    percent,
   };
 }
 
@@ -727,16 +741,23 @@ async function connectWhatsApp() {
       const final = path.join(userDir, "inbox", `${Date.now()}-${msgId}.json`);
       fs.writeFileSync(tmp, JSON.stringify(inboxMsg)); fs.renameSync(tmp, final);
 
-      // Check daily token limit before dispatching
+      // Check monthly token budget before dispatching
       const usageCheck = checkUserLimit(userId);
       if (usageCheck.over) {
-        log(`user ${userId} over daily limit (${usageCheck.used.toLocaleString()} / ${usageCheck.limit.toLocaleString()} tokens)`);
-        // Remove the inbox message we just wrote — don't queue it
+        log(`user ${userId} over monthly limit (${usageCheck.used.toLocaleString()} / ${usageCheck.limit.toLocaleString()} tokens, ${usageCheck.percent}%)`);
         try { fs.unlinkSync(final); } catch {}
-        // Send limit notification via WhatsApp
-        const limitMsg = `Daily token limit reached (${Math.round(usageCheck.used / 1000)}K / ${Math.round(usageCheck.limit / 1000)}K tokens used). Resets at midnight UTC. Contact admin for higher limits.`;
+        const fmtUsed = usageCheck.used >= 1e6 ? `${(usageCheck.used / 1e6).toFixed(1)}M` : `${Math.round(usageCheck.used / 1000)}K`;
+        const fmtLimit = usageCheck.limit >= 1e6 ? `${(usageCheck.limit / 1e6).toFixed(1)}M` : `${Math.round(usageCheck.limit / 1000)}K`;
+        const limitMsg = `Monthly token budget exceeded (${fmtUsed} / ${fmtLimit} used). Contact admin to increase your budget or wait until next month.`;
         try { await sock.sendMessage(jid, { text: limitMsg }); } catch (e) { log(`failed to send limit msg: ${e}`); }
         continue;
+      }
+      if (usageCheck.warned) {
+        const fmtUsed = usageCheck.used >= 1e6 ? `${(usageCheck.used / 1e6).toFixed(1)}M` : `${Math.round(usageCheck.used / 1000)}K`;
+        const fmtLimit = usageCheck.limit >= 1e6 ? `${(usageCheck.limit / 1e6).toFixed(1)}M` : `${Math.round(usageCheck.limit / 1000)}K`;
+        log(`user ${userId} at ${usageCheck.percent}% of monthly budget`);
+        try { await sock.sendMessage(jid, { text: `[${usageCheck.percent}% of monthly budget used: ${fmtUsed} / ${fmtLimit} tokens]` }); } catch {}
+        // Don't block — just warn, then proceed to dispatch
       }
 
       spawnUserSession(userId, sessionJid);

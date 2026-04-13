@@ -1,19 +1,21 @@
 #!/usr/bin/env node
 /**
- * cc-usage-monitor — CLI tool for viewing and managing channel token usage.
+ * cc-usage-monitor — CLI tool for channel token usage and monthly budgets.
  *
  * Usage:
- *   cc-usage-monitor status                  Show all users' daily usage
- *   cc-usage-monitor check <userId>          Check a specific user's usage
- *   cc-usage-monitor set-limit <tokens>      Set default daily token limit
- *   cc-usage-monitor set-limit <userId> <tokens>  Set per-user limit
- *   cc-usage-monitor reset <userId>          Reset a user's daily counter
- *   cc-usage-monitor reset-all               Reset all users' daily counters
+ *   cc-usage-monitor status                       Monthly overview for all users
+ *   cc-usage-monitor check <userId>               Detailed usage for one user
+ *   cc-usage-monitor daily <userId>               Daily breakdown for current month
+ *   cc-usage-monitor set-budget <tokens>           Set default monthly budget
+ *   cc-usage-monitor set-budget <userId> <tokens>  Set per-user monthly budget
+ *   cc-usage-monitor set-warn <percent>            Set warning threshold (default 80%)
+ *   cc-usage-monitor reset <userId>                Reset a user's current month
+ *   cc-usage-monitor reset-all                     Reset all users' current month
  *
- * Token limit of 0 = unlimited. Limits are in billable tokens
+ * Budget of 0 = unlimited. Budgets are in billable tokens
  * (input + output + cache creation, not cache reads).
  *
- * Data stored in: ~/.ccm/usage/
+ * Data: ~/.ccm/usage/
  */
 
 const fs = require("fs");
@@ -26,21 +28,14 @@ fs.mkdirSync(USAGE_DIR, { recursive: true });
 
 function loadLimits() {
   try { return JSON.parse(fs.readFileSync(LIMITS_FILE, "utf8")); }
-  catch { return { default_daily_tokens: 0, users: {} }; }
+  catch { return { default_monthly_tokens: 0, warn_percent: 80, users: {} }; }
 }
-
-function saveLimits(limits) {
-  fs.writeFileSync(LIMITS_FILE, JSON.stringify(limits, null, 2));
-}
-
+function saveLimits(l) { fs.writeFileSync(LIMITS_FILE, JSON.stringify(l, null, 2)); }
 function loadUsage(userId) {
   try { return JSON.parse(fs.readFileSync(path.join(USAGE_DIR, `${userId}.json`), "utf8")); }
-  catch { return { userId, days: {} }; }
+  catch { return { userId, months: {} }; }
 }
-
-function todayKey() {
-  return new Date().toISOString().slice(0, 10);
-}
+function monthKey() { return new Date().toISOString().slice(0, 7); }
 
 function fmt(n) {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -48,11 +43,16 @@ function fmt(n) {
   return String(n);
 }
 
+function pct(used, limit) {
+  if (limit === 0) return "—";
+  return `${Math.round((used / limit) * 100)}%`;
+}
+
 // ── Commands ──
 
 function cmdStatus() {
   const limits = loadLimits();
-  const today = todayKey();
+  const month = monthKey();
   const files = fs.readdirSync(USAGE_DIR).filter(f => f.endsWith(".json") && f !== "limits.json");
 
   if (files.length === 0) {
@@ -60,87 +60,136 @@ function cmdStatus() {
     return;
   }
 
-  console.log(`\n  Token Usage (${today})\n`);
-  console.log(`  ${"User".padEnd(25)} ${"Input".padStart(10)} ${"Output".padStart(10)} ${"Cache Cr.".padStart(10)} ${"Billable".padStart(10)} ${"Limit".padStart(10)} ${"Status".padStart(8)}`);
-  console.log(`  ${"─".repeat(25)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(8)}`);
+  console.log(`\n  Monthly Usage — ${month}\n`);
+  console.log(`  ${"User".padEnd(25)} ${"Input".padStart(10)} ${"Output".padStart(10)} ${"Cache Cr.".padStart(10)} ${"Billable".padStart(10)} ${"Budget".padStart(10)} ${"Used".padStart(7)} ${"Status".padStart(8)}`);
+  console.log(`  ${"─".repeat(25)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(7)} ${"─".repeat(8)}`);
 
   for (const f of files) {
     const userId = f.replace(".json", "");
     const usage = loadUsage(userId);
-    const day = usage.days?.[today] || { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0 };
-    const billable = day.input_tokens + day.output_tokens + day.cache_creation;
-    const userLimit = limits.users?.[userId]?.daily_tokens ?? limits.default_daily_tokens ?? 0;
+    const mo = usage.months?.[month] || { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0 };
+    const billable = mo.input_tokens + mo.output_tokens + mo.cache_creation;
+    const userLimit = limits.users?.[userId]?.monthly_tokens ?? limits.default_monthly_tokens ?? 0;
     const limitStr = userLimit === 0 ? "none" : fmt(userLimit);
-    const status = userLimit > 0 && billable >= userLimit ? "OVER" : "ok";
+    const usedPct = pct(billable, userLimit);
+    const warnPct = limits.warn_percent || 80;
+    let status = "ok";
+    if (userLimit > 0 && billable >= userLimit) status = "OVER";
+    else if (userLimit > 0 && (billable / userLimit * 100) >= warnPct) status = "WARN";
 
-    console.log(`  ${userId.padEnd(25)} ${fmt(day.input_tokens).padStart(10)} ${fmt(day.output_tokens).padStart(10)} ${fmt(day.cache_creation).padStart(10)} ${fmt(billable).padStart(10)} ${limitStr.padStart(10)} ${status.padStart(8)}`);
+    console.log(`  ${userId.padEnd(25)} ${fmt(mo.input_tokens).padStart(10)} ${fmt(mo.output_tokens).padStart(10)} ${fmt(mo.cache_creation).padStart(10)} ${fmt(billable).padStart(10)} ${limitStr.padStart(10)} ${usedPct.padStart(7)} ${status.padStart(8)}`);
   }
   console.log();
-  console.log(`  Default limit: ${limits.default_daily_tokens === 0 ? "unlimited" : fmt(limits.default_daily_tokens)}`);
+  console.log(`  Default budget: ${limits.default_monthly_tokens === 0 ? "unlimited" : fmt(limits.default_monthly_tokens)}/month`);
+  console.log(`  Warning at: ${limits.warn_percent || 80}%`);
   console.log();
 }
 
 function cmdCheck(userId) {
   const limits = loadLimits();
-  const today = todayKey();
+  const month = monthKey();
   const usage = loadUsage(userId);
-  const day = usage.days?.[today] || { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0 };
-  const billable = day.input_tokens + day.output_tokens + day.cache_creation;
-  const userLimit = limits.users?.[userId]?.daily_tokens ?? limits.default_daily_tokens ?? 0;
+  const mo = usage.months?.[month] || { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0, daily: {} };
+  const billable = mo.input_tokens + mo.output_tokens + mo.cache_creation;
+  const userLimit = limits.users?.[userId]?.monthly_tokens ?? limits.default_monthly_tokens ?? 0;
 
   console.log(`\n  User: ${userId}`);
-  console.log(`  Date: ${today}`);
-  console.log(`  Input tokens:    ${day.input_tokens.toLocaleString()}`);
-  console.log(`  Output tokens:   ${day.output_tokens.toLocaleString()}`);
-  console.log(`  Cache creation:  ${day.cache_creation.toLocaleString()}`);
-  console.log(`  Cache read:      ${day.cache_read.toLocaleString()}`);
+  console.log(`  Month: ${month}`);
+  console.log(`  ──────────────────────────`);
+  console.log(`  Input tokens:    ${mo.input_tokens.toLocaleString()}`);
+  console.log(`  Output tokens:   ${mo.output_tokens.toLocaleString()}`);
+  console.log(`  Cache creation:  ${mo.cache_creation.toLocaleString()}`);
+  console.log(`  Cache read:      ${(mo.cache_read || 0).toLocaleString()}`);
+  console.log(`  ──────────────────────────`);
   console.log(`  Billable total:  ${billable.toLocaleString()}`);
-  console.log(`  Daily limit:     ${userLimit === 0 ? "unlimited" : userLimit.toLocaleString()}`);
+  console.log(`  Monthly budget:  ${userLimit === 0 ? "unlimited" : userLimit.toLocaleString()}`);
   if (userLimit > 0) {
     const remaining = Math.max(0, userLimit - billable);
+    console.log(`  Used:            ${pct(billable, userLimit)}`);
     console.log(`  Remaining:       ${remaining.toLocaleString()}`);
-    console.log(`  Status:          ${billable >= userLimit ? "OVER LIMIT" : "ok"}`);
+    console.log(`  Status:          ${billable >= userLimit ? "OVER BUDGET" : "ok"}`);
+  }
+
+  // Show previous months if available
+  const prevMonths = Object.keys(usage.months || {}).filter(m => m !== month).sort().reverse();
+  if (prevMonths.length > 0) {
+    console.log(`\n  History:`);
+    for (const pm of prevMonths) {
+      const pmo = usage.months[pm];
+      const pb = pmo.input_tokens + pmo.output_tokens + pmo.cache_creation;
+      console.log(`    ${pm}: ${fmt(pb)} billable`);
+    }
   }
   console.log();
 }
 
-function cmdSetLimit(args) {
+function cmdDaily(userId) {
+  const month = monthKey();
+  const usage = loadUsage(userId);
+  const mo = usage.months?.[month];
+
+  if (!mo || !mo.daily || Object.keys(mo.daily).length === 0) {
+    console.log(`No daily data for ${userId} in ${month}.`);
+    return;
+  }
+
+  console.log(`\n  Daily Breakdown — ${userId} — ${month}\n`);
+  console.log(`  ${"Date".padEnd(14)} ${"Input".padStart(10)} ${"Output".padStart(10)} ${"Cache Cr.".padStart(10)} ${"Billable".padStart(10)}`);
+  console.log(`  ${"─".repeat(14)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)}`);
+
+  const days = Object.keys(mo.daily).sort();
+  for (const d of days) {
+    const dd = mo.daily[d];
+    const billable = dd.input_tokens + dd.output_tokens + dd.cache_creation;
+    if (billable === 0) continue;
+    console.log(`  ${d.padEnd(14)} ${fmt(dd.input_tokens).padStart(10)} ${fmt(dd.output_tokens).padStart(10)} ${fmt(dd.cache_creation).padStart(10)} ${fmt(billable).padStart(10)}`);
+  }
+
+  const total = mo.input_tokens + mo.output_tokens + mo.cache_creation;
+  console.log(`  ${"─".repeat(14)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)}`);
+  console.log(`  ${"TOTAL".padEnd(14)} ${fmt(mo.input_tokens).padStart(10)} ${fmt(mo.output_tokens).padStart(10)} ${fmt(mo.cache_creation).padStart(10)} ${fmt(total).padStart(10)}`);
+  console.log();
+}
+
+function cmdSetBudget(args) {
   const limits = loadLimits();
   if (args.length === 1) {
-    // set-limit <tokens> — default limit
-    limits.default_daily_tokens = parseInt(args[0], 10);
+    limits.default_monthly_tokens = parseInt(args[0], 10);
     saveLimits(limits);
-    console.log(`Default daily limit set to ${limits.default_daily_tokens === 0 ? "unlimited" : fmt(limits.default_daily_tokens)}`);
+    console.log(`Default monthly budget: ${limits.default_monthly_tokens === 0 ? "unlimited" : fmt(limits.default_monthly_tokens)}`);
   } else if (args.length === 2) {
-    // set-limit <userId> <tokens>
     if (!limits.users) limits.users = {};
-    limits.users[args[0]] = { daily_tokens: parseInt(args[1], 10) };
+    limits.users[args[0]] = { monthly_tokens: parseInt(args[1], 10) };
     saveLimits(limits);
-    const val = limits.users[args[0]].daily_tokens;
-    console.log(`User ${args[0]} daily limit set to ${val === 0 ? "unlimited" : fmt(val)}`);
+    const val = limits.users[args[0]].monthly_tokens;
+    console.log(`User ${args[0]} monthly budget: ${val === 0 ? "unlimited" : fmt(val)}`);
   } else {
-    console.error("Usage: cc-usage-monitor set-limit [userId] <tokens>");
+    console.error("Usage: cc-usage-monitor set-budget [userId] <tokens>");
     process.exit(1);
   }
 }
 
+function cmdSetWarn(args) {
+  if (args.length !== 1) { console.error("Usage: cc-usage-monitor set-warn <percent>"); process.exit(1); }
+  const limits = loadLimits();
+  limits.warn_percent = parseInt(args[0], 10);
+  saveLimits(limits);
+  console.log(`Warning threshold: ${limits.warn_percent}%`);
+}
+
 function cmdReset(userId) {
-  const today = todayKey();
+  const month = monthKey();
   const usage = loadUsage(userId);
-  if (usage.days?.[today]) {
-    delete usage.days[today];
+  if (usage.months?.[month]) {
+    delete usage.months[month];
     fs.writeFileSync(path.join(USAGE_DIR, `${userId}.json`), JSON.stringify(usage, null, 2));
   }
-  console.log(`Reset daily usage for ${userId}`);
+  console.log(`Reset ${month} usage for ${userId}`);
 }
 
 function cmdResetAll() {
-  const today = todayKey();
   const files = fs.readdirSync(USAGE_DIR).filter(f => f.endsWith(".json") && f !== "limits.json");
-  for (const f of files) {
-    const userId = f.replace(".json", "");
-    cmdReset(userId);
-  }
+  for (const f of files) cmdReset(f.replace(".json", ""));
 }
 
 // ── Main ──
@@ -152,20 +201,25 @@ switch (cmd) {
   case "check":
     if (!args[0]) { console.error("Usage: cc-usage-monitor check <userId>"); process.exit(1); }
     cmdCheck(args[0]); break;
-  case "set-limit": cmdSetLimit(args); break;
+  case "daily":
+    if (!args[0]) { console.error("Usage: cc-usage-monitor daily <userId>"); process.exit(1); }
+    cmdDaily(args[0]); break;
+  case "set-budget": cmdSetBudget(args); break;
+  case "set-warn": cmdSetWarn(args); break;
   case "reset":
     if (!args[0]) { console.error("Usage: cc-usage-monitor reset <userId>"); process.exit(1); }
     cmdReset(args[0]); break;
   case "reset-all": cmdResetAll(); break;
   default:
-    console.log("cc-usage-monitor — Channel token usage tracking\n");
+    console.log("cc-usage-monitor — Channel token usage and monthly budgets\n");
     console.log("Commands:");
-    console.log("  status                  Show all users' daily usage");
-    console.log("  check <userId>          Check a specific user's usage");
-    console.log("  set-limit <tokens>      Set default daily token limit");
-    console.log("  set-limit <userId> <n>  Set per-user daily limit");
-    console.log("  reset <userId>          Reset a user's daily counter");
-    console.log("  reset-all               Reset all daily counters");
-    console.log("\nToken limit of 0 = unlimited.");
-    console.log("Data stored in: ~/.ccm/usage/");
+    console.log("  status                       Monthly overview for all users");
+    console.log("  check <userId>               Detailed usage for one user");
+    console.log("  daily <userId>               Daily breakdown for current month");
+    console.log("  set-budget <tokens>           Set default monthly budget (0 = unlimited)");
+    console.log("  set-budget <userId> <tokens>  Set per-user monthly budget");
+    console.log("  set-warn <percent>            Set warning threshold (default 80%)");
+    console.log("  reset <userId>               Reset user's current month");
+    console.log("  reset-all                    Reset all current month counters");
+    console.log("\nData: ~/.ccm/usage/");
 }
