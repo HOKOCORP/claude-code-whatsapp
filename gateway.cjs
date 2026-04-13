@@ -244,7 +244,9 @@ function spawnUserSession(userId, userJid) {
 
   const allowedTools = [
     "mcp__whatsapp__reply", "mcp__whatsapp__react", "mcp__whatsapp__download_attachment", "mcp__whatsapp__fetch_messages",
-    "Read", "Write", "Edit", "Glob", "Grep", "LS",
+    "Read", "Glob", "Grep", "LS",
+    // Write/Edit admin-only — non-admin could rewrite CLAUDE.md to remove security rules
+    ...(isAdmin ? ["Write", "Edit"] : []),
     '"Bash(git:*)"', '"Bash(ls:*)"',
     // cat/head/tail can read arbitrary files — admin only
     ...(isAdmin ? ['"Bash(cat:*)"', '"Bash(head:*)"', '"Bash(tail:*)"'] : []),
