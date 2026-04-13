@@ -34,13 +34,165 @@ const USERS_DIR = path.join(STATE_DIR, "users");
 const OUTBOX_DIR = path.join(STATE_DIR, "outbox");
 const PHONE = path.basename(STATE_DIR).replace("whatsapp-", "");
 const SESSION_IDLE_MS = 30 * 60 * 1000;
+const USAGE_DIR = path.join(os.homedir(), ".ccm", "usage");
+const USAGE_LIMITS_FILE = path.join(USAGE_DIR, "limits.json");
 
 fs.mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
 fs.mkdirSync(USERS_DIR, { recursive: true });
 fs.mkdirSync(OUTBOX_DIR, { recursive: true });
+fs.mkdirSync(USAGE_DIR, { recursive: true });
 
 const logger = pino({ level: "silent" });
 const log = (msg) => process.stderr.write(`wa-gateway: ${msg}\n`);
+
+// ── Token usage tracking ───────────────────────────────────────────
+// Reads Claude Code .jsonl session files to count actual API token usage
+// per user per day. Enforces daily limits set in ~/.ccm/usage/limits.json.
+
+function loadUsageLimits() {
+  try { return JSON.parse(fs.readFileSync(USAGE_LIMITS_FILE, "utf8")); }
+  catch { return { default_daily_tokens: 0, users: {} }; } // 0 = unlimited
+}
+
+function getUserUsageFile(userId) {
+  return path.join(USAGE_DIR, `${userId}.json`);
+}
+
+function loadUserUsage(userId) {
+  try { return JSON.parse(fs.readFileSync(getUserUsageFile(userId), "utf8")); }
+  catch { return { userId, days: {} }; }
+}
+
+function saveUserUsage(userId, usage) {
+  fs.writeFileSync(getUserUsageFile(userId), JSON.stringify(usage, null, 2));
+}
+
+function todayKey() {
+  return new Date().toISOString().slice(0, 10); // "2026-04-13"
+}
+
+/**
+ * Find all .jsonl session files for a user's workspace.
+ * Claude Code stores sessions at ~/.claude/projects/<slug>/*.jsonl
+ * where slug is the workspace path with / replaced by -.
+ */
+function findUserSessionFiles(userId) {
+  const userWorkDir = path.join(USERS_DIR, userId, "workspace");
+  const projectsDir = path.join(os.homedir(), ".claude", "projects");
+  if (!fs.existsSync(projectsDir)) return [];
+
+  // Try multiple slug encodings (same as ensureUserConfig)
+  const slugs = new Set([
+    userWorkDir.replace(/\//g, "-"),
+    userWorkDir.replace(/[/.]/g, "-"),
+    userWorkDir.replace(/\//g, "-").replace(/-\./g, "."),
+  ]);
+
+  const files = [];
+  for (const slug of slugs) {
+    const projDir = path.join(projectsDir, slug);
+    if (!fs.existsSync(projDir)) continue;
+    try {
+      for (const f of fs.readdirSync(projDir)) {
+        if (f.endsWith(".jsonl")) files.push(path.join(projDir, f));
+      }
+      // Also check subagents/
+      const subDir = path.join(projDir, "subagents");
+      if (fs.existsSync(subDir)) {
+        for (const sub of fs.readdirSync(subDir)) {
+          const subPath = path.join(subDir, sub);
+          if (sub.endsWith(".jsonl")) files.push(subPath);
+          else if (fs.statSync(subPath).isDirectory()) {
+            for (const f of fs.readdirSync(subPath)) {
+              if (f.endsWith(".jsonl")) files.push(path.join(subPath, f));
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+  return [...new Set(files)]; // dedupe
+}
+
+/**
+ * Scan .jsonl files for token usage, reading incrementally from last offset.
+ * Returns { input_tokens, output_tokens, cache_creation, cache_read }
+ */
+function scanUsageIncremental(userId) {
+  const today = todayKey();
+  const usage = loadUserUsage(userId);
+
+  // Reset if day changed
+  if (!usage.days[today]) {
+    usage.days[today] = {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation: 0,
+      cache_read: 0,
+      offsets: {}, // { filepath: byte_offset }
+    };
+  }
+  const day = usage.days[today];
+
+  const files = findUserSessionFiles(userId);
+  for (const file of files) {
+    let stat;
+    try { stat = fs.statSync(file); } catch { continue; }
+    const lastOffset = day.offsets[file] || 0;
+    if (stat.size <= lastOffset) continue; // no new data
+
+    // Read new bytes
+    const fd = fs.openSync(file, "r");
+    const buf = Buffer.alloc(stat.size - lastOffset);
+    fs.readSync(fd, buf, 0, buf.length, lastOffset);
+    fs.closeSync(fd);
+
+    const lines = buf.toString("utf8").split("\n");
+    for (const line of lines) {
+      if (!line.includes('"type":"message"')) continue;
+      try {
+        const d = JSON.parse(line);
+        if (d.type !== "message" && d.message?.type !== "message") continue;
+        const u = (d.message || d).usage;
+        if (!u) continue;
+        day.input_tokens += u.input_tokens || 0;
+        day.output_tokens += u.output_tokens || 0;
+        day.cache_creation += u.cache_creation_input_tokens || 0;
+        day.cache_read += u.cache_read_input_tokens || 0;
+      } catch {}
+    }
+    day.offsets[file] = stat.size;
+  }
+
+  // Clean up old days (keep last 7)
+  const keys = Object.keys(usage.days).sort();
+  while (keys.length > 7) {
+    delete usage.days[keys.shift()];
+  }
+
+  saveUserUsage(userId, usage);
+  return day;
+}
+
+/**
+ * Check if a user has exceeded their daily token limit.
+ * Returns { over: boolean, used, limit, remaining }
+ */
+function checkUserLimit(userId) {
+  const limits = loadUsageLimits();
+  const userLimit = limits.users?.[userId]?.daily_tokens ?? limits.default_daily_tokens ?? 0;
+  if (userLimit === 0) return { over: false, used: 0, limit: 0, remaining: Infinity }; // unlimited
+
+  const day = scanUsageIncremental(userId);
+  // Count billable tokens (input + output + cache creation, not cache reads)
+  const used = day.input_tokens + day.output_tokens + day.cache_creation;
+  return {
+    over: used >= userLimit,
+    used,
+    limit: userLimit,
+    remaining: Math.max(0, userLimit - used),
+  };
+}
 
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
 const RECONNECT = { initialMs: 2000, maxMs: 30000, factor: 1.8, jitter: 0.25 };
@@ -574,6 +726,18 @@ async function connectWhatsApp() {
       const tmp = path.join(userDir, "inbox", `.${Date.now()}-${msgId}.tmp`);
       const final = path.join(userDir, "inbox", `${Date.now()}-${msgId}.json`);
       fs.writeFileSync(tmp, JSON.stringify(inboxMsg)); fs.renameSync(tmp, final);
+
+      // Check daily token limit before dispatching
+      const usageCheck = checkUserLimit(userId);
+      if (usageCheck.over) {
+        log(`user ${userId} over daily limit (${usageCheck.used.toLocaleString()} / ${usageCheck.limit.toLocaleString()} tokens)`);
+        // Remove the inbox message we just wrote — don't queue it
+        try { fs.unlinkSync(final); } catch {}
+        // Send limit notification via WhatsApp
+        const limitMsg = `Daily token limit reached (${Math.round(usageCheck.used / 1000)}K / ${Math.round(usageCheck.limit / 1000)}K tokens used). Resets at midnight UTC. Contact admin for higher limits.`;
+        try { await sock.sendMessage(jid, { text: limitMsg }); } catch (e) { log(`failed to send limit msg: ${e}`); }
+        continue;
+      }
 
       spawnUserSession(userId, sessionJid);
     }

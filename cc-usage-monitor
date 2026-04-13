@@ -1,0 +1,171 @@
+#!/usr/bin/env node
+/**
+ * cc-usage-monitor — CLI tool for viewing and managing channel token usage.
+ *
+ * Usage:
+ *   cc-usage-monitor status                  Show all users' daily usage
+ *   cc-usage-monitor check <userId>          Check a specific user's usage
+ *   cc-usage-monitor set-limit <tokens>      Set default daily token limit
+ *   cc-usage-monitor set-limit <userId> <tokens>  Set per-user limit
+ *   cc-usage-monitor reset <userId>          Reset a user's daily counter
+ *   cc-usage-monitor reset-all               Reset all users' daily counters
+ *
+ * Token limit of 0 = unlimited. Limits are in billable tokens
+ * (input + output + cache creation, not cache reads).
+ *
+ * Data stored in: ~/.ccm/usage/
+ */
+
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+
+const USAGE_DIR = path.join(os.homedir(), ".ccm", "usage");
+const LIMITS_FILE = path.join(USAGE_DIR, "limits.json");
+fs.mkdirSync(USAGE_DIR, { recursive: true });
+
+function loadLimits() {
+  try { return JSON.parse(fs.readFileSync(LIMITS_FILE, "utf8")); }
+  catch { return { default_daily_tokens: 0, users: {} }; }
+}
+
+function saveLimits(limits) {
+  fs.writeFileSync(LIMITS_FILE, JSON.stringify(limits, null, 2));
+}
+
+function loadUsage(userId) {
+  try { return JSON.parse(fs.readFileSync(path.join(USAGE_DIR, `${userId}.json`), "utf8")); }
+  catch { return { userId, days: {} }; }
+}
+
+function todayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function fmt(n) {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`;
+  return String(n);
+}
+
+// ── Commands ──
+
+function cmdStatus() {
+  const limits = loadLimits();
+  const today = todayKey();
+  const files = fs.readdirSync(USAGE_DIR).filter(f => f.endsWith(".json") && f !== "limits.json");
+
+  if (files.length === 0) {
+    console.log("No usage data yet.");
+    return;
+  }
+
+  console.log(`\n  Token Usage (${today})\n`);
+  console.log(`  ${"User".padEnd(25)} ${"Input".padStart(10)} ${"Output".padStart(10)} ${"Cache Cr.".padStart(10)} ${"Billable".padStart(10)} ${"Limit".padStart(10)} ${"Status".padStart(8)}`);
+  console.log(`  ${"─".repeat(25)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(10)} ${"─".repeat(8)}`);
+
+  for (const f of files) {
+    const userId = f.replace(".json", "");
+    const usage = loadUsage(userId);
+    const day = usage.days?.[today] || { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0 };
+    const billable = day.input_tokens + day.output_tokens + day.cache_creation;
+    const userLimit = limits.users?.[userId]?.daily_tokens ?? limits.default_daily_tokens ?? 0;
+    const limitStr = userLimit === 0 ? "none" : fmt(userLimit);
+    const status = userLimit > 0 && billable >= userLimit ? "OVER" : "ok";
+
+    console.log(`  ${userId.padEnd(25)} ${fmt(day.input_tokens).padStart(10)} ${fmt(day.output_tokens).padStart(10)} ${fmt(day.cache_creation).padStart(10)} ${fmt(billable).padStart(10)} ${limitStr.padStart(10)} ${status.padStart(8)}`);
+  }
+  console.log();
+  console.log(`  Default limit: ${limits.default_daily_tokens === 0 ? "unlimited" : fmt(limits.default_daily_tokens)}`);
+  console.log();
+}
+
+function cmdCheck(userId) {
+  const limits = loadLimits();
+  const today = todayKey();
+  const usage = loadUsage(userId);
+  const day = usage.days?.[today] || { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0 };
+  const billable = day.input_tokens + day.output_tokens + day.cache_creation;
+  const userLimit = limits.users?.[userId]?.daily_tokens ?? limits.default_daily_tokens ?? 0;
+
+  console.log(`\n  User: ${userId}`);
+  console.log(`  Date: ${today}`);
+  console.log(`  Input tokens:    ${day.input_tokens.toLocaleString()}`);
+  console.log(`  Output tokens:   ${day.output_tokens.toLocaleString()}`);
+  console.log(`  Cache creation:  ${day.cache_creation.toLocaleString()}`);
+  console.log(`  Cache read:      ${day.cache_read.toLocaleString()}`);
+  console.log(`  Billable total:  ${billable.toLocaleString()}`);
+  console.log(`  Daily limit:     ${userLimit === 0 ? "unlimited" : userLimit.toLocaleString()}`);
+  if (userLimit > 0) {
+    const remaining = Math.max(0, userLimit - billable);
+    console.log(`  Remaining:       ${remaining.toLocaleString()}`);
+    console.log(`  Status:          ${billable >= userLimit ? "OVER LIMIT" : "ok"}`);
+  }
+  console.log();
+}
+
+function cmdSetLimit(args) {
+  const limits = loadLimits();
+  if (args.length === 1) {
+    // set-limit <tokens> — default limit
+    limits.default_daily_tokens = parseInt(args[0], 10);
+    saveLimits(limits);
+    console.log(`Default daily limit set to ${limits.default_daily_tokens === 0 ? "unlimited" : fmt(limits.default_daily_tokens)}`);
+  } else if (args.length === 2) {
+    // set-limit <userId> <tokens>
+    if (!limits.users) limits.users = {};
+    limits.users[args[0]] = { daily_tokens: parseInt(args[1], 10) };
+    saveLimits(limits);
+    const val = limits.users[args[0]].daily_tokens;
+    console.log(`User ${args[0]} daily limit set to ${val === 0 ? "unlimited" : fmt(val)}`);
+  } else {
+    console.error("Usage: cc-usage-monitor set-limit [userId] <tokens>");
+    process.exit(1);
+  }
+}
+
+function cmdReset(userId) {
+  const today = todayKey();
+  const usage = loadUsage(userId);
+  if (usage.days?.[today]) {
+    delete usage.days[today];
+    fs.writeFileSync(path.join(USAGE_DIR, `${userId}.json`), JSON.stringify(usage, null, 2));
+  }
+  console.log(`Reset daily usage for ${userId}`);
+}
+
+function cmdResetAll() {
+  const today = todayKey();
+  const files = fs.readdirSync(USAGE_DIR).filter(f => f.endsWith(".json") && f !== "limits.json");
+  for (const f of files) {
+    const userId = f.replace(".json", "");
+    cmdReset(userId);
+  }
+}
+
+// ── Main ──
+
+const [cmd, ...args] = process.argv.slice(2);
+
+switch (cmd) {
+  case "status": cmdStatus(); break;
+  case "check":
+    if (!args[0]) { console.error("Usage: cc-usage-monitor check <userId>"); process.exit(1); }
+    cmdCheck(args[0]); break;
+  case "set-limit": cmdSetLimit(args); break;
+  case "reset":
+    if (!args[0]) { console.error("Usage: cc-usage-monitor reset <userId>"); process.exit(1); }
+    cmdReset(args[0]); break;
+  case "reset-all": cmdResetAll(); break;
+  default:
+    console.log("cc-usage-monitor — Channel token usage tracking\n");
+    console.log("Commands:");
+    console.log("  status                  Show all users' daily usage");
+    console.log("  check <userId>          Check a specific user's usage");
+    console.log("  set-limit <tokens>      Set default daily token limit");
+    console.log("  set-limit <userId> <n>  Set per-user daily limit");
+    console.log("  reset <userId>          Reset a user's daily counter");
+    console.log("  reset-all               Reset all daily counters");
+    console.log("\nToken limit of 0 = unlimited.");
+    console.log("Data stored in: ~/.ccm/usage/");
+}
