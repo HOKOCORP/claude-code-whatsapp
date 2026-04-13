@@ -749,18 +749,23 @@ async function connectWhatsApp() {
       // (text has already been trigger-stripped at this point, e.g. "@ai /usage" → "/usage")
       if (text && text.trim().toLowerCase() === "/usage") {
         const u = syncUserUsage(userId);
+        const adminCheck = loadAdmin();
+        const isAdminUser = adminCheck && userId === sanitizeUserId(adminCheck.jid);
         const mo = u.months?.[monthKey()] || { input_tokens: 0, output_tokens: 0, cache_creation: 0, cache_read: 0 };
         const billable = mo.input_tokens + mo.output_tokens + mo.cache_creation;
-        const fmtBal = u.balance >= 1e6 ? `${(u.balance / 1e6).toFixed(1)}M` : u.balance >= 1e3 ? `${Math.round(u.balance / 1e3)}K` : String(u.balance);
-        const fmtUsed = billable >= 1e6 ? `${(billable / 1e6).toFixed(1)}M` : billable >= 1e3 ? `${Math.round(billable / 1e3)}K` : String(billable);
-        const fmtTotal = (u.total_used || 0) >= 1e6 ? `${((u.total_used || 0) / 1e6).toFixed(1)}M` : (u.total_used || 0) >= 1e3 ? `${Math.round((u.total_used || 0) / 1e3)}K` : String(u.total_used || 0);
-        const status = u.balance <= 0 ? "BLOCKED" : "Active";
-        const lines = [
-          `Token Usage`,
-          `Balance: ${fmtBal} tokens (${status})`,
-          `This month: ${fmtUsed} billable`,
-          `All time: ${fmtTotal} used`,
-        ];
+        const fmtN = (n) => Math.abs(n) >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : Math.abs(n) >= 1e3 ? `${Math.round(n / 1e3)}K` : String(n);
+        const lines = isAdminUser
+          ? [
+              `Token Usage (Admin — Unlimited)`,
+              `This month: ${fmtN(billable)} billable`,
+              `All time: ${fmtN(u.total_used || 0)} used`,
+            ]
+          : [
+              `Token Usage`,
+              `Balance: ${fmtN(u.balance)} tokens${u.balance <= 0 ? " (no tokens — ask admin)" : ""}`,
+              `This month: ${fmtN(billable)} billable`,
+              `All time: ${fmtN(u.total_used || 0)} used`,
+            ];
         try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
         continue;
       }
