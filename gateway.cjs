@@ -181,6 +181,13 @@ function spawnUserSession(userId, userJid) {
   // available for any tool call the model decides to escalate
   // manually, but routine file exploration is no longer gated.
   const launcher = path.join(userDir, "launch.sh");
+
+  // Check if this user is the admin — only admin gets full credentials
+  // and env/printenv tool access. Non-admin users get ANTHROPIC_API_KEY
+  // only, preventing exfiltration of GITHUB_TOKEN, CF keys, etc.
+  const admin = loadAdmin();
+  const isAdmin = admin && (admin.jid === userJid || toJid(admin.jid) === userJid);
+
   const allowedTools = [
     "mcp__whatsapp__reply", "mcp__whatsapp__react", "mcp__whatsapp__download_attachment", "mcp__whatsapp__fetch_messages",
     "Read", "Write", "Edit", "Glob", "Grep", "LS",
@@ -189,7 +196,9 @@ function spawnUserSession(userId, userJid) {
     '"Bash(npm:*)"', '"Bash(node:*)"', '"Bash(python3:*)"', '"Bash(pip:*)"',
     '"Bash(curl:*)"', '"Bash(wget:*)"', '"Bash(which:*)"', '"Bash(whoami:*)"',
     '"Bash(date:*)"', '"Bash(uname:*)"', '"Bash(df:*)"', '"Bash(du:*)"', '"Bash(free:*)"',
-    '"Bash(ps:*)"', '"Bash(top:*)"', '"Bash(env:*)"', '"Bash(printenv:*)"',
+    '"Bash(ps:*)"', '"Bash(top:*)"',
+    // env/printenv only for admin — non-admin could use these to dump tokens
+    ...(isAdmin ? ['"Bash(env:*)"', '"Bash(printenv:*)"'] : []),
     '"Bash(mkdir:*)"', '"Bash(cp:*)"', '"Bash(mv:*)"', '"Bash(touch:*)"',
     '"Bash(chmod:*)"', '"Bash(chown:*)"', '"Bash(stat:*)"', '"Bash(file:*)"',
     '"Bash(tar:*)"', '"Bash(zip:*)"', '"Bash(unzip:*)"',
@@ -199,7 +208,28 @@ function spawnUserSession(userId, userJid) {
     '"Bash(make:*)"', '"Bash(gcc:*)"', '"Bash(cargo:*)"', '"Bash(go:*)"',
     '"Bash(gh:*)"',
   ].join(" ");
-  fs.writeFileSync(launcher, `#!/bin/bash\ncd "${userWorkDir}"\nexec cc-watchdog --dangerously-load-development-channels "server:whatsapp" --permission-mode bypassPermissions --allowedTools ${allowedTools}\n`);
+  let envPreamble;
+  if (isAdmin) {
+    // Admin: inherit full environment (all tokens from ~/.env)
+    envPreamble = "";
+  } else {
+    // Non-admin: strip all sensitive env vars, keep only ANTHROPIC_API_KEY
+    envPreamble = [
+      '_ANTHROPIC_KEY="$ANTHROPIC_API_KEY"',
+      'for _v in $(env | grep -oP "^(GITHUB_TOKEN|CLOUDFLARE_|CF_GLOBAL_|CF_TOKEN_|CF_ACCOUNT_|VERCEL_TOKEN|FLY_API_TOKEN|SUPABASE_ACCESS_TOKEN|SENTRY_AUTH_TOKEN|NPM_TOKEN|SMTP_|MAILBABY_|DISCORD_BOT_TOKEN|TELEGRAM_BOT_TOKEN)[^=]*" 2>/dev/null); do unset "$_v"; done',
+      'export ANTHROPIC_API_KEY="$_ANTHROPIC_KEY"',
+      'unset _ANTHROPIC_KEY',
+    ].join("\n");
+  }
+
+  const launcherBody = [
+    "#!/bin/bash",
+    envPreamble,
+    `cd "${userWorkDir}"`,
+    `exec cc-watchdog --dangerously-load-development-channels "server:whatsapp" --permission-mode bypassPermissions --allowedTools ${allowedTools}`,
+  ].filter(Boolean).join("\n") + "\n";
+
+  fs.writeFileSync(launcher, launcherBody);
   fs.chmodSync(launcher, 0o755);
 
   execFile("tmux", ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50", launcher], (err) => {
