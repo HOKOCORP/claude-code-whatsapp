@@ -19,7 +19,7 @@ function makeMocks() {
     tmuxCalls,
     reply: async (text) => { replies.push(text); },
     tmux: {
-      capturePane: (name) => { tmuxCalls.push(["cap", name]); return "╭ idle prompt ╰"; },
+      capturePane: (name) => { tmuxCalls.push(["cap", name]); return "──────\n❯ \n──────"; },
       sendKeys: (name, ...keys) => { tmuxCalls.push(["keys", name, ...keys]); },
       killSession: (name) => { tmuxCalls.push(["kill", name]); },
     },
