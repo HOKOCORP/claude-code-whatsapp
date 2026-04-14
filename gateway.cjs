@@ -412,6 +412,42 @@ function ensureProjectUser(userId, userJid) {
     "",
   ].join("\n"));
 
+  // If domains is enabled, append domain-specific instructions to CLAUDE.md
+  // (mirrors the bash branch in isolation_create_user)
+  if (domainsAvailable()) {
+    const hash = isolationHash(path.basename(STATE_DIR), userId);
+    const domainNote = [
+      "",
+      "## Your subdomain",
+      "",
+      `You are reachable at: https://${hash}.${process.env.DOMAIN_ROOT}`,
+      "Bind your dev server to $PORT (set in your environment).",
+      "",
+      "### nginx config (yours to edit)",
+      "",
+      "Your nginx vhost: ~/nginx/vhost.conf",
+      "After editing, run: sudo ccm-nginx-reload",
+      "",
+      "This validates the config with `nginx -t` and reloads on success. On syntax errors,",
+      "nginx keeps the previous config running — edits can't break the server globally.",
+      "",
+      "### Logs",
+      "- ~/nginx/logs/access.log — every request your subdomain receives",
+      "- ~/nginx/logs/error.log — nginx-side errors (bad upstream, timeouts, etc.)",
+      "",
+      "### Persistence for long-running services",
+      "",
+      "When the tmux session dies (30min idle timeout, manual kill), child processes get SIGHUP.",
+      "Plain `nohup` is insufficient. For services meant to survive session death, use:",
+      "",
+      "    setsid nohup <cmd> >~/logs/svc.log 2>&1 </dev/null &",
+      "",
+      "`setsid` starts a new session detached from tmux.",
+      "",
+    ].join("\n");
+    fs.appendFileSync(path.join(claudeDir, "CLAUDE.md"), domainNote);
+  }
+
   // Create workspace
   fs.mkdirSync(path.join(homeDir, "workspace"), { recursive: true });
 
