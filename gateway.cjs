@@ -622,6 +622,49 @@ function domainsDeprovision(username) {
   } catch {}
 }
 
+// ── Capacity / account exhaustion ────────────────────────────────
+
+const CAPACITY_FLAG = "/var/lib/ccm/capacity-blocked";
+
+const CAPACITY_MSG_USER_DEFAULT =
+  "⏸ I'm temporarily at capacity. Please try again in <eta_relative>. Or you can upgrade to get more capacity limit.";
+
+const CAPACITY_MSG_ADMIN_DEFAULT =
+  "⏸ All Claude accounts rate-limited.\n\nNext reset: <eta_relative> (<account_label>)\n\nOptions:\n  ccm → Settings → [acc] → Add   (new account)\n  ccm → Settings → [acc] → List  (see all statuses)";
+
+function readCapacityInfo() {
+  try { return JSON.parse(fs.readFileSync(CAPACITY_FLAG, "utf8")); } catch { return null; }
+}
+
+function formatEtaRelative(unixSeconds) {
+  const now = Math.floor(Date.now() / 1000);
+  const delta = Math.max(0, unixSeconds - now);
+  if (delta <= 0) return "a moment";
+  const days = Math.floor(delta / 86400);
+  const hours = Math.floor((delta % 86400) / 3600);
+  const minutes = Math.floor((delta % 3600) / 60);
+  const parts = [];
+  if (days > 0) parts.push(`${days} day${days > 1 ? "s" : ""}`);
+  if (hours > 0) parts.push(`${hours} hour${hours > 1 ? "s" : ""}`);
+  if (minutes > 0 && days === 0) parts.push(`${minutes} minute${minutes > 1 ? "s" : ""}`);
+  return parts.join(" ") || "a moment";
+}
+
+function sendCapacityMessage(userJid, isAdmin) {
+  const info = readCapacityInfo() || {};
+  const eta = formatEtaRelative(info.earliest_reset || (Date.now() / 1000 + 3600));
+  const label = info.last_active || "";
+  const template = isAdmin
+    ? (process.env.CAPACITY_MSG_ADMIN || CAPACITY_MSG_ADMIN_DEFAULT)
+    : (process.env.CAPACITY_MSG_USER  || CAPACITY_MSG_USER_DEFAULT);
+  const text = template
+    .replace(/<eta_relative>/g, eta)
+    .replace(/<account_label>/g, label);
+  // Write to global outbox so the existing outbox scanner delivers it
+  const outFile = path.join(OUTBOX_DIR, `${Date.now()}-capacity.json`);
+  fs.writeFileSync(outFile, JSON.stringify({ jid: userJid, text }));
+}
+
 function isSessionRunning(sessionName) {
   try { execFileSync("tmux", ["has-session", "-t", sessionName], { stdio: "ignore" }); return true; } catch { return false; }
 }
@@ -1245,6 +1288,15 @@ async function connectWhatsApp() {
       if (usageCheck.warned) {
         log(`user ${userId} low balance: $${usageCheck.balance.toFixed(2)}`);
         try { await sock.sendMessage(jid, { text: `[Low balance: $${usageCheck.balance.toFixed(2)} remaining]` }); } catch {}
+      }
+
+      // Capacity check: if all Claude accounts exhausted, reply directly via outbox
+      // and do not spawn a Claude session (it would just error out).
+      if (fs.existsSync(CAPACITY_FLAG)) {
+        const admin = loadAdmin();
+        const isAdmin = admin && (admin.jid === sessionJid || toJid(admin.jid) === sessionJid);
+        sendCapacityMessage(sessionJid, isAdmin);
+        return;  // do not spawn
       }
 
       spawnUserSession(userId, sessionJid);
