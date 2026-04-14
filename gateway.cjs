@@ -362,11 +362,24 @@ function ensureProjectUser(userId, userJid) {
   // Check if user already exists
   try {
     execFileSync("id", [username], { stdio: "ignore" });
-    let port;
-    try {
-      const m = JSON.parse(fs.readFileSync(ISOLATION_MAP, "utf8"));
-      if (m[username] && m[username].port) port = m[username].port;
-    } catch {}
+    // User exists — load mapping to get port
+    let mapping = {};
+    try { mapping = JSON.parse(fs.readFileSync(ISOLATION_MAP, "utf8")); } catch {}
+    let port = mapping[username] && mapping[username].port;
+    // If domains is on and this user has no port yet, provision now
+    if (!port && domainsAvailable()) {
+      port = domainsAllocatePort();
+      const hash = isolationHash(path.basename(STATE_DIR), userId);
+      if (domainsProvision(username, hash, port, homeDir)) {
+        if (!mapping[username]) mapping[username] = { userId, channel: path.basename(STATE_DIR), created: Math.floor(Date.now() / 1000) };
+        mapping[username].port = port;
+        mapping[username].subdomain = `${hash}.${process.env.DOMAIN_ROOT}`;
+        fs.mkdirSync(path.dirname(ISOLATION_MAP), { recursive: true });
+        fs.writeFileSync(ISOLATION_MAP, JSON.stringify(mapping, null, 2));
+      } else {
+        port = undefined;
+      }
+    }
     return { username, homeDir, port };
   } catch {
     // User does not exist — create below
