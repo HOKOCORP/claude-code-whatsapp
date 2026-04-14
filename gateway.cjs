@@ -362,7 +362,12 @@ function ensureProjectUser(userId, userJid) {
   // Check if user already exists
   try {
     execFileSync("id", [username], { stdio: "ignore" });
-    return { username, homeDir };
+    let port;
+    try {
+      const m = JSON.parse(fs.readFileSync(ISOLATION_MAP, "utf8"));
+      if (m[username] && m[username].port) port = m[username].port;
+    } catch {}
+    return { username, homeDir, port };
   } catch {
     // User does not exist — create below
   }
@@ -421,10 +426,151 @@ function ensureProjectUser(userId, userJid) {
   let mapping = {};
   try { mapping = JSON.parse(fs.readFileSync(ISOLATION_MAP, "utf8")); } catch {}
   mapping[username] = { userId, channel: path.basename(STATE_DIR), created: Math.floor(Date.now() / 1000) };
+
+  // If domains is available, allocate port and provision vhost
+  if (domainsAvailable()) {
+    const port = domainsAllocatePort();
+    const hash = isolationHash(path.basename(STATE_DIR), userId);
+    if (domainsProvision(username, hash, port, homeDir)) {
+      mapping[username].port = port;
+      mapping[username].subdomain = `${hash}.${process.env.DOMAIN_ROOT}`;
+    }
+  }
+
   fs.mkdirSync(path.dirname(ISOLATION_MAP), { recursive: true });
   fs.writeFileSync(ISOLATION_MAP, JSON.stringify(mapping, null, 2));
 
-  return { username, homeDir };
+  return { username, homeDir, port: mapping[username].port };
+}
+
+// ── Domains: subdomain provisioning ──────────────────────────────
+
+function domainsAvailable() {
+  if (!ISOLATION) return false;
+  if (process.env.CCM_DOMAINS !== "1") return false;
+  if (!process.env.DOMAIN_ROOT) return false;
+  try { execFileSync("nginx", ["-v"], { stdio: "ignore" }); } catch { return false; }
+  return true;
+}
+
+function domainsNginxUser() {
+  try {
+    const conf = fs.readFileSync("/etc/nginx/nginx.conf", "utf8");
+    const m = conf.match(/^\s*user\s+([^\s;]+)/m);
+    if (m) return m[1];
+  } catch {}
+  try { execFileSync("id", ["www-data"], { stdio: "ignore" }); return "www-data"; } catch {}
+  try { execFileSync("id", ["nginx"], { stdio: "ignore" }); return "nginx"; } catch {}
+  return "www-data";
+}
+
+function domainsAllocatePort() {
+  const used = new Set();
+  try {
+    const m = JSON.parse(fs.readFileSync(ISOLATION_MAP, "utf8"));
+    for (const info of Object.values(m)) {
+      if (info && info.port) used.add(info.port);
+    }
+  } catch {}
+  try {
+    const out = execFileSync("ss", ["-tlnH"], { encoding: "utf8" });
+    for (const line of out.split("\n")) {
+      const m2 = line.match(/:(\d+)\s/);
+      if (m2) used.add(parseInt(m2[1], 10));
+    }
+  } catch {}
+  let p = 10000;
+  while (used.has(p)) p++;
+  return p;
+}
+
+function domainsProvision(username, hash, port, homeDir) {
+  if (!domainsAvailable()) return false;
+
+  const vhostDir = path.join(homeDir, "nginx");
+  const logsDir = path.join(vhostDir, "logs");
+  const vhostFile = path.join(vhostDir, "vhost.conf");
+  const symlinkPath = `/etc/nginx/conf.d/${username}.conf`;
+  const nginxUser = domainsNginxUser();
+  const root = process.env.DOMAIN_ROOT;
+
+  try {
+    fs.mkdirSync(vhostDir, { recursive: true });
+    fs.mkdirSync(logsDir, { recursive: true });
+
+    const vhost = [
+      "# Your nginx config — edit freely.",
+      "# After changes, run: sudo ccm-nginx-reload",
+      `# User: ${username}`,
+      `# Port: ${port}`,
+      "server {",
+      "    listen 80;",
+      `    server_name ${hash}.${root};`,
+      "",
+      `    access_log ${logsDir}/access.log;`,
+      `    error_log  ${logsDir}/error.log warn;`,
+      "",
+      "    location / {",
+      `        proxy_pass http://127.0.0.1:${port};`,
+      "        proxy_http_version 1.1;",
+      "        proxy_set_header Upgrade $http_upgrade;",
+      '        proxy_set_header Connection "upgrade";',
+      "        proxy_set_header Host $host;",
+      "        proxy_set_header X-Real-IP $remote_addr;",
+      "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+      "        proxy_set_header X-Forwarded-Proto $scheme;",
+      "        proxy_read_timeout 300s;",
+      "        proxy_intercept_errors off;",
+      "    }",
+      "}",
+      "",
+    ].join("\n");
+    fs.writeFileSync(vhostFile, vhost);
+
+    for (const f of ["access.log", "error.log"]) {
+      const lf = path.join(logsDir, f);
+      if (!fs.existsSync(lf)) fs.writeFileSync(lf, "");
+    }
+
+    execFileSync("chown", ["-R", `${username}:${username}`, vhostDir]);
+    execFileSync("chmod", ["0755", vhostDir, logsDir]);
+    execFileSync("chmod", ["0644", vhostFile]);
+    execFileSync("chmod", ["0640", path.join(logsDir, "access.log"), path.join(logsDir, "error.log")]);
+
+    try { execFileSync("setfacl", ["-m", `u:${nginxUser}:rx`, homeDir, vhostDir]); } catch {}
+    try { execFileSync("setfacl", ["-m", `u:${nginxUser}:rwx`, logsDir]); } catch {}
+    try { execFileSync("setfacl", ["-m", `u:${nginxUser}:rw`, path.join(logsDir, "access.log"), path.join(logsDir, "error.log")]); } catch {}
+    try { execFileSync("setfacl", ["-d", "-m", `u:${nginxUser}:rw`, logsDir]); } catch {}
+
+    try { fs.unlinkSync(symlinkPath); } catch {}
+    fs.symlinkSync(vhostFile, symlinkPath);
+
+    try { execFileSync("nginx", ["-t"], { stdio: "ignore" }); } catch {
+      log(`domainsProvision: nginx -t failed for ${username}, rolling back`);
+      try { fs.unlinkSync(symlinkPath); } catch {}
+      return false;
+    }
+    try { execFileSync("systemctl", ["reload", "nginx"], { stdio: "ignore" }); } catch (e) {
+      log(`domainsProvision: systemctl reload failed: ${e}`);
+      return false;
+    }
+
+    log(`domains provisioned: ${username} → ${hash}.${root} :${port}`);
+    return true;
+  } catch (e) {
+    log(`domainsProvision error for ${username}: ${e}`);
+    try { fs.unlinkSync(symlinkPath); } catch {}
+    return false;
+  }
+}
+
+function domainsDeprovision(username) {
+  const symlinkPath = `/etc/nginx/conf.d/${username}.conf`;
+  try { fs.unlinkSync(symlinkPath); } catch {}
+  try {
+    execFileSync("nginx", ["-t"], { stdio: "ignore" });
+    execFileSync("systemctl", ["reload", "nginx"], { stdio: "ignore" });
+  } catch {}
 }
 
 function isSessionRunning(sessionName) {
@@ -622,9 +768,17 @@ function spawnUserSession(userId, userJid) {
   const launchWorkDir = projectUser
     ? path.join(projectUser.homeDir, "workspace")
     : userWorkDir;
+
+  // If domains is on and this user has a port, expose it as $PORT
+  let portExport = "";
+  if (projectUser && projectUser.port) {
+    portExport = `export PORT=${projectUser.port}`;
+  }
+
   const launcherBody = [
     "#!/bin/bash",
     envPreamble,
+    portExport,
     `cd "${launchWorkDir}"`,
     `exec cc-watchdog --dangerously-load-development-channels "server:whatsapp" --permission-mode bypassPermissions --allowedTools ${allowedTools}`,
   ].filter(Boolean).join("\n") + "\n";
