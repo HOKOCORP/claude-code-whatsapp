@@ -10,7 +10,6 @@ test("slugify replaces non-alphanumerics with dashes", () => {
 });
 
 const fs = require("node:fs");
-const fsp = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
 
@@ -127,4 +126,9 @@ test("hasMessageId does not match a substring of a longer id", () => {
 test("hasMessageId rejects empty id", () => {
   assert.equal(js.hasMessageId("anything", ""), false);
   assert.equal(js.hasMessageId("anything", null), false);
+});
+
+test("hasMessageId rejects null/undefined tailText", () => {
+  assert.equal(js.hasMessageId(null, "ABC"), false);
+  assert.equal(js.hasMessageId(undefined, "ABC"), false);
 });
