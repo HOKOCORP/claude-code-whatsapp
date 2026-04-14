@@ -107,3 +107,180 @@ test("delete requires at least one msgId tracked (empty set = not delivered)", (
   });
   assert.equal(action.kind, "wait");
 });
+
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+
+function mkTmp(prefix) {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+function writeOutboxFile(dir, filename, payload) {
+  const fp = path.join(dir, filename);
+  fs.writeFileSync(fp, JSON.stringify(payload));
+  return fp;
+}
+
+test("tick: fresh file triggers sendFn, state recorded with msgIds", async () => {
+  const outboxDir = mkTmp("outbox-recon-");
+  const fp = writeOutboxFile(outboxDir, "1000-a.json", { action: "reply", chat_id: "c", text: "hi" });
+  const ackedIds = new Set();
+  const sends = [];
+  const tick = r.createOutboxReconciler({
+    outboxDir,
+    sendFn: async (data) => { sends.push(data); return { msgIds: ["ID-A"] }; },
+    ackedIds,
+    now: () => 1000,
+    stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+  });
+  await tick();
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].text, "hi");
+  assert.ok(fs.existsSync(fp), "file still present pre-ack");
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
+
+test("tick: file unlinked once all msgIds are in ackedIds", async () => {
+  const outboxDir = mkTmp("outbox-recon-");
+  const fp = writeOutboxFile(outboxDir, "1000-a.json", { action: "reply", chat_id: "c", text: "hi" });
+  const ackedIds = new Set();
+  const tick = r.createOutboxReconciler({
+    outboxDir,
+    sendFn: async () => ({ msgIds: ["ID-A"] }),
+    ackedIds,
+    now: () => 1000,
+    stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+  });
+  await tick();
+  assert.ok(fs.existsSync(fp), "file still present pre-ack");
+  ackedIds.add("ID-A");
+  await tick();
+  assert.equal(fs.existsSync(fp), false, "file unlinked after ack");
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
+
+test("tick: ack arriving before sendState write (race) is handled via immediate post-send check", async () => {
+  const outboxDir = mkTmp("outbox-recon-");
+  const fp = writeOutboxFile(outboxDir, "1000-a.json", { action: "reply", chat_id: "c", text: "hi" });
+  const ackedIds = new Set();
+  const tick = r.createOutboxReconciler({
+    outboxDir,
+    sendFn: async () => {
+      ackedIds.add("ID-A");
+      return { msgIds: ["ID-A"] };
+    },
+    ackedIds,
+    now: () => 1000,
+    stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+  });
+  await tick();
+  assert.equal(fs.existsSync(fp), false, "file unlinked immediately because ack already present");
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
+
+test("tick: sendFn throws — file kept, state records attempt", async () => {
+  const outboxDir = mkTmp("outbox-recon-");
+  const fp = writeOutboxFile(outboxDir, "1000-a.json", { action: "reply", chat_id: "c", text: "hi" });
+  let clock = 1000;
+  let sendCalls = 0;
+  const tick = r.createOutboxReconciler({
+    outboxDir,
+    sendFn: async () => { sendCalls += 1; throw new Error("Connection Closed"); },
+    ackedIds: new Set(),
+    now: () => clock,
+    stalenessMs: 1000, maxAgeMs: 300000, maxRetries: 10,
+  });
+  await tick();
+  assert.equal(sendCalls, 1);
+  assert.ok(fs.existsSync(fp), "file kept after throw");
+  clock = 3000;
+  await tick();
+  assert.equal(sendCalls, 2, "resend on staleness");
+  assert.ok(fs.existsSync(fp));
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
+
+test("tick: sendFn returning {fireAndForget: true} unlinks immediately (no tracking)", async () => {
+  const outboxDir = mkTmp("outbox-recon-");
+  const fp = writeOutboxFile(outboxDir, "1000-a.json", { action: "typing_start", chat_id: "c" });
+  const tick = r.createOutboxReconciler({
+    outboxDir,
+    sendFn: async () => ({ fireAndForget: true }),
+    ackedIds: new Set(),
+    now: () => 1000,
+    stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+  });
+  await tick();
+  assert.equal(fs.existsSync(fp), false, "fire-and-forget file unlinked");
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
+
+test("tick: quarantined files moved to outbox/failed/", async () => {
+  const outboxDir = mkTmp("outbox-recon-");
+  const fp = writeOutboxFile(outboxDir, "1000-a.json", { action: "reply", chat_id: "c", text: "hi" });
+  let clock = 1000;
+  const tick = r.createOutboxReconciler({
+    outboxDir,
+    sendFn: async () => { throw new Error("always fails"); },
+    ackedIds: new Set(),
+    now: () => clock,
+    stalenessMs: 10, maxAgeMs: 10000, maxRetries: 3,
+  });
+  await tick();
+  clock += 20; await tick();
+  clock += 20; await tick();
+  clock += 20; await tick();
+  assert.equal(fs.existsSync(fp), false, "original file moved");
+  const failedDir = path.join(outboxDir, "failed");
+  assert.ok(fs.existsSync(failedDir), "failed dir created");
+  const files = fs.readdirSync(failedDir);
+  assert.equal(files.length, 1, "one quarantined file");
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
+
+test("tick: malformed JSON quarantined, not crashed", async () => {
+  const outboxDir = mkTmp("outbox-recon-");
+  fs.writeFileSync(path.join(outboxDir, "bad.json"), "{ not json");
+  const tick = r.createOutboxReconciler({
+    outboxDir,
+    sendFn: async () => { throw new Error("should not be called"); },
+    ackedIds: new Set(),
+    now: () => 1000,
+    stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+  });
+  await tick();
+  const failedDir = path.join(outboxDir, "failed");
+  assert.ok(fs.existsSync(failedDir));
+  assert.deepEqual(fs.readdirSync(failedDir), ["bad.json"]);
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
+
+test("tick: fresh reconciler redelivers un-acked file (simulates gateway restart)", async () => {
+  const outboxDir = mkTmp("outbox-recon-");
+  writeOutboxFile(outboxDir, "1000-a.json", { action: "reply", chat_id: "c", text: "hi" });
+
+  const ackedIds = new Set();
+  const sends1 = [];
+  const tick1 = r.createOutboxReconciler({
+    outboxDir,
+    sendFn: async (data) => { sends1.push(data); return { msgIds: ["ID-1"] }; },
+    ackedIds,
+    now: () => 1000,
+    stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+  });
+  await tick1();
+  assert.equal(sends1.length, 1);
+
+  const sends2 = [];
+  const tick2 = r.createOutboxReconciler({
+    outboxDir,
+    sendFn: async (data) => { sends2.push(data); return { msgIds: ["ID-2"] }; },
+    ackedIds,
+    now: () => 2000,
+    stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+  });
+  await tick2();
+  assert.equal(sends2.length, 1, "fresh reconciler re-sends (the trade-off: possible duplicate)");
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
