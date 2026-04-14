@@ -132,3 +132,25 @@ test("hasMessageId rejects null/undefined tailText", () => {
   assert.equal(js.hasMessageId(null, "ABC"), false);
   assert.equal(js.hasMessageId(undefined, "ABC"), false);
 });
+
+test("findSessionJsonl finds jsonl under any of the CC slug encodings", async () => {
+  const home = mkTmp("jsonl-scan-");
+  const cwd = "/a/b";
+  // The three encodings of "/a/b":
+  //   [^a-zA-Z0-9] → -       : "-a-b"
+  //   /            → -       : "-a-b"   (same for this path — that's fine)
+  //   [/.]         → -       : "-a-b"
+  //   /→- then -.→.          : "-a-b"
+  // All collapse to "-a-b" for a dotless path, so we need a path with a dot to differentiate.
+  const cwdWithDot = "/foo/.bar";
+  const projectsRoot = path.join(home, ".claude/projects");
+  // Simulate CC having used the "[/.] → -" encoding (produces "-foo--bar")
+  const slug = cwdWithDot.replace(/[/.]/g, "-");
+  const projDir = path.join(projectsRoot, slug);
+  fs.mkdirSync(projDir, { recursive: true });
+  const fp = path.join(projDir, "session.jsonl");
+  fs.writeFileSync(fp, "content");
+  const result = js.findSessionJsonl(cwdWithDot, home);
+  assert.equal(result, fp);
+  fs.rmSync(home, { recursive: true, force: true });
+});

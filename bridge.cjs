@@ -79,6 +79,7 @@ const mcp = new Server(
 
 let mcpReady = false;
 
+// sendNotification's writeOutbox reference is safe: function declarations are hoisted.
 const reconcilerTick = inboxReconciler.createReconciler({
   userDir: USER_DIR,
   loadJsonl: loadJsonlTail,
