@@ -54,3 +54,57 @@ test("findSessionJsonl ignores .jsonl.bak and returns newest .jsonl", async () =
   assert.equal(result, newer);
   fs.rmSync(home, { recursive: true, force: true });
 });
+
+test("readJsonlTail returns empty string when file missing", () => {
+  const cache = {};
+  const out = js.readJsonlTail("/nope/nope.jsonl", 1024, cache);
+  assert.equal(out, "");
+});
+
+test("readJsonlTail returns full content when file smaller than window", () => {
+  const home = mkTmp("jsonl-scan-");
+  const fp = path.join(home, "small.jsonl");
+  fs.writeFileSync(fp, "hello world");
+  const cache = {};
+  const out = js.readJsonlTail(fp, 1024, cache);
+  assert.equal(out, "hello world");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("readJsonlTail returns only the tail bytes when file is larger than window", () => {
+  const home = mkTmp("jsonl-scan-");
+  const fp = path.join(home, "big.jsonl");
+  fs.writeFileSync(fp, "A".repeat(100) + "TAIL_MARKER");
+  const cache = {};
+  const out = js.readJsonlTail(fp, 20, cache);
+  assert.ok(out.endsWith("TAIL_MARKER"), `got: ${out}`);
+  assert.equal(out.length, 20);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("readJsonlTail reuses cached text when mtime/inode unchanged", () => {
+  const home = mkTmp("jsonl-scan-");
+  const fp = path.join(home, "cached.jsonl");
+  fs.writeFileSync(fp, "first-read");
+  const cache = {};
+  const first = js.readJsonlTail(fp, 1024, cache);
+  const second = js.readJsonlTail(fp, 1024, cache);
+  assert.equal(first, "first-read");
+  assert.equal(second, "first-read");
+  assert.equal(cache.text, "first-read");
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("readJsonlTail re-reads when mtime changes", async () => {
+  const home = mkTmp("jsonl-scan-");
+  const fp = path.join(home, "changing.jsonl");
+  fs.writeFileSync(fp, "v1");
+  const cache = {};
+  const first = js.readJsonlTail(fp, 1024, cache);
+  await new Promise(r => setTimeout(r, 20));
+  fs.writeFileSync(fp, "v2");
+  const second = js.readJsonlTail(fp, 1024, cache);
+  assert.equal(first, "v1");
+  assert.equal(second, "v2");
+  fs.rmSync(home, { recursive: true, force: true });
+});
