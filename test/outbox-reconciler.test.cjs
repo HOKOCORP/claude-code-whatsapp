@@ -256,6 +256,28 @@ test("tick: malformed JSON quarantined, not crashed", async () => {
   fs.rmSync(outboxDir, { recursive: true, force: true });
 });
 
+test("tick: file older than maxAgeMs is quarantined even within retry budget", async () => {
+  const outboxDir = mkTmp("outbox-recon-");
+  const fp = writeOutboxFile(outboxDir, "1000-old.json", { action: "reply", chat_id: "c", text: "hi" });
+  let clock = 1000;
+  const tick = r.createOutboxReconciler({
+    outboxDir,
+    sendFn: async () => { throw new Error("still broken"); },
+    ackedIds: new Set(),
+    now: () => clock,
+    stalenessMs: 100, maxAgeMs: 500, maxRetries: 100,
+  });
+  await tick();                          // attempt 1 — throws, state recorded
+  clock = 200; await tick();             // attempt 2 (past staleness) — throws
+  clock = 1700; await tick();            // age exceeded → quarantine (firstSentAt=1000, now=1700, maxAge=500)
+
+  assert.equal(fs.existsSync(fp), false, "file moved to failed/");
+  const failed = path.join(outboxDir, "failed");
+  assert.ok(fs.existsSync(failed));
+  assert.deepEqual(fs.readdirSync(failed), ["1000-old.json"]);
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
+
 test("tick: fresh reconciler redelivers un-acked file (simulates gateway restart)", async () => {
   const outboxDir = mkTmp("outbox-recon-");
   writeOutboxFile(outboxDir, "1000-a.json", { action: "reply", chat_id: "c", text: "hi" });
