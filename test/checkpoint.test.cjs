@@ -73,3 +73,19 @@ test("pruneOld is a no-op when fewer than retention checkpoints exist", async ()
 test("pruneOld is idempotent when the user dir does not exist", async () => {
   await cp.pruneOld("ghost");
 });
+
+test("create and pruneOld reject unsafe userIds (path traversal guard)", async () => {
+  const projectDir = await makeProjectDir("slug");
+  for (const bad of ["../escape", "user/sub", "user\0", "", null, undefined, "user with space"]) {
+    await assert.rejects(
+      async () => { await cp.create(bad, projectDir, "s"); },
+      /unsafe userId/,
+      `create should reject ${JSON.stringify(bad)}`,
+    );
+    await assert.rejects(
+      async () => { await cp.pruneOld(bad); },
+      /unsafe userId/,
+      `pruneOld should reject ${JSON.stringify(bad)}`,
+    );
+  }
+});
