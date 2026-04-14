@@ -38,7 +38,11 @@ const USAGE_DIR = path.join(os.homedir(), ".ccm", "usage");
 const USAGE_LIMITS_FILE = path.join(USAGE_DIR, "limits.json");
 
 // ── Isolation mode ────────────────────────────────────────────────
-const ISOLATION = process.env.CCM_ISOLATION === "1";
+const ISOLATION_REQUESTED = process.env.CCM_ISOLATION === "1";
+const ISOLATION = ISOLATION_REQUESTED && process.getuid && process.getuid() === 0;
+if (ISOLATION_REQUESTED && !ISOLATION) {
+  process.stderr.write("wa-gateway: WARNING: CCM_ISOLATION=1 set but gateway is not running as root — isolation disabled, falling back to single-user mode\n");
+}
 const IPC_BASE = ISOLATION
   ? path.join("/var/lib/ccm/channels", path.basename(STATE_DIR))
   : STATE_DIR;
