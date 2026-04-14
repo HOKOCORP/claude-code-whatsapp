@@ -22,6 +22,8 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const channelSlash = require("./lib/channel-slash.cjs");
+const tmuxHelper = require("./lib/tmux.cjs");
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -1164,6 +1166,30 @@ async function connectWhatsApp() {
         const trigger = (loadAccess().groupTrigger || "@ai");
         text = text.replace(new RegExp(trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "").trim();
       }
+      // Channel slash commands (/help, /clear, /compact, OTP confirm) — check
+      // before /usage so they short-circuit cleanly. Falls through (returns
+      // false) for any text that isn't one of these commands or a pending OTP.
+      {
+        const userWorkDir = path.join(getUserDir(userId), "workspace");
+        const projectDirCandidates = [
+          userWorkDir.replace(/\//g, "-"),
+          userWorkDir.replace(/[/.]/g, "-"),
+          userWorkDir.replace(/\//g, "-").replace(/-\./g, "."),
+        ].map(slug => path.join(os.homedir(), ".claude", "projects", slug));
+        const sessionName = getUserSessionName(userId);
+        const handled = await channelSlash.handleChannelSlashCommand({
+          userId,
+          text,
+          reply: async (t) => {
+            try { await sock.sendMessage(jid, { text: t }); }
+            catch (e) { log(`channel-slash reply failed: ${e}`); }
+          },
+          tmux: tmuxHelper,
+          paths: { projectDirCandidates, sessionName },
+        });
+        if (handled) continue;
+      }
+
       // /usage command — check BEFORE sender prefix so it works in groups too
       // (text has already been trigger-stripped at this point, e.g. "@ai /usage" → "/usage")
       if (text && /^\/usage\s+history$/i.test(text.trim())) {
