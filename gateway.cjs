@@ -1170,12 +1170,19 @@ async function connectWhatsApp() {
       // before /usage so they short-circuit cleanly. Falls through (returns
       // false) for any text that isn't one of these commands or a pending OTP.
       {
-        const userWorkDir = path.join(getUserDir(userId), "workspace");
+        // Mirror findUserSessionFiles() — in isolation mode the project user's
+        // session files live under /home/<isolation-user>/, not admin's home.
+        const projectUserHome = ISOLATION
+          ? `/home/${isolationGetUsername(userId)}`
+          : os.homedir();
+        const userWorkDir = ISOLATION
+          ? path.join(projectUserHome, "workspace")
+          : path.join(getUserDir(userId), "workspace");
         const projectDirCandidates = [
           userWorkDir.replace(/\//g, "-"),
           userWorkDir.replace(/[/.]/g, "-"),
           userWorkDir.replace(/\//g, "-").replace(/-\./g, "."),
-        ].map(slug => path.join(os.homedir(), ".claude", "projects", slug));
+        ].map(slug => path.join(projectUserHome, ".claude", "projects", slug));
         const sessionName = getUserSessionName(userId);
         const handled = await channelSlash.handleChannelSlashCommand({
           userId,
