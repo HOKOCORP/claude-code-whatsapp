@@ -52,9 +52,11 @@ to:
 ```json
 "scripts": {
   "start": "node server.cjs",
-  "test": "node --test test/"
+  "test": "node --test test/**/*.{cjs,js}"
 },
 ```
+
+(A glob is required because `node --test test/` errors out on an empty directory by treating the path as a single file argument. The glob expands to zero matches on the empty directory and Node exits 0.)
 
 - [ ] **Step 3: Create the test directory placeholder**
 
