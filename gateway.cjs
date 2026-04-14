@@ -326,8 +326,10 @@ function getUserDir(userId) {
   // In isolation mode, the project user owns the IPC directory; admin (gateway) accesses via root
   if (ISOLATION) {
     const username = isolationGetUsername(userId);
-    try { execFileSync("chown", ["-R", `${username}:${username}`, dir]); } catch {}
-    try { execFileSync("chmod", ["700", dir]); } catch {}
+    // Owner: project user (can read/write their own IPC)
+    // Group: ccm-gw (admin/gateway can read/write, other project users cannot)
+    try { execFileSync("chown", ["-R", `${username}:ccm-gw`, dir]); } catch {}
+    try { execFileSync("chmod", ["770", dir]); } catch {}
   }
   return dir;
 }
