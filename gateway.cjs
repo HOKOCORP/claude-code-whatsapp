@@ -1391,9 +1391,18 @@ setInterval(async () => {
           let displayName = d.user_number || uid;
           try { const meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8")); if (meta.name) displayName = meta.name; } catch {}
 
-          // Send context + poll to admin
-          const contextText = `\uD83D\uDD10 *Permission Request*\n\n\uD83D\uDC64 From: ${displayName}\n${d.user_message ? `\uD83D\uDCAC "${d.user_message.slice(0,100)}"\n` : ""}\n\u26A1 ${action}`;
-          await sock.sendMessage(admin.jid, { text: contextText });
+          // Route the poll: in isolation mode, users approve their own actions
+          // (damage is scoped to their own Unix user). Without isolation, admin
+          // remains the gatekeeper since users share the admin's filesystem.
+          const pollTargetJid = (ISOLATION && d.user_jid) ? d.user_jid : admin.jid;
+          const isSelfApproval = pollTargetJid === d.user_jid;
+
+          // Send context message — "From: <name>" doesn't make sense when the
+          // user is approving their own action
+          const contextText = isSelfApproval
+            ? `\uD83D\uDD10 *Permission Request*\n${d.user_message ? `\uD83D\uDCAC Your message: "${d.user_message.slice(0,100)}"\n` : ""}\n\u26A1 ${action}`
+            : `\uD83D\uDD10 *Permission Request*\n\n\uD83D\uDC64 From: ${displayName}\n${d.user_message ? `\uD83D\uDCAC "${d.user_message.slice(0,100)}"\n` : ""}\n\u26A1 ${action}`;
+          await sock.sendMessage(pollTargetJid, { text: contextText });
 
           // Build a signature for "allow all similar" pattern
           let patternSig = "";
@@ -1408,7 +1417,7 @@ setInterval(async () => {
             }
           } catch { patternSig = toolName; }
 
-          const pollMsg = await sock.sendMessage(admin.jid, {
+          const pollMsg = await sock.sendMessage(pollTargetJid, {
             poll: {
               name: "Approve?",
               selectableCount: 1,
@@ -1421,8 +1430,10 @@ setInterval(async () => {
             storeRaw(pollMsg);
           }
 
-          // Only send "waiting" to DMs, not groups
-          if (d.user_jid && !d.user_jid.endsWith("@g.us")) {
+          // Send "waiting" only when the approver is someone OTHER than the
+          // requester (admin-gatekeeper mode). When the user is self-approving,
+          // the poll itself is the prompt — no separate waiting message needed.
+          if (!isSelfApproval && d.user_jid && !d.user_jid.endsWith("@g.us")) {
             try { await sock.sendMessage(d.user_jid, { text: "\u23F3 Waiting for admin approval..." }); } catch {}
           }
         } catch (e) { log(`perm relay ${uid}/${f}: ${e}`); }
