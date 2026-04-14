@@ -108,3 +108,23 @@ test("readJsonlTail re-reads when mtime changes", async () => {
   assert.equal(second, "v2");
   fs.rmSync(home, { recursive: true, force: true });
 });
+
+test("hasMessageId finds a literal message_id=\"...\" occurrence", () => {
+  const haystack = '{"content":"<channel message_id=\\"ABC123\\" ts=\\"...\\">"}';
+  assert.equal(js.hasMessageId(haystack, "ABC123"), true);
+});
+
+test("hasMessageId returns false on absence", () => {
+  const haystack = '{"content":"<channel message_id=\\"XYZ\\" >"}';
+  assert.equal(js.hasMessageId(haystack, "ABC123"), false);
+});
+
+test("hasMessageId does not match a substring of a longer id", () => {
+  const haystack = '{"content":"<channel message_id=\\"ABC1234567\\">"}';
+  assert.equal(js.hasMessageId(haystack, "ABC123"), false);
+});
+
+test("hasMessageId rejects empty id", () => {
+  assert.equal(js.hasMessageId("anything", ""), false);
+  assert.equal(js.hasMessageId("anything", null), false);
+});
