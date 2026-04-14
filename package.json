@@ -4,7 +4,8 @@
   "license": "MIT",
   "bin": "./server.cjs",
   "scripts": {
-    "start": "node server.cjs"
+    "start": "node server.cjs",
+    "test": "node --test test/**/*.{cjs,js}"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
