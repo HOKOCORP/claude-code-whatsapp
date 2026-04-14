@@ -34,6 +34,55 @@ async function makeProjectDir(slug) {
 }
 
 test.beforeEach(async () => { await fs.rm(ROOT, { recursive: true, force: true }); });
+test("/clear with no existing project dir skips Checkpointing reply but still clears", async () => {
+  const m = makeMocks();
+  await cs.handleChannelSlashCommand({
+    userId: "u1", text: "/clear", reply: m.reply, tmux: m.tmux,
+    paths: { projectDirCandidates: ["/nonexistent/path/zzz"], sessionName: "s1" },
+  });
+  const code = (await pa.read("u1")).code;
+  m.replies.length = 0;
+  m.tmuxCalls.length = 0;
+  const handled = await cs.handleChannelSlashCommand({
+    userId: "u1", text: code, reply: m.reply, tmux: m.tmux,
+    paths: { projectDirCandidates: ["/nonexistent/path/zzz"], sessionName: "s1" },
+  });
+  assert.equal(handled, true);
+  // Only "Cleared." reply — no "Checkpointing…" since there was nothing to checkpoint
+  assert.equal(m.replies.length, 1);
+  assert.match(m.replies[0], /Cleared/);
+  assert.deepEqual(m.tmuxCalls.find(c => c[0] === "kill"), ["kill", "s1"]);
+  assert.equal(await pa.read("u1"), null);
+});
+
+test("/clear keeps pending file when checkpoint fails", async () => {
+  const projectDir = await makeProjectDir("slug-fail");
+  // Pre-create a checkpoint dir with the same UTC stamp will be hard to time.
+  // Instead, make the project dir read-only so fs.rename fails.
+  // Simpler: use a path that's actually a file, not a dir, so fs.rename throws.
+  const fakeFile = path.join(ROOT, "projects", "is-a-file");
+  await fs.mkdir(path.dirname(fakeFile), { recursive: true });
+  await fs.writeFile(fakeFile, "I am a file, not a dir");
+  const m = makeMocks();
+  await cs.handleChannelSlashCommand({
+    userId: "u1", text: "/clear", reply: m.reply, tmux: m.tmux,
+    paths: { projectDirCandidates: [fakeFile], sessionName: "s1" },
+  });
+  const code = (await pa.read("u1")).code;
+  m.replies.length = 0;
+  const handled = await cs.handleChannelSlashCommand({
+    userId: "u1", text: code, reply: m.reply, tmux: m.tmux,
+    paths: { projectDirCandidates: [fakeFile], sessionName: "s1" },
+  });
+  assert.equal(handled, true);
+  // Should have sent "Checkpointing…" then the failure apology
+  assert.match(m.replies[0], /Checkpointing/);
+  assert.match(m.replies[1], /Couldn't checkpoint/);
+  // Pending KEPT (mid-flight failure)
+  const stillPending = await pa.read("u1");
+  assert.equal(stillPending.code, code);
+});
+
 test.after(async () => { await fs.rm(ROOT, { recursive: true, force: true }); });
 
 test("returns false for plain non-slash text", async () => {
