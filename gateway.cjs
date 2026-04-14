@@ -24,6 +24,7 @@ const os = require("os");
 const crypto = require("crypto");
 const channelSlash = require("./lib/channel-slash.cjs");
 const tmuxHelper = require("./lib/tmux.cjs");
+const outboxReconciler = require("./lib/outbox-reconciler.cjs");
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -62,6 +63,16 @@ if (ISOLATION) {
 
 const logger = pino({ level: "silent" });
 const log = (msg) => process.stderr.write(`wa-gateway: ${msg}\n`);
+
+// Outbox redelivery (see docs/superpowers/specs/2026-04-14-outbox-redelivery-design.md)
+const outboxAckedIds = new Set();
+const OUTBOX_ACKED_TTL_MS = 60_000;
+
+function markAcked(id) {
+  if (!id || typeof id !== "string") return;
+  outboxAckedIds.add(id);
+  setTimeout(() => outboxAckedIds.delete(id), OUTBOX_ACKED_TTL_MS);
+}
 
 // ── USD wallet ─────────────────────────────────────────────────────
 // Pay-as-you-go USD balance per user. New users start at $0 (blocked).
@@ -986,6 +997,17 @@ async function connectWhatsApp() {
       }, WATCHDOG_INTERVAL);
     }
   });
+  sock.ev.on('messages.update', (updates) => {
+    try {
+      if (!Array.isArray(updates)) return;
+      for (const u of updates) {
+        if (!u || !u.key || !u.key.id) continue;
+        if (u.key.fromMe !== true) continue; // only track our own sent messages
+        const status = u.update && typeof u.update.status === "number" ? u.update.status : null;
+        if (status !== null && status >= 2) markAcked(u.key.id);
+      }
+    } catch (e) { log(`messages.update handler error: ${e}`); }
+  });
   if (sock.ws && typeof sock.ws.on === "function") sock.ws.on("error", (err) => log(`ws error: ${err}`));
 
   // ── Message handler ─────────────────────────────────────────────
@@ -1377,53 +1399,115 @@ async function connectWhatsApp() {
   });
 }
 
-// ── Per-user outbox processor ───────────────────────────────────────
+// ── Per-user outbox processor — redelivery-aware ────────────────────
+// Reconciler-based: each outbox dir has its own createOutboxReconciler
+// instance. On sendFn success, msgIds go into sendState; messages.update
+// populates outboxAckedIds; next tick unlinks the file. On send throw,
+// file stays and is retried. Gateway restart re-sends unacked files
+// (possible visible duplicate — see spec §5.5). Fire-and-forget actions
+// (typing indicators, download) bypass the ack-tracking path.
+
+const outboxReconcilers = new Map(); // dir -> reconciler tick fn
+
+function sendFnGlobal(data) {
+  if (!data || !data.jid || !data.text) return Promise.resolve({ fireAndForget: true });
+  return sock.sendMessage(data.jid, { text: data.text }).then(
+    (msg) => ({ msgIds: msg && msg.key && msg.key.id ? [msg.key.id] : [] })
+  );
+}
+
+function makeSendFnUser(uid) {
+  return async function sendFnUser(data) {
+    if (!data || !data.action) return { fireAndForget: true };
+    userActivity.set(uid, Date.now());
+
+    if (data.action === "typing_start") {
+      try { sock.sendPresenceUpdate("composing", data.chat_id); } catch {}
+      return { fireAndForget: true };
+    }
+    if (data.action === "typing_stop") {
+      try { sock.sendPresenceUpdate("paused", data.chat_id); } catch {}
+      return { fireAndForget: true };
+    }
+    if (data.action === "download") {
+      const raw = rawMessages.get(data.message_id);
+      if (raw?.message) {
+        const media = extractMediaInfo(raw.message);
+        if (media) {
+          const buf = await downloadMediaMessage(raw, "buffer", {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const fn = media.filename || `${Date.now()}.${mimeToExt(media.mimetype)}`;
+          fs.writeFileSync(path.join(USERS_DIR, uid, "downloads", `${data.message_id}-${fn}`), buf);
+        }
+      }
+      return { fireAndForget: true };
+    }
+    if (data.action === "react") {
+      const msg = await sock.sendMessage(data.chat_id, {
+        react: { text: data.emoji, key: { remoteJid: data.chat_id, id: data.message_id } }
+      });
+      return { msgIds: msg && msg.key && msg.key.id ? [msg.key.id] : [] };
+    }
+    if (data.action === "reply") {
+      const msgIds = [];
+      if (data.text) {
+        const q = data.reply_to ? rawMessages.get(data.reply_to) : undefined;
+        const msg = await sock.sendMessage(data.chat_id, { text: data.text }, q ? { quoted: q } : undefined);
+        if (msg && msg.key && msg.key.id) msgIds.push(msg.key.id);
+      }
+      for (const file of (data.files || [])) {
+        const ext = path.extname(file).toLowerCase();
+        const buf = fs.readFileSync(file);
+        let msg;
+        if ([".jpg",".jpeg",".png",".gif",".webp"].includes(ext)) {
+          msg = await sock.sendMessage(data.chat_id, { image: buf });
+        } else if ([".ogg",".mp3",".m4a",".wav"].includes(ext)) {
+          msg = await sock.sendMessage(data.chat_id, { audio: buf, mimetype: ext === ".ogg" ? "audio/ogg; codecs=opus" : "audio/mpeg", ptt: ext === ".ogg" });
+        } else if ([".mp4",".mov",".avi"].includes(ext)) {
+          msg = await sock.sendMessage(data.chat_id, { video: buf });
+        } else {
+          msg = await sock.sendMessage(data.chat_id, { document: buf, mimetype: "application/octet-stream", fileName: path.basename(file) });
+        }
+        if (msg && msg.key && msg.key.id) msgIds.push(msg.key.id);
+      }
+      try { sock.sendPresenceUpdate("paused", data.chat_id); } catch {}
+      return { msgIds };
+    }
+    log(`outbox: unknown action "${data.action}" for ${uid} — discarding`);
+    return { fireAndForget: true };
+  };
+}
+
+function reconcilerFor(dir, sendFn) {
+  let r = outboxReconcilers.get(dir);
+  if (!r) {
+    r = outboxReconciler.createOutboxReconciler({
+      outboxDir: dir,
+      sendFn,
+      ackedIds: outboxAckedIds,
+      now: () => Date.now(),
+      stalenessMs: 5000,
+      maxAgeMs: 5 * 60 * 1000,
+      maxRetries: 5,
+      log,
+    });
+    outboxReconcilers.set(dir, r);
+  }
+  return r;
+}
 
 let outboxBusy = false;
 setInterval(async () => {
   if (!sock || !connectionReady || outboxBusy) return;
   outboxBusy = true;
   try {
-    // Global outbox (admin OTP messages from menu)
-    for (const f of fs.readdirSync(OUTBOX_DIR).filter((x) => x.endsWith(".json"))) {
-      const fp = path.join(OUTBOX_DIR, f);
-      try { const d = fs.readFileSync(fp, "utf8"); fs.unlinkSync(fp); const { jid: to, text } = JSON.parse(d); if (to && text) await sock.sendMessage(to, { text }); } catch (e) { log(`outbox: ${e}`); }
-    }
-    // Per-user outboxes
+    await reconcilerFor(OUTBOX_DIR, sendFnGlobal)();
     for (const uid of (fs.readdirSync(USERS_DIR) || [])) {
       const odir = path.join(USERS_DIR, uid, "outbox");
-      let files; try { files = fs.readdirSync(odir).filter((x) => x.endsWith(".json")).sort(); } catch { continue; }
-      for (const f of files) {
-        const fp = path.join(odir, f);
-        try {
-          const d = fs.readFileSync(fp, "utf8"); fs.unlinkSync(fp); const a = JSON.parse(d);
-          // Track outbound activity so active sessions don't get killed as idle
-          userActivity.set(uid, Date.now());
-          if (a.action === "reply") {
-            if (a.text) { const q = a.reply_to ? rawMessages.get(a.reply_to) : undefined; await sock.sendMessage(a.chat_id, { text: a.text }, q ? { quoted: q } : undefined); }
-            for (const file of (a.files || [])) {
-              const ext = path.extname(file).toLowerCase(); const buf = fs.readFileSync(file);
-              if ([".jpg",".jpeg",".png",".gif",".webp"].includes(ext)) await sock.sendMessage(a.chat_id, { image: buf });
-              else if ([".ogg",".mp3",".m4a",".wav"].includes(ext)) await sock.sendMessage(a.chat_id, { audio: buf, mimetype: ext === ".ogg" ? "audio/ogg; codecs=opus" : "audio/mpeg", ptt: ext === ".ogg" });
-              else if ([".mp4",".mov",".avi"].includes(ext)) await sock.sendMessage(a.chat_id, { video: buf });
-              else await sock.sendMessage(a.chat_id, { document: buf, mimetype: "application/octet-stream", fileName: path.basename(file) });
-            }
-            try { sock.sendPresenceUpdate("paused", a.chat_id); } catch {}
-          } else if (a.action === "react") {
-            await sock.sendMessage(a.chat_id, { react: { text: a.emoji, key: { remoteJid: a.chat_id, id: a.message_id } } });
-          } else if (a.action === "download") {
-            const raw = rawMessages.get(a.message_id);
-            if (raw?.message) {
-              const media = extractMediaInfo(raw.message);
-              if (media) { const buf = await downloadMediaMessage(raw, "buffer", {}, { logger, reuploadRequest: sock.updateMediaMessage }); const fn = media.filename || `${Date.now()}.${mimeToExt(media.mimetype)}`; fs.writeFileSync(path.join(USERS_DIR, uid, "downloads", `${a.message_id}-${fn}`), buf); }
-            }
-          } else if (a.action === "typing_start") { try { sock.sendPresenceUpdate("composing", a.chat_id); } catch {} }
-          else if (a.action === "typing_stop") { try { sock.sendPresenceUpdate("paused", a.chat_id); } catch {} }
-        } catch (e) { log(`user outbox ${uid}/${f}: ${e}`); }
-      }
+      try { fs.accessSync(odir); } catch { continue; }
+      await reconcilerFor(odir, makeSendFnUser(uid))();
     }
   } catch (e) { log(`outbox scan: ${e}`); }
-  outboxBusy = false;
+  finally { outboxBusy = false; }
 }, 1500);
 
 // ── Permission request relay (via polls) ────────────────────────────
