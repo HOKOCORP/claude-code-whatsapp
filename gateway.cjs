@@ -124,8 +124,12 @@ function todayKey() { return new Date().toISOString().slice(0, 10); }
  * Find all .jsonl session files for a user's workspace.
  */
 function findUserSessionFiles(userId) {
-  const userWorkDir = path.join(USERS_DIR, userId, "workspace");
-  const projectsDir = path.join(os.homedir(), ".claude", "projects");
+  // In isolation mode, session files live in the project user's home, not admin's
+  const projectUserHome = ISOLATION ? `/home/${isolationGetUsername(userId)}` : os.homedir();
+  const projectsDir = path.join(projectUserHome, ".claude", "projects");
+  const userWorkDir = ISOLATION
+    ? path.join(projectUserHome, "workspace")
+    : path.join(USERS_DIR, userId, "workspace");
   if (!fs.existsSync(projectsDir)) return [];
 
   const slugs = new Set([
