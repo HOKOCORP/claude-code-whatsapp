@@ -1409,11 +1409,10 @@ async function connectWhatsApp() {
 
 const outboxReconcilers = new Map(); // dir -> reconciler tick fn
 
-function sendFnGlobal(data) {
-  if (!data || !data.jid || !data.text) return Promise.resolve({ fireAndForget: true });
-  return sock.sendMessage(data.jid, { text: data.text }).then(
-    (msg) => ({ msgIds: msg && msg.key && msg.key.id ? [msg.key.id] : [] })
-  );
+async function sendFnGlobal(data) {
+  if (!data || !data.jid || !data.text) return { fireAndForget: true };
+  const msg = await sock.sendMessage(data.jid, { text: data.text });
+  return { msgIds: msg && msg.key && msg.key.id ? [msg.key.id] : [] };
 }
 
 function makeSendFnUser(uid) {
@@ -1430,14 +1429,18 @@ function makeSendFnUser(uid) {
       return { fireAndForget: true };
     }
     if (data.action === "download") {
-      const raw = rawMessages.get(data.message_id);
-      if (raw?.message) {
-        const media = extractMediaInfo(raw.message);
-        if (media) {
-          const buf = await downloadMediaMessage(raw, "buffer", {}, { logger, reuploadRequest: sock.updateMediaMessage });
-          const fn = media.filename || `${Date.now()}.${mimeToExt(media.mimetype)}`;
-          fs.writeFileSync(path.join(USERS_DIR, uid, "downloads", `${data.message_id}-${fn}`), buf);
+      try {
+        const raw = rawMessages.get(data.message_id);
+        if (raw?.message) {
+          const media = extractMediaInfo(raw.message);
+          if (media) {
+            const buf = await downloadMediaMessage(raw, "buffer", {}, { logger, reuploadRequest: sock.updateMediaMessage });
+            const fn = media.filename || `${Date.now()}.${mimeToExt(media.mimetype)}`;
+            fs.writeFileSync(path.join(USERS_DIR, uid, "downloads", `${data.message_id}-${fn}`), buf);
+          }
         }
+      } catch (e) {
+        log(`download failed for ${data.message_id}: ${e.message}`);
       }
       return { fireAndForget: true };
     }
