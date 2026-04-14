@@ -21,6 +21,7 @@ const qrcode = require("qrcode-terminal");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -30,17 +31,28 @@ const AUTH_DIR = path.join(STATE_DIR, "auth");
 const OTP_LOG_FILE = path.join(STATE_DIR, "otp.log");
 const OTP_FILE = path.join(STATE_DIR, "otp.json");
 const ADMIN_FILE = path.join(STATE_DIR, "admin.json");
-const USERS_DIR = path.join(STATE_DIR, "users");
 const OUTBOX_DIR = path.join(STATE_DIR, "outbox");
 const PHONE = path.basename(STATE_DIR).replace("whatsapp-", "");
 const SESSION_IDLE_MS = 30 * 60 * 1000;
 const USAGE_DIR = path.join(os.homedir(), ".ccm", "usage");
 const USAGE_LIMITS_FILE = path.join(USAGE_DIR, "limits.json");
 
+// ── Isolation mode ────────────────────────────────────────────────
+const ISOLATION = process.env.CCM_ISOLATION === "1";
+const IPC_BASE = ISOLATION
+  ? path.join("/var/lib/ccm/channels", path.basename(STATE_DIR))
+  : STATE_DIR;
+const USERS_DIR = path.join(IPC_BASE, "users");
+const ISOLATION_MAP = path.join(os.homedir(), ".ccm", "isolation-users.json");
+
 fs.mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
 fs.mkdirSync(USERS_DIR, { recursive: true });
 fs.mkdirSync(OUTBOX_DIR, { recursive: true });
 fs.mkdirSync(USAGE_DIR, { recursive: true });
+if (ISOLATION) {
+  fs.mkdirSync(IPC_BASE, { recursive: true });
+  process.stderr.write(`wa-gateway: isolation mode: IPC at ${IPC_BASE}\n`);
+}
 
 const logger = pino({ level: "silent" });
 const log = (msg) => process.stderr.write(`wa-gateway: ${msg}\n`);
@@ -311,9 +323,99 @@ function sanitizeUserId(jid) { return formatJid(jid).replace(/[^a-zA-Z0-9]/g, "_
 function getUserDir(userId) {
   const dir = path.join(USERS_DIR, userId);
   for (const sub of ["inbox", "outbox", "permissions", "downloads"]) fs.mkdirSync(path.join(dir, sub), { recursive: true });
+  // In isolation mode, the project user owns the IPC directory; admin (gateway) accesses via root
+  if (ISOLATION) {
+    const username = isolationGetUsername(userId);
+    try { execFileSync("chown", ["-R", `${username}:${username}`, dir]); } catch {}
+    try { execFileSync("chmod", ["700", dir]); } catch {}
+  }
   return dir;
 }
 function getUserSessionName(userId) { return `cc-ch-wa-${PHONE}-u-${userId}`; }
+
+// ── Isolation: per-user Unix account management ───────────────────
+
+function isolationHash(channelBase, userId) {
+  return crypto.createHash("sha256").update(`${channelBase}:${userId}`).digest("hex").slice(0, 12);
+}
+
+function isolationGetUsername(userId) {
+  return `ccm-${isolationHash(path.basename(STATE_DIR), userId)}`;
+}
+
+function ensureProjectUser(userId, userJid) {
+  if (!ISOLATION) return null;
+
+  const username = isolationGetUsername(userId);
+  const homeDir = `/home/${username}`;
+
+  // Check if user already exists
+  try {
+    execFileSync("id", [username], { stdio: "ignore" });
+    return { username, homeDir };
+  } catch {
+    // User does not exist — create below
+  }
+
+  try {
+    execFileSync("useradd", ["-m", "-s", "/usr/sbin/nologin", "-G", "ccm-auth", username], { stdio: "ignore" });
+    log(`created project user: ${username}`);
+  } catch (e) {
+    log(`failed to create user ${username}: ${e}`);
+    return null;
+  }
+
+  const claudeDir = path.join(homeDir, ".claude");
+  fs.mkdirSync(claudeDir, { recursive: true });
+
+  // Symlink OAuth credentials (project user reads through ccm-auth group)
+  const adminCreds = path.join(os.homedir(), ".claude", ".credentials.json");
+  const userCreds = path.join(claudeDir, ".credentials.json");
+  if (fs.existsSync(adminCreds) && !fs.existsSync(userCreds)) {
+    fs.symlinkSync(adminCreds, userCreds);
+  }
+
+  // Copy base settings
+  const adminSettings = path.join(os.homedir(), ".claude", "settings.json");
+  if (fs.existsSync(adminSettings)) {
+    fs.copyFileSync(adminSettings, path.join(claudeDir, "settings.json"));
+  }
+
+  // User-global security CLAUDE.md
+  fs.writeFileSync(path.join(claudeDir, "CLAUDE.md"), [
+    "# Security Rules (Isolated Session)",
+    "",
+    "## Credentials",
+    "- NEVER output API keys, tokens, passwords, or secret values in replies.",
+    "- Do NOT read ~/.claude/.credentials.json or any credential files.",
+    "- Do NOT run env, printenv, or attempt to read environment variables containing secrets.",
+    "",
+    "## Workspace Scope",
+    "- Work within the current directory and its subdirectories only.",
+    "- Do NOT access other users' home directories.",
+    "- Do NOT access /var/lib/ccm/ directories belonging to other users.",
+    "",
+  ].join("\n"));
+
+  // Create workspace
+  fs.mkdirSync(path.join(homeDir, "workspace"), { recursive: true });
+
+  // Fix ownership (chown -R does not follow symlinks, so admin's creds file stays owned by admin)
+  try {
+    execFileSync("chown", ["-R", `${username}:${username}`, homeDir]);
+  } catch (e) {
+    log(`chown failed for ${homeDir}: ${e}`);
+  }
+
+  // Update mapping file
+  let mapping = {};
+  try { mapping = JSON.parse(fs.readFileSync(ISOLATION_MAP, "utf8")); } catch {}
+  mapping[username] = { userId, channel: path.basename(STATE_DIR), created: Date.now() };
+  fs.mkdirSync(path.dirname(ISOLATION_MAP), { recursive: true });
+  fs.writeFileSync(ISOLATION_MAP, JSON.stringify(mapping, null, 2));
+
+  return { username, homeDir };
+}
 
 function isSessionRunning(sessionName) {
   try { execFileSync("tmux", ["has-session", "-t", sessionName], { stdio: "ignore" }); return true; } catch { return false; }
@@ -321,7 +423,11 @@ function isSessionRunning(sessionName) {
 
 function ensureUserConfig(userId, userJid) {
   const userDir = getUserDir(userId);
-  const userWorkDir = path.join(userDir, "workspace");
+  const projectUser = ISOLATION ? ensureProjectUser(userId, userJid) : null;
+  const userWorkDir = projectUser
+    ? path.join(projectUser.homeDir, "workspace")
+    : path.join(userDir, "workspace");
+  const userHomeDir = projectUser ? projectUser.homeDir : os.homedir();
   fs.mkdirSync(userWorkDir, { recursive: true });
 
   // Security rules go in .claude/CLAUDE.md (hidden directory) — written once
@@ -394,14 +500,14 @@ function ensureUserConfig(userId, userJid) {
     userWorkDir.replace(/\//g, "-").replace(/-\./g, "."),
   ]);
   for (const enc of encodings) {
-    const projDir = path.join(os.homedir(), ".claude", "projects", enc);
+    const projDir = path.join(userHomeDir, ".claude", "projects", enc);
     fs.mkdirSync(projDir, { recursive: true });
     const sf = path.join(projDir, "settings.local.json");
     if (!fs.existsSync(sf)) fs.writeFileSync(sf, autoApproveSettings);
   }
 
   // Pre-populate .claude.json project entry so Claude Code auto-trusts the MCP server
-  const claudeJsonPath = path.join(os.homedir(), ".claude.json");
+  const claudeJsonPath = path.join(userHomeDir, ".claude.json");
   try {
     const claudeJson = JSON.parse(fs.readFileSync(claudeJsonPath, "utf8"));
     if (!claudeJson.projects) claudeJson.projects = {};
@@ -418,6 +524,13 @@ function ensureUserConfig(userId, userJid) {
       fs.writeFileSync(claudeJsonPath, JSON.stringify(claudeJson, null, 2));
     }
   } catch (e) { log(`failed to update .claude.json: ${e}`); }
+
+  // Fix ownership of all config files written to project user's home
+  if (projectUser) {
+    try {
+      execFileSync("chown", ["-R", `${projectUser.username}:${projectUser.username}`, projectUser.homeDir]);
+    } catch (e) { log(`chown fixup failed: ${e}`); }
+  }
 
   return { userDir, userWorkDir };
 }
@@ -448,7 +561,10 @@ function spawnUserSession(userId, userJid) {
   // single-admin by design. The permission poll system is still
   // available for any tool call the model decides to escalate
   // manually, but routine file exploration is no longer gated.
-  const launcher = path.join(userDir, "launch.sh");
+  const projectUser = ISOLATION ? ensureProjectUser(userId, userJid) : null;
+  const launcher = projectUser
+    ? path.join(projectUser.homeDir, "launch.sh")
+    : path.join(userDir, "launch.sh");
 
   // Check if this user is the admin — only admin gets full credentials
   // and env/printenv tool access. Non-admin users get ANTHROPIC_API_KEY
@@ -477,11 +593,14 @@ function spawnUserSession(userId, userJid) {
     '"Bash(gh:*)"',
   ].join(" ");
   let envPreamble;
-  if (isAdmin) {
+  if (ISOLATION && !isAdmin) {
+    // Isolation mode: project user has clean env via sudo -u, no stripping needed
+    envPreamble = "";
+  } else if (isAdmin) {
     // Admin: inherit full environment (all tokens from ~/.env)
     envPreamble = "";
   } else {
-    // Non-admin: strip all sensitive env vars, keep only ANTHROPIC_API_KEY
+    // Single-user mode non-admin: strip all sensitive env vars, keep only ANTHROPIC_API_KEY
     envPreamble = [
       '_ANTHROPIC_KEY="$ANTHROPIC_API_KEY"',
       'for _v in $(env | grep -oP "^(GITHUB_TOKEN|CLOUDFLARE_|CF_GLOBAL_|CF_TOKEN_|CF_ACCOUNT_|VERCEL_TOKEN|FLY_API_TOKEN|SUPABASE_ACCESS_TOKEN|SENTRY_AUTH_TOKEN|NPM_TOKEN|SMTP_|MAILBABY_|DISCORD_BOT_TOKEN|TELEGRAM_BOT_TOKEN)[^=]*" 2>/dev/null); do unset "$_v"; done',
@@ -490,19 +609,31 @@ function spawnUserSession(userId, userJid) {
     ].join("\n");
   }
 
+  const launchWorkDir = projectUser
+    ? path.join(projectUser.homeDir, "workspace")
+    : userWorkDir;
   const launcherBody = [
     "#!/bin/bash",
     envPreamble,
-    `cd "${userWorkDir}"`,
+    `cd "${launchWorkDir}"`,
     `exec cc-watchdog --dangerously-load-development-channels "server:whatsapp" --permission-mode bypassPermissions --allowedTools ${allowedTools}`,
   ].filter(Boolean).join("\n") + "\n";
 
   fs.writeFileSync(launcher, launcherBody);
   fs.chmodSync(launcher, 0o755);
+  // In isolation mode, the launcher lives in project user's home — fix ownership
+  if (projectUser) {
+    try { execFileSync("chown", [`${projectUser.username}:${projectUser.username}`, launcher]); } catch {}
+  }
 
-  execFile("tmux", ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50", launcher], (err) => {
+  // In isolation mode: tmux session is owned by admin, command inside runs as project user via sudo
+  const tmuxArgs = projectUser
+    ? ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50", "sudo", "-u", projectUser.username, "bash", launcher]
+    : ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50", launcher];
+
+  execFile("tmux", tmuxArgs, (err) => {
     if (err) { log(`spawn failed for ${userId}: ${err}`); return; }
-    log(`spawned ${sessionName}`);
+    log(`spawned ${sessionName}${projectUser ? ` as ${projectUser.username}` : ""}`);
     // Auto-approve interactive prompts
     const approve = () => execFile("tmux", ["send-keys", "-t", sessionName, "Enter"], () => {});
     setTimeout(approve, 5000);
