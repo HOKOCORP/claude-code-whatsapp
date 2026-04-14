@@ -420,7 +420,7 @@ function ensureProjectUser(userId, userJid) {
   // Update mapping file
   let mapping = {};
   try { mapping = JSON.parse(fs.readFileSync(ISOLATION_MAP, "utf8")); } catch {}
-  mapping[username] = { userId, channel: path.basename(STATE_DIR), created: Date.now() };
+  mapping[username] = { userId, channel: path.basename(STATE_DIR), created: Math.floor(Date.now() / 1000) };
   fs.mkdirSync(path.dirname(ISOLATION_MAP), { recursive: true });
   fs.writeFileSync(ISOLATION_MAP, JSON.stringify(mapping, null, 2));
 
