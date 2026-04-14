@@ -1296,7 +1296,7 @@ async function connectWhatsApp() {
         const admin = loadAdmin();
         const isAdmin = admin && (admin.jid === sessionJid || toJid(admin.jid) === sessionJid);
         sendCapacityMessage(sessionJid, isAdmin);
-        return;  // do not spawn
+        continue;  // do not spawn; keep processing other messages in this batch
       }
 
       spawnUserSession(userId, sessionJid);
