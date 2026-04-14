@@ -122,6 +122,24 @@ claude --dangerously-load-development-channels "server:whatsapp-us,server:whatsa
 
 ---
 
+## Channel Commands
+
+The WhatsApp gateway recognizes these slash commands inline. Send the command as a message; in groups, prefix with the configured trigger (`@ai /help`).
+
+| Command | Description |
+|---|---|
+| `/help` | List all channel commands |
+| `/usage` | Show your monthly tokens & cost |
+| `/usage history` | Show top-up history |
+| `/clear` | Wipe Claude's conversation memory (OTP-confirmed; auto-checkpoints to `~/.ccm/checkpoints/`) |
+| `/compact` | Summarize & shrink Claude's context (OTP-confirmed; lossy) |
+
+Destructive commands (`/clear`, `/compact`) reply with a 4-digit code and require a confirmation reply within 90 seconds before any action runs.
+
+`/clear` checkpoints your session JSONL to `~/.ccm/checkpoints/<userId>/<UTC-timestamp>/originals/` (last 10 retained) before wiping it, so a fresh session always starts clean while the prior context is recoverable from disk.
+
+---
+
 ## How It Works
 
 The gateway runs as a standalone daemon with a single WhatsApp connection. When a message arrives from a whitelisted user, the gateway:
