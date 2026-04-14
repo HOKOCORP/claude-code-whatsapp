@@ -66,8 +66,27 @@ test("clear is idempotent when no file exists", async () => {
   await pa.clear("ghost");
 });
 
-test("write uses atomic rename (no .tmp file remains)", async () => {
+test("write leaves no .tmp file after completion", async () => {
   await pa.write("user_e", "clear");
   const entries = await fs.readdir(TMP);
   assert.deepEqual(entries.filter(e => e.endsWith(".tmp")), []);
+});
+
+test("fileFor rejects unsafe userIds (path traversal guard)", async () => {
+  for (const bad of ["../escape", "user/sub", "user\u0000", "", null, undefined, "user with space"]) {
+    await assert.rejects(
+      async () => { await pa.write(bad, "clear"); },
+      /unsafe userId/,
+      `expected ${JSON.stringify(bad)} to throw`,
+    );
+  }
+});
+
+test("read returns null and unlinks file when JSON is malformed", async () => {
+  await pa.write("user_f", "clear");
+  const file = path.join(TMP, "user_f.json");
+  await fs.writeFile(file, "{ this is not json");
+  const read = await pa.read("user_f");
+  assert.equal(read, null);
+  await assert.rejects(fs.stat(file), { code: "ENOENT" });
 });
