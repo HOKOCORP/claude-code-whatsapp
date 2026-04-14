@@ -12,6 +12,9 @@ const { ListToolsRequestSchema, CallToolRequestSchema } = require("@modelcontext
 const { z } = require("zod");
 const fs = require("fs");
 const path = require("path");
+const os = require("node:os");
+const jsonlScan = require("./lib/jsonl-scan.cjs");
+const inboxReconciler = require("./lib/inbox-reconciler.cjs");
 
 const USER_DIR = process.env.BRIDGE_USER_DIR;
 const USER_JID = process.env.BRIDGE_USER_JID || "";
@@ -27,6 +30,29 @@ const DOWNLOADS_DIR = path.join(USER_DIR, "downloads");
 for (const d of [INBOX_DIR, OUTBOX_DIR, PERM_DIR, DOWNLOADS_DIR]) fs.mkdirSync(d, { recursive: true });
 
 const log = (msg) => process.stderr.write(`wa-bridge[${path.basename(USER_DIR)}]: ${msg}\n`);
+
+let jsonlPath = null;
+let jsonlPathResolvedAt = 0;
+const jsonlCache = {};
+const JSONL_RESOLVE_INTERVAL_MS = 30000;
+const JSONL_TAIL_BYTES = 262144;
+
+function resolveJsonlPath() {
+  const now = Date.now();
+  if (jsonlPath && fs.existsSync(jsonlPath) && now - jsonlPathResolvedAt < JSONL_RESOLVE_INTERVAL_MS) {
+    return jsonlPath;
+  }
+  jsonlPath = jsonlScan.findSessionJsonl(process.cwd(), os.homedir());
+  jsonlPathResolvedAt = now;
+  if (!jsonlPath) log(`warn: no session.jsonl found for cwd=${process.cwd()}`);
+  return jsonlPath;
+}
+
+function loadJsonlTail() {
+  const p = resolveJsonlPath();
+  if (!p) return "";
+  return jsonlScan.readJsonlTail(p, JSONL_TAIL_BYTES, jsonlCache);
+}
 
 // Track last message for permission context
 let lastMessage = { text: "", number: "" };
@@ -53,35 +79,28 @@ const mcp = new Server(
 
 let mcpReady = false;
 
+const reconcilerTick = inboxReconciler.createReconciler({
+  userDir: USER_DIR,
+  loadJsonl: loadJsonlTail,
+  sendNotification: ({ content, meta }) => {
+    lastMessage = { text: content || "", number: meta?.user || "" };
+    if (meta?.chat_id) writeOutbox({ action: "typing_start", chat_id: meta.chat_id });
+    mcp.notification({ method: "notifications/claude/channel", params: { content, meta } })
+      .catch((err) => log(`deliver failed: ${err}`));
+  },
+  now: () => Date.now(),
+  stalenessMs: 20000,
+  maxAgeMs: 5 * 60 * 1000,
+  maxRetries: 3,
+  log,
+});
+
 function processInbox() {
   if (!mcpReady) return;
-  try {
-    // Read all json files (don't delete before delivering — only delete on success)
-    const files = fs.readdirSync(INBOX_DIR).filter((f) => f.endsWith(".json")).sort();
-    for (const file of files) {
-      const fp = path.join(INBOX_DIR, file);
-      try {
-        const data = JSON.parse(fs.readFileSync(fp, "utf8"));
-
-        lastMessage = { text: data.content || "", number: data.meta?.user || "" };
-
-        // Send typing indicator via outbox
-        if (data.meta?.chat_id) {
-          writeOutbox({ action: "typing_start", chat_id: data.meta.chat_id });
-        }
-
-        mcp.notification({ method: "notifications/claude/channel", params: { content: data.content, meta: data.meta } })
-          .then(() => { try { fs.unlinkSync(fp); } catch {} })
-          .catch((err) => log(`deliver failed: ${err}`));
-      } catch (e) {
-        log(`inbox read error (${file}): ${e}`);
-        try { fs.unlinkSync(fp); } catch {}
-      }
-    }
-  } catch {}
+  reconcilerTick();
 }
 
-const inboxPoll = setInterval(processInbox, 500);
+const inboxPoll = setInterval(processInbox, 1000);
 
 // ── Outbox helper ───────────────────────────────────────────────────
 
