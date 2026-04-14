@@ -56,13 +56,23 @@ Destructive. Wipes the user's Claude session JSONL. Auto-checkpoints first.
 Reply with code *NNNN* within 90s to confirm.
 ```
 
-**Second message — user sends matching 4-digit code within 90s:**
+**Second message — user sends matching 4-digit code within 90s. Order is chosen for crash-safety: claude session state is moved out of the project dir BEFORE the tmux kill, so a gateway crash mid-flow can never leave a half-cleared session that resumes on next spawn.**
+
 1. Reply: `🛟 Checkpointing your conversation…`
-2. Copy `~/.claude/projects/<workspace-slug>/` → `~/.ccm/checkpoints/<userId>/<UTC-timestamp>/` (preserves all `.jsonl` plus a small `meta.json`).
-3. `tmux kill-session -t <getUserSessionName(userId)>` — terminates the live Claude process.
-4. Delete the original `*.jsonl` files in `~/.claude/projects/<workspace-slug>/` (so the next spawn does NOT pass `--continue`).
-5. Reply: `✅ Cleared. Send any message to start fresh.`
-6. Next inbound message triggers gateway's existing user-session spawn path (`isSessionRunning` returns false → fresh tmux + `cc-watchdog` → fresh `claude` with no `--continue`).
+2. `mkdir -p ~/.ccm/checkpoints/<userId>/<UTC-timestamp>/`
+3. **Atomic move** the project dir into the checkpoint: `mv ~/.claude/projects/<workspace-slug> ~/.ccm/checkpoints/<userId>/<UTC-timestamp>/originals` (same filesystem, single rename — atomic on local fs). claude's open file descriptors keep working against the renamed inode; the new spawn will see no project dir.
+4. `mkdir ~/.claude/projects/<workspace-slug>` — recreate empty (so cc-watchdog's `compgen -G "*.jsonl"` finds nothing → no `--continue`).
+5. Write `meta.json` into the checkpoint dir: `{ workspace_slug, session_name, jsonl_count, total_bytes, cleared_at }`.
+6. `tmux kill-session -t <getUserSessionName(userId)>` — terminates the live Claude process.
+7. Unlink the pending file.
+8. Reply: `✅ Cleared. Send any message to start fresh.`
+9. Next inbound message triggers gateway's existing user-session spawn path (`isSessionRunning` returns false → fresh tmux + `cc-watchdog` → fresh `claude` with no `--continue`).
+
+**Crash safety:** Step 3 is a single `rename` syscall on a local fs (atomic). After that step succeeds, the user's session is effectively cleared from cc-watchdog's perspective — even if every subsequent step fails, the next inbound message will spawn a fresh claude (empty project dir → no `--continue`). The only step whose failure aborts the operation is the move itself (handled in §7 edge cases).
+
+**Workspace-slug computation:** Use the same encoding `cc-watchdog` does at line 78 (`pwd | sed 's|[^a-zA-Z0-9]|-|g'`) and that `gateway.cjs` already uses around line 751. Don't reimplement — call the existing helper if one is exported, otherwise extract a small util.
+
+**Disk pressure:** Keep the *last 10 checkpoints per user*. After step 5, list `~/.ccm/checkpoints/<userId>/`, sort by name (UTC-timestamp sorts lexicographically), `rm -rf` everything beyond the 10 most recent. Bounds disk growth without losing the recent history.
 
 ### 3.3 `/compact`
 
@@ -81,9 +91,11 @@ Reply with code *NNNN* within 90s to confirm.
 
 **Second message — user sends matching code:**
 1. Reply: `🗜️ Compacting…`
-2. Capture pane via `tmux capture-pane -p -t <session>`. Claude is considered idle at input when (a) the captured text contains the prompt-box border characters (`╭` and `╰`) AND (b) does NOT contain `Enter to confirm` (the marker used by `cc-watchdog`'s prompt poller, indicating a blocking dialog). If idle, send keys immediately. Otherwise schedule a single retry after 1s; if still not idle, abort and reply `⚠️ Couldn't compact — Claude is busy. Try again in a moment.`
-3. `tmux send-keys -t <session> "/compact" Enter`.
-4. No second reply — Claude itself will respond when compaction completes.
+2. Capture pane via `tmux capture-pane -p -t <session>`. Claude is considered idle at input when (a) the captured text contains the prompt-box border characters (`╭` and `╰`) AND (b) does NOT contain `Enter to confirm` (the marker used by `cc-watchdog`'s prompt poller, indicating a blocking dialog). If idle, proceed. Otherwise schedule a single retry after 1s; if still not idle, abort and reply `⚠️ Couldn't compact — Claude is busy. Try again in a moment.`
+3. **Clear the input box first** with `tmux send-keys -t <session> Escape` — defensive in case the user (or another process) had keystrokes pending in the input. Same pattern as gateway.cjs lines 1031, 1120, 1337.
+4. `tmux send-keys -t <session> "/compact" Enter`.
+5. Unlink the pending file.
+6. No second reply from gateway — Claude itself will respond when compaction completes.
 
 ## 4. State Model
 
@@ -102,7 +114,7 @@ One file per user: `~/.ccm/pending/<userId>.json`
 
 - **Atomic write:** write to `<userId>.json.tmp`, then `rename`.
 - **TTL:** `expires_at = created_at + 90`. On read, if `now > expires_at`, treat as no pending action and unlink the file.
-- **Single-use:** delete the file as soon as the OTP is consumed (success or rejection on a different code).
+- **Lifetime:** delete the file when (a) the action completes successfully, or (b) the user sends a wrong 4-digit code (single-use), or (c) a new `/clear`/`/compact` overwrites it. **Do NOT delete** if the action fails partway through (checkpoint error, etc.) — the user may want to retry the same code.
 - **Re-issue:** if the user sends `/clear` (or `/compact`) while a pending action exists, overwrite atomically with a new code and reply with the new code. Never wait the old TTL out.
 
 ### 4.2 Code generation
@@ -113,34 +125,39 @@ Range `0000`-`9999`. Single-use within 90s — collision risk is negligible.
 ### 4.3 Checkpoints
 
 `~/.ccm/checkpoints/<userId>/<UTC-timestamp>/`
-- Mirror copy of the user's project dir at `~/.claude/projects/<workspace-slug>/`.
-- Plus `meta.json`: `{ workspace_slug, session_name, jsonl_count, total_bytes, cleared_at }`.
-- No automated cleanup yet — disk grows over time. Acceptable for v1 (each checkpoint is small kilobytes-to-MB; user can prune manually). Future: cron retention.
+- Contains `originals/` — the entire former project dir, moved in by `mv` (see §3.2 step 3).
+- Plus `meta.json` written after the move: `{ workspace_slug, session_name, jsonl_count, total_bytes, cleared_at }`.
+- **Retention:** keep last 10 per user, prune older. Bounds disk growth without losing recent history. Implementation: after writing, `readdir` the user's checkpoints dir, sort lexicographically (UTC-timestamps sort correctly), `rm -rf` everything beyond the 10 newest.
+
+### 4.4 `userId` filename safety
+
+All paths embed `<userId>` (a WhatsApp JID like `204406284935400@lid`). `gateway.cjs` already exports a `sanitizeUserId` helper (used at line 1207) to make JIDs filesystem-safe — reuse it for every path that includes `<userId>`. Do not concatenate raw JIDs into paths.
 
 ## 5. Code Layout in `gateway.cjs`
 
-A single new helper, placed above the per-message loop:
+**Do not refactor the existing `/usage` handlers.** They work, they're tested, and moving them carries risk for zero user-visible benefit. The new commands get their own helper, placed adjacent to the existing `/usage` blocks.
 
 ```js
-async function handleSlashCommand(sock, jid, userId, userDir, text) {
-  // returns true if message was consumed (caller should `continue`)
-  // returns false otherwise
+async function handleChannelSlashCommand(sock, jid, userId, userDir, text) {
+  // Handles: pending OTP, /help, /clear, /compact.
+  // Returns true if message was consumed (caller should `continue`),
+  //         false otherwise (fall through to /usage block, then to claude).
 }
 ```
 
-Inside, dispatch on:
-1. Pending OTP code match (`/^\d{4}$/.test(text.trim())` and matching pending file)
-2. `/help`
-3. `/clear`
-4. `/compact`
-5. (Existing `/usage` cases will be migrated INTO this helper in the same patch, to keep the dispatch logic in one place. The user-visible behavior of `/usage` stays identical.)
+Inside, dispatch order matters (most specific first):
+1. **Pending OTP match** — `/^\d{4}$/.test(text.trim())` AND a non-expired pending file exists for this user with that code → execute the pending action.
+2. `/help` (any case)
+3. `/clear` (any case)
+4. `/compact` (any case)
+5. Otherwise return false.
 
-Call site in the per-message loop replaces lines 1167-1263:
+Call site: insert immediately *before* the existing `/usage history` check at line 1169:
 ```js
-if (await handleSlashCommand(sock, jid, userId, userDir, text)) continue;
+if (await handleChannelSlashCommand(sock, jid, userId, userDir, text)) continue;
 ```
 
-The helpers `isSessionRunning(sessionName)` (line 668), `getUserSessionName(userId)`, and `tmux kill-session` (already used at line 1512) are reused.
+This keeps `/usage` working untouched and lets the new dispatcher short-circuit before the rest of the loop. Reused helpers: `isSessionRunning(sessionName)` (line 668), `getUserSessionName(userId)`, `sanitizeUserId(...)` (line 1207), `tmux kill-session` (already used at line 1512).
 
 ## 6. Data Flow
 
@@ -148,19 +165,23 @@ The helpers `isSessionRunning(sessionName)` (line 668), `getUserSessionName(user
 
 ```
 WhatsApp → gateway socket → per-message loop
-  → handleSlashCommand sees "/clear"
+  → handleChannelSlashCommand sees "/clear"
     → write pending-action.json {action:"clear", code, expires_at}
     → sock.sendMessage(jid, warning + code)
     → return true (consumed)
 
 WhatsApp → user types "4827" within 90s
-  → handleSlashCommand sees /^\d{4}$/, reads pending file
-    → match? → continue. No match? → fall through to normal message path.
+  → handleChannelSlashCommand sees /^\d{4}$/, reads pending file
+    → match? → continue. No match (single-use)? → reject + unlink + return true.
+    → no pending? → return false (falls through to /usage block, then to claude).
     → reply "Checkpointing…"
-    → cp -a project dir → ~/.ccm/checkpoints/<userId>/<ts>/
-    → tmux kill-session -t <name>
-    → unlink the *.jsonl files
+    → mkdir checkpoint dir
+    → mv project dir → checkpoint dir/originals (ATOMIC)
+    → mkdir empty project dir
+    → write checkpoint meta.json
+    → tmux kill-session
     → unlink pending file
+    → prune checkpoints beyond 10 newest
     → reply "Cleared. Send any message to start fresh."
     → return true
 ```
@@ -188,6 +209,8 @@ Same as `/clear` up to OTP match, then:
 | Claude is at a permission prompt when `/compact` confirmed | Capture-pane heuristic detects this, defers + retries once. If still busy, abort with a "try again" reply rather than risk hijacking the prompt. |
 | Group chat | Trigger-strip already happens in line 1162-1166. Commands work in groups exactly like `/usage` does today; only the sender's own session is affected. |
 | User on cooldown / out of balance | Slash commands bypass `checkUserLimit` because they're channel meta-commands (not Claude turns). Same as `/usage`. |
+| User legitimately sends a 4-digit number that happens to match the pending OTP | Action fires unintentionally. Probability is 1/10000 per pending action. Accepted limitation for v1. Mitigation if it ever bites: require `code 4827` prefix, or expand to 6 digits. |
+| Checkpoint `cp`/`mv` fails (disk full, permissions) | Reply `⚠️ Couldn't checkpoint — aborting clear to keep your session safe.` Leave pending file alone so the user can retry by sending the code again. |
 
 ## 8. Testing
 
