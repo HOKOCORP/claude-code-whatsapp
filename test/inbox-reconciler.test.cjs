@@ -152,7 +152,7 @@ test("tick: resends after staleness window", () => {
   fs.rmSync(userDir, { recursive: true, force: true });
 });
 
-test("tick: gracefully skips files with malformed JSON", () => {
+test("tick: malformed JSON files are quarantined", () => {
   const userDir = mkTmp("recon-");
   const inbox = path.join(userDir, "inbox");
   fs.mkdirSync(inbox);
@@ -167,5 +167,10 @@ test("tick: gracefully skips files with malformed JSON", () => {
   });
 
   tick();
+
+  const failedDir = path.join(inbox, "failed");
+  assert.ok(fs.existsSync(failedDir));
+  assert.deepEqual(fs.readdirSync(failedDir), ["bad.json"]);
+  assert.equal(fs.existsSync(path.join(inbox, "bad.json")), false);
   fs.rmSync(userDir, { recursive: true, force: true });
 });
