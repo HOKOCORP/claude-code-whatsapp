@@ -369,3 +369,81 @@ test("tick: fresh reconciler redelivers un-acked file (simulates gateway restart
   assert.equal(sends2.length, 1, "fresh reconciler re-sends (the trade-off: possible duplicate)");
   fs.rmSync(outboxDir, { recursive: true, force: true });
 });
+
+test("factory tick: erroredIds triggers quarantine on next tick", async () => {
+  const outboxDir = mkTmp("outbox-recon-");
+  const fp = writeOutboxFile(outboxDir, "1000-a.json", { action: "reply", chat_id: "c", text: "hi" });
+  const ackedIds = new Set();
+  const erroredIds = new Set();
+  const tick = r.createOutboxReconciler({
+    outboxDir,
+    sendFn: async () => ({ msgIds: ["ID-A"] }),
+    ackedIds, erroredIds,
+    now: () => 1000,
+    stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+  });
+  await tick();
+  assert.ok(fs.existsSync(fp), "file kept post-send");
+  erroredIds.add("ID-A");
+  await tick();
+  assert.equal(fs.existsSync(fp), false, "original file removed");
+  const failedPath = path.join(outboxDir, "failed", "1000-a.json");
+  assert.ok(fs.existsSync(failedPath), "moved to failed/");
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
+
+test("factory tick: auditEvent receives send/retry/quarantine events", async () => {
+  const outboxDir = mkTmp("outbox-recon-");
+  writeOutboxFile(outboxDir, "1000-a.json", { action: "reply", chat_id: "c", text: "hi" });
+  const events = [];
+  let clock = 1000;
+  let call = 0;
+  const tick = r.createOutboxReconciler({
+    outboxDir,
+    sendFn: async () => {
+      call += 1;
+      if (call === 1) return { msgIds: ["ID-A"] };
+      throw new Error("boom");
+    },
+    ackedIds: new Set(),
+    erroredIds: new Set(),
+    now: () => clock,
+    stalenessMs: 100, maxAgeMs: 10000, maxRetries: 2,
+    auditEvent: (event, extras) => { events.push({ event, ...extras }); },
+  });
+  await tick();                    // send
+  clock += 200; await tick();      // retry (stale, sendFn throws)
+  clock += 200; await tick();      // retries exhausted → quarantine
+  const kinds = events.map((e) => e.event);
+  assert.deepEqual(kinds, ["send", "retry", "quarantine"]);
+  assert.equal(events[0].filename, "1000-a.json");
+  assert.deepEqual(events[0].msg_ids, ["ID-A"]);
+  assert.equal(events[0].chat_id, "c");
+  assert.equal(events[2].reason, "retries exhausted");
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
+
+test("factory tick: registerMsgIds + unregisterFile called at boundaries", async () => {
+  const outboxDir = mkTmp("outbox-recon-");
+  writeOutboxFile(outboxDir, "1000-a.json", { action: "reply", chat_id: "c", text: "hi" });
+  const registered = [];
+  const unregistered = [];
+  const ackedIds = new Set();
+  const tick = r.createOutboxReconciler({
+    outboxDir,
+    sendFn: async () => ({ msgIds: ["ID-A"] }),
+    ackedIds,
+    erroredIds: new Set(),
+    now: () => 1000,
+    stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+    registerMsgIds: (filename, msgIds, chatId) => { registered.push({ filename, msgIds, chatId }); },
+    unregisterFile: (filename) => { unregistered.push(filename); },
+  });
+  await tick();
+  assert.deepEqual(registered, [{ filename: "1000-a.json", msgIds: ["ID-A"], chatId: "c" }]);
+  assert.deepEqual(unregistered, []);
+  ackedIds.add("ID-A");
+  await tick();
+  assert.deepEqual(unregistered, ["1000-a.json"], "unregister called on delete branch");
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
