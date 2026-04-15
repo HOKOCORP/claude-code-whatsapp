@@ -27,6 +27,13 @@ const tmuxHelper = require("./lib/tmux.cjs");
 const outboxReconciler = require("./lib/outbox-reconciler.cjs");
 const { dispatchAck } = require("./lib/ack-dispatcher.cjs");
 const { createAuditLogger } = require("./lib/audit-log.cjs");
+const quotaScraper = require("./lib/quota-scraper.cjs");
+const quotaCache = require("./lib/quota-cache.cjs");
+const { detectTransitions } = require("./lib/quota-transitions.cjs");
+
+const QUOTA_POLL_INTERVAL_MS = 5 * 60 * 1000;
+const QUOTA_RENDER_DELAY_MS = 400;
+const QUOTA_TAB_DELAY_MS = 200;
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -340,6 +347,57 @@ function addToWhitelist(jid) {
   if (!access.allowFrom.some((a) => toJid(a) === jid || a === jid)) { access.allowFrom.push(jid); fs.writeFileSync(ACCESS_FILE, JSON.stringify(access, null, 2) + "\n"); log(`whitelist: added ${jid}`); }
 }
 function loadAdmin() { try { return JSON.parse(fs.readFileSync(ADMIN_FILE, "utf8")); } catch { return null; } }
+
+function adminQuotaFilePath() { return path.join(IPC_BASE, "admin-quota.json"); }
+
+function adminTmuxSession() {
+  const admin = loadAdmin();
+  if (!admin || !admin.jid) return null;
+  return getUserSessionName(sanitizeUserId(admin.jid));
+}
+
+async function runTmuxSendKeys(session, keys) {
+  return new Promise((resolve, reject) => {
+    execFile("tmux", ["send-keys", "-t", `${session}.0`, ...keys], (err) => {
+      if (err) reject(err); else resolve();
+    });
+  });
+}
+
+async function runTmuxCapturePane(session) {
+  return new Promise((resolve, reject) => {
+    execFile("tmux", ["capture-pane", "-t", `${session}.0`, "-p"], (err, stdout) => {
+      if (err) reject(err); else resolve(stdout);
+    });
+  });
+}
+
+const quotaSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function captureAdminQuota() {
+  const session = adminTmuxSession();
+  if (!session) return null;
+  return quotaScraper.captureQuota({
+    tmuxSession: session,
+    sendKeys: runTmuxSendKeys,
+    capturePane: runTmuxCapturePane,
+    sleep: quotaSleep,
+    renderDelayMs: QUOTA_RENDER_DELAY_MS,
+    tabDelayMs: QUOTA_TAB_DELAY_MS,
+  });
+}
+
+function emitQuotaAlert(breach, adminJid, adminUserDir) {
+  const icon = breach.threshold === 10 ? "🚨" : "⚠️";
+  const label = breach.window === "session" ? "Session" : "Weekly";
+  const tail = breach.threshold === 10 ? " — near exhaustion" : "";
+  const text = `${icon} ${label} quota at ${breach.remaining}% remaining${tail} (crossed ${breach.threshold}% threshold)`;
+  const filename = `${Date.now()}-quota-${breach.window}_${breach.threshold}.json`;
+  const fp = path.join(adminUserDir, "outbox", filename);
+  fs.mkdirSync(path.dirname(fp), { recursive: true });
+  fs.writeFileSync(fp, JSON.stringify({ action: "reply", chat_id: adminJid, text }));
+}
+
 function loadOtp() { try { const d = JSON.parse(fs.readFileSync(OTP_FILE, "utf8")); return d.code && d.expiresAt > Date.now() ? d : null; } catch { return null; } }
 
 // ── Message helpers ─────────────────────────────────────────────────
@@ -1346,6 +1404,23 @@ async function connectWhatsApp() {
         lines.push(`Month cost: ${fmtUSD(totalCost)}`);
         lines.push(`All time: ${fmtUSD(u.total_cost || 0)} spent`);
 
+        if (isAdminUser) {
+          try {
+            const q = await captureAdminQuota();
+            if (q) {
+              lines.push(``);
+              lines.push(`📊 Admin quota`);
+              const sessionLabel = q.sessionResetsAt ? ` (resets ${q.sessionResetsAt})` : ``;
+              const weekLabel    = q.weekResetsAt    ? ` (resets ${q.weekResetsAt})`    : ``;
+              lines.push(`Session: ${q.sessionRemainingPct}% remaining${sessionLabel}`);
+              lines.push(`Weekly: ${q.weekRemainingPct}% remaining${weekLabel}`);
+            } else {
+              lines.push(``);
+              lines.push(`📊 Admin quota: (unavailable)`);
+            }
+          } catch { /* ignore scrape errors in /usage path */ }
+        }
+
         try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
         continue;
       }
@@ -1551,6 +1626,32 @@ setInterval(async () => {
   } catch (e) { log(`outbox scan: ${e}`); }
   finally { outboxBusy = false; }
 }, 1500);
+
+async function quotaTick() {
+  try {
+    const admin = loadAdmin();
+    if (!admin || !admin.jid) return;
+    const current = await captureAdminQuota();
+    if (!current) return;
+    const cachePath = adminQuotaFilePath();
+    const existing = quotaCache.readQuota(cachePath);
+    const { alertsToFire, resetsToClear } = detectTransitions({
+      previous: existing?.current || null,
+      current,
+      lastAlerted: existing?.lastAlerted || { session_25: null, session_10: null, week_25: null, week_10: null },
+    });
+    const now = Date.now();
+    const lastAlerted = {};
+    for (const breach of alertsToFire) lastAlerted[`${breach.window}_${breach.threshold}`] = now;
+    for (const reset of resetsToClear)  lastAlerted[`${reset.window}_${reset.threshold}`] = null;
+    quotaCache.writeQuota(cachePath, { current, lastAlerted });
+    if (alertsToFire.length > 0) {
+      const adminUserDir = getUserDir(sanitizeUserId(admin.jid));
+      for (const breach of alertsToFire) emitQuotaAlert(breach, admin.jid, adminUserDir);
+    }
+  } catch (e) { log(`quota tick error: ${e.stack || e}`); }
+}
+setInterval(quotaTick, QUOTA_POLL_INTERVAL_MS);
 
 // ── Permission request relay (via polls) ────────────────────────────
 
