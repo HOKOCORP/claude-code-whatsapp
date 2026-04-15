@@ -1526,6 +1526,7 @@ async function connectWhatsApp() {
       }
 
       spawnUserSession(userId, sessionJid);
+      armStallWatchdog(userId, sessionJid);
     }
   });
 
@@ -1580,6 +1581,74 @@ async function connectWhatsApp() {
 
 const outboxReconcilers = new Map(); // dir -> reconciler tick fn
 
+// ── Stall-watchdog: surface silent upstream failures ────────────────
+// When a user DMs the bot and the underlying assistant hits an API
+// error (500, quota, auth) before it can call mcp__whatsapp__reply,
+// there's no outbox file and the user just sits in silence. We arm a
+// per-user timer on inbox; any reply disarms it; a timeout fires a
+// generic fallback. Error-text sniffing of the session pane lets us
+// include the specific reason when we can extract one without leaking
+// upstream-brand language.
+const STALL_WATCHDOG_MS = 3 * 60 * 1000;
+const stallWatchdogs = new Map(); // uid -> { timer, chatJid, armedAt }
+const STALL_ERROR_PATTERNS = [
+  { re: /API Error:\s*5\d\d\s+([^\n]+)/i,                     label: "Upstream API error" },
+  { re: /Internal Server Error/i,                              label: "Upstream server error" },
+  { re: /(?:Request|Connection) failed:\s*([^\n]+)/i,          label: "Upstream request failed" },
+  { re: /Credit balance (?:is\s*)?too low/i,                   label: "Upstream credit exhausted" },
+  { re: /rate[\s-]?limit(?:ed)?/i,                             label: "Upstream rate limited" },
+  { re: /authentication[_\s-]?error/i,                         label: "Upstream auth error" },
+];
+
+function armStallWatchdog(uid, chatJid) {
+  disarmStallWatchdog(uid);
+  const timer = setTimeout(() => fireStallFallback(uid, chatJid), STALL_WATCHDOG_MS);
+  stallWatchdogs.set(uid, { timer, chatJid, armedAt: Date.now() });
+}
+
+function disarmStallWatchdog(uid) {
+  const w = stallWatchdogs.get(uid);
+  if (!w) return;
+  clearTimeout(w.timer);
+  stallWatchdogs.delete(uid);
+}
+
+async function captureUserPane(uid) {
+  const session = getUserSessionName(uid);
+  return new Promise((resolve) => {
+    execFile("tmux", ["capture-pane", "-t", `${session}.0`, "-p", "-S", "-200"], (err, stdout) => {
+      resolve(err ? "" : stdout);
+    });
+  });
+}
+
+function fireStallFallback(uid, chatJid) {
+  stallWatchdogs.delete(uid);
+  (async () => {
+    try {
+      const pane = await captureUserPane(uid);
+      let detail = "";
+      for (const p of STALL_ERROR_PATTERNS) {
+        const m = pane.match(p.re);
+        if (m) {
+          detail = p.label + (m[1] ? `: ${m[1].trim()}` : "");
+          break;
+        }
+      }
+      const text = detail
+        ? `⚠️ ${detail}. Please try again in a moment.`
+        : `⚠️ No response yet — something may be stuck. Please try rephrasing or retry.`;
+      const userDir = path.join(USERS_DIR, uid);
+      const outboxFile = path.join(userDir, "outbox", `${Date.now()}-stall-fallback.json`);
+      fs.mkdirSync(path.dirname(outboxFile), { recursive: true });
+      fs.writeFileSync(outboxFile, JSON.stringify({ action: "reply", chat_id: chatJid, text }));
+      log(`stall fallback emitted for ${uid} (${detail || "no detail"})`);
+    } catch (e) {
+      log(`stall fallback error for ${uid}: ${e.stack || e}`);
+    }
+  })();
+}
+
 async function sendFnGlobal(data) {
   if (!data || !data.jid || !data.text) return { fireAndForget: true };
   const msg = await sock.sendMessage(data.jid, { text: data.text });
@@ -1622,6 +1691,10 @@ function makeSendFnUser(uid) {
       return { msgIds: msg && msg.key && msg.key.id ? [msg.key.id] : [] };
     }
     if (data.action === "reply") {
+      // Any reply-type outbox send counts as "the assistant responded",
+      // so disarm the stall watchdog for this user — they won't get
+      // the "no response" fallback on top of a legit reply.
+      disarmStallWatchdog(uid);
       const msgIds = [];
       if (data.text) {
         const q = data.reply_to ? rawMessages.get(data.reply_to) : undefined;
