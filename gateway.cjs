@@ -36,6 +36,13 @@ const QUOTA_RENDER_DELAY_MS = 400;
 const QUOTA_TAB_DELAY_MS = 200;
 const QUOTA_LOAD_DELAY_MS = 500;
 const QUOTA_LOAD_RETRIES = 6;
+// Dedicated tmux session that runs its own idle `claude` process
+// purely so the poller has a pane to scrape. Keeps the admin's
+// active session free of /status flash + "Status dialog dismissed"
+// chat-history pollution. Same auth, same quota bucket.
+const QUOTA_SCRAPE_SESSION = "woofund-quota-scrape";
+const QUOTA_SCRAPE_WORKDIR = "/tmp/woofund-quota-scrape-workspace";
+const QUOTA_SCRAPE_BOOT_WAIT_MS = 12000;
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -376,11 +383,63 @@ async function runTmuxCapturePane(session) {
 
 const quotaSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+function tmuxSessionExists(name) {
+  return new Promise((resolve) => {
+    execFile("tmux", ["has-session", "-t", name], (err) => resolve(!err));
+  });
+}
+
+// Make sure the dedicated quota-scrape session exists and is running
+// a claude process ready to answer /status. Idempotent — a second
+// call while the session exists is a no-op. On cold boot we spend
+// the full BOOT_WAIT_MS (~12s) waiting for claude's welcome screen
+// to settle before the first scrape; subsequent calls return immediately.
+let quotaScrapeReadyPromise = null;
+async function ensureQuotaScrapeSession() {
+  if (quotaScrapeReadyPromise) return quotaScrapeReadyPromise;
+  quotaScrapeReadyPromise = (async () => {
+    try {
+      fs.mkdirSync(QUOTA_SCRAPE_WORKDIR, { recursive: true });
+      if (await tmuxSessionExists(QUOTA_SCRAPE_SESSION)) {
+        return true;
+      }
+      await new Promise((resolve, reject) => {
+        execFile(
+          "tmux",
+          [
+            "new-session", "-d",
+            "-s", QUOTA_SCRAPE_SESSION,
+            "-c", QUOTA_SCRAPE_WORKDIR,
+            "claude --dangerously-skip-permissions",
+          ],
+          (err) => (err ? reject(err) : resolve()),
+        );
+      });
+      // Claude's first-run shows a "trust this folder?" prompt. Enter
+      // confirms "Yes, I trust this folder" (the default highlight),
+      // then claude renders the welcome screen and prompt. If the
+      // folder is already trusted (subsequent boots) the Enter key
+      // lands on an empty prompt and is harmless.
+      await quotaSleep(2500);
+      await runTmuxSendKeys(QUOTA_SCRAPE_SESSION, ["Enter"]);
+      await quotaSleep(QUOTA_SCRAPE_BOOT_WAIT_MS - 2500);
+      return true;
+    } catch (e) {
+      log(`quota scrape session boot error: ${e.stack || e}`);
+      quotaScrapeReadyPromise = null; // allow retry on next call
+      return false;
+    }
+  })();
+  return quotaScrapeReadyPromise;
+}
+
 async function captureAdminQuota() {
-  const session = adminTmuxSession();
-  if (!session) return null;
+  const admin = loadAdmin();
+  if (!admin || !admin.jid) return null;
+  const ready = await ensureQuotaScrapeSession();
+  if (!ready) return null;
   return quotaScraper.captureQuota({
-    tmuxSession: session,
+    tmuxSession: QUOTA_SCRAPE_SESSION,
     sendKeys: runTmuxSendKeys,
     capturePane: runTmuxCapturePane,
     sleep: quotaSleep,
