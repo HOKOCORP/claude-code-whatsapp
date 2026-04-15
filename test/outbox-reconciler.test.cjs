@@ -161,6 +161,16 @@ test("erroredIds omitted (undefined) is safe — treated as empty", () => {
   assert.equal(action.kind, "delete");
 });
 
+test("errored entry does not quarantine if file has no tracked msgIds yet", () => {
+  const action = r.reconcileOutboxFile({
+    sendState: { msgIds: new Set(), firstSentAt: 500, lastSentAt: 500, attempts: 1 },
+    ackedIds: new Set(),
+    erroredIds: new Set(["A"]),
+    now: 1000, stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+  });
+  assert.equal(action.kind, "wait");
+});
+
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
