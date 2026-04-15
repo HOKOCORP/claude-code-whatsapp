@@ -34,6 +34,8 @@ const { detectTransitions } = require("./lib/quota-transitions.cjs");
 const QUOTA_POLL_INTERVAL_MS = 5 * 60 * 1000;
 const QUOTA_RENDER_DELAY_MS = 400;
 const QUOTA_TAB_DELAY_MS = 200;
+const QUOTA_LOAD_DELAY_MS = 500;
+const QUOTA_LOAD_RETRIES = 6;
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -384,6 +386,8 @@ async function captureAdminQuota() {
     sleep: quotaSleep,
     renderDelayMs: QUOTA_RENDER_DELAY_MS,
     tabDelayMs: QUOTA_TAB_DELAY_MS,
+    loadDelayMs: QUOTA_LOAD_DELAY_MS,
+    loadRetries: QUOTA_LOAD_RETRIES,
   });
 }
 

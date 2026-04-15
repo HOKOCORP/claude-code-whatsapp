@@ -100,6 +100,61 @@ test("concurrent calls share one capture (inFlight dedup)", async () => {
   assert.equal(calls.capturePane, 1, "only one capture happened");
 });
 
+test("retries capture while pane shows 'Loading usage data', then parses the loaded pane", async () => {
+  const LOADING_PANE = `
+   Status   Config   Usage   Stats
+
+  Loading usage data…
+
+  Esc to cancel
+`;
+  const LOADED_PANE = `
+   Status   Config   Usage   Stats
+
+  Current session
+  █ 34% used
+  Resets 10am (UTC)
+
+  Current week (all models)
+  █ 21% used
+  Resets Apr 21, 5am (UTC)
+
+  Esc to cancel
+`;
+  let captureCount = 0;
+  const calls = { sleeps: [] };
+  const deps = {
+    sendKeys: () => Promise.resolve(),
+    capturePane: () => { captureCount++; return Promise.resolve(captureCount < 3 ? LOADING_PANE : LOADED_PANE); },
+    sleep: (ms) => { calls.sleeps.push(ms); return Promise.resolve(); },
+    now: () => 1776240000000,
+  };
+  const r = await captureQuota({ tmuxSession: "x", ...deps, loadDelayMs: 100, loadRetries: 5 });
+  assert.equal(r.sessionRemainingPct, 66);
+  assert.equal(r.weekRemainingPct, 79);
+  assert.equal(captureCount, 3, "two retries before parse succeeds");
+});
+
+test("gives up after loadRetries when pane keeps showing 'Loading usage data'", async () => {
+  const LOADING_PANE = `
+   Status   Config   Usage   Stats
+
+  Loading usage data…
+
+  Esc to cancel
+`;
+  let captureCount = 0;
+  const deps = {
+    sendKeys: () => Promise.resolve(),
+    capturePane: () => { captureCount++; return Promise.resolve(LOADING_PANE); },
+    sleep: () => Promise.resolve(),
+    now: () => 0,
+  };
+  const r = await captureQuota({ tmuxSession: "x", ...deps, loadDelayMs: 1, loadRetries: 3 });
+  assert.equal(r, null);
+  assert.equal(captureCount, 4, "1 initial + 3 retries");
+});
+
 test("reset-time fields omitted when parse succeeds for pcts but reset regex fails", async () => {
   const pane = `
    Status   Config   Usage   Stats
