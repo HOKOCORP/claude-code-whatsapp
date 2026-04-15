@@ -96,11 +96,33 @@ function isAllowed(jid, participant) {
 
 const OTP_FILE = path.join(STATE_DIR, "otp.json");   // { code, expiresAt }
 const ADMIN_FILE = path.join(STATE_DIR, "admin.json"); // { jid }
+// Global admin — server-level, shared across all channels. See
+// gateway.cjs for the design rationale; we mirror the same behaviour
+// here so the MCP server's permission relay asks the server-level
+// operator rather than a per-channel admin.
+const GLOBAL_ADMIN_FILE = path.join(os.homedir(), ".ccm", "admin.json");
 const OUTBOX_DIR = path.join(STATE_DIR, "outbox");
 fs.mkdirSync(OUTBOX_DIR, { recursive: true });
 
 function loadAdmin() {
-  try { return JSON.parse(fs.readFileSync(ADMIN_FILE, "utf8")); } catch { return null; }
+  // Global file is source of truth. Per-channel is a fallback for
+  // setups that haven't migrated yet; on a successful fallback we
+  // populate the global file so the next read is native.
+  try {
+    const g = JSON.parse(fs.readFileSync(GLOBAL_ADMIN_FILE, "utf8"));
+    if (g && g.jid) return g;
+  } catch {}
+  try {
+    const local = JSON.parse(fs.readFileSync(ADMIN_FILE, "utf8"));
+    if (local && local.jid) {
+      try {
+        fs.mkdirSync(path.dirname(GLOBAL_ADMIN_FILE), { recursive: true });
+        fs.writeFileSync(GLOBAL_ADMIN_FILE, JSON.stringify(local) + "\n");
+      } catch {}
+      return local;
+    }
+  } catch {}
+  return null;
 }
 
 function addToWhitelist(jid) {
@@ -127,8 +149,15 @@ async function handleUnknown(msg, jid) {
   const otp = loadOtp();
   if (otp && text === otp.code) {
     if (otp.type === "admin") {
-      // Admin verification — save as admin and whitelist
-      fs.writeFileSync(ADMIN_FILE, JSON.stringify({ jid }) + "\n");
+      // Admin verification — save as admin and whitelist. Write both
+      // the per-channel file (legacy) and the global file (source of
+      // truth going forward); see gateway.cjs for full rationale.
+      const adminJson = JSON.stringify({ jid }) + "\n";
+      fs.writeFileSync(ADMIN_FILE, adminJson);
+      try {
+        fs.mkdirSync(path.dirname(GLOBAL_ADMIN_FILE), { recursive: true });
+        fs.writeFileSync(GLOBAL_ADMIN_FILE, adminJson);
+      } catch (e) { log(`global admin write failed: ${e}`); }
       addToWhitelist(jid);
       try { fs.unlinkSync(OTP_FILE); } catch {}
       try { await sock.sendMessage(jid, { text: "✅ You are now the admin of this agent." }); } catch {}

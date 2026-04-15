@@ -52,6 +52,14 @@ const AUTH_DIR = path.join(STATE_DIR, "auth");
 const OTP_LOG_FILE = path.join(STATE_DIR, "otp.log");
 const OTP_FILE = path.join(STATE_DIR, "otp.json");
 const ADMIN_FILE = path.join(STATE_DIR, "admin.json");
+// Global admin — server-level identity that sees /usage quota %,
+// receives cross-channel permission polls, and is the true "operator"
+// of this ccm install. Lives at ~/.ccm/admin.json, shared across all
+// channels run by the same Unix user. Per-channel ADMIN_FILE is kept
+// for legacy callers (whitelist add/remove, channel-specific handoff)
+// until the next cleanup pass; loadAdmin() prefers the global file
+// and falls back to per-channel if global is absent.
+const GLOBAL_ADMIN_FILE = path.join(os.homedir(), ".ccm", "admin.json");
 const OUTBOX_DIR = path.join(STATE_DIR, "outbox");
 const PHONE = path.basename(STATE_DIR).replace("whatsapp-", "");
 const SESSION_IDLE_MS = 30 * 60 * 1000;
@@ -355,7 +363,29 @@ function addToWhitelist(jid) {
   const access = loadAccess();
   if (!access.allowFrom.some((a) => toJid(a) === jid || a === jid)) { access.allowFrom.push(jid); fs.writeFileSync(ACCESS_FILE, JSON.stringify(access, null, 2) + "\n"); log(`whitelist: added ${jid}`); }
 }
-function loadAdmin() { try { return JSON.parse(fs.readFileSync(ADMIN_FILE, "utf8")); } catch { return null; } }
+function loadAdmin() {
+  // Prefer the server-level global admin when present. Fall back to
+  // the per-channel admin file for backward compatibility — on every
+  // successful fallback we also write the global file so the next
+  // boot sees it natively (auto-migration without needing a separate
+  // step). Both reads swallow errors and return null on any parse
+  // failure, so a corrupt file can't crash the gateway.
+  try {
+    const g = JSON.parse(fs.readFileSync(GLOBAL_ADMIN_FILE, "utf8"));
+    if (g && g.jid) return g;
+  } catch {}
+  try {
+    const local = JSON.parse(fs.readFileSync(ADMIN_FILE, "utf8"));
+    if (local && local.jid) {
+      try {
+        fs.mkdirSync(path.dirname(GLOBAL_ADMIN_FILE), { recursive: true });
+        fs.writeFileSync(GLOBAL_ADMIN_FILE, JSON.stringify(local) + "\n");
+      } catch {}
+      return local;
+    }
+  } catch {}
+  return null;
+}
 
 function adminQuotaFilePath() { return path.join(IPC_BASE, "admin-quota.json"); }
 
@@ -1226,7 +1256,17 @@ async function connectWhatsApp() {
         const otp = loadOtp();
         if (otp && extractText(msg.message || {}).trim().toUpperCase() === otp.code) {
           if (otp.type === "admin") {
-            fs.writeFileSync(ADMIN_FILE, JSON.stringify({ jid }) + "\n"); addToWhitelist(jid);
+            // Write both the per-channel admin (legacy consumers still
+            // read ADMIN_FILE directly) AND the global admin file (the
+            // new source of truth for /usage quota, cross-channel polls,
+            // and future ccm admin management).
+            const adminJson = JSON.stringify({ jid }) + "\n";
+            fs.writeFileSync(ADMIN_FILE, adminJson);
+            try {
+              fs.mkdirSync(path.dirname(GLOBAL_ADMIN_FILE), { recursive: true });
+              fs.writeFileSync(GLOBAL_ADMIN_FILE, adminJson);
+            } catch (e) { log(`global admin write failed: ${e}`); }
+            addToWhitelist(jid);
             try { fs.unlinkSync(OTP_FILE); } catch {}
             try { await sock.sendMessage(jid, { text: "\u2705 You are now the admin of this agent." }); } catch {}
             try { fs.appendFileSync(OTP_LOG_FILE, `${new Date().toISOString()} otp: ${formatJid(jid)} set as admin\n`); } catch {}
