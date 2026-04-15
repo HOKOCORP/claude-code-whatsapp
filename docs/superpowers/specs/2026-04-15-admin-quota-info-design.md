@@ -32,20 +32,34 @@ This spec closes the visibility gap. Two complementary surfaces:
 
 ## 4. Assumptions
 
-Verified during exploration of `gateway.cjs` and the `/status` overlay:
+Verified during exploration of `gateway.cjs` and a live capture of the `/status` overlay in Claude Code 2.1.101:
 
 - The admin's Claude Code runs inside a tmux session named `cc-ch-wa-{PHONE}-u-{sanitizedAdminId}` (see `gateway.cjs:383`). The gateway already knows `ADMIN_JID` and the sanitization logic.
-- `/status` is a Claude Code slash command that opens a full-screen overlay in the TUI. Relevant lines for us look like:
+- `/status` is a Claude Code slash command that opens a tabbed overlay. Tabs: `Status · Config · Usage · Stats`. The Status tab is the default and does NOT show rate-limit info — we must navigate to the `Usage` tab (two Right-arrow presses from default).
+- Live capture of the `Usage` tab on 2026-04-15:
 
   ```
-  5-hour limit       ████████░░░░░░░░░░░░  38% used (2h 14m left)
-  Week's usage       ██████████████░░░░░░  70% used (resets Sun 04:00)
+   Status   Config   Usage   Stats
+
+  Current session
+  █████████████████                                  34% used
+  Resets 10am (UTC)
+
+  Current week (all models)
+  ██████████▌                                        21% used
+  Resets Apr 21, 5am (UTC)
+
+  Current week (Sonnet only)
+  ███                                                6% used
+  Resets Apr 19, 11am (UTC)
+
+  Esc to cancel
   ```
 
-  Exact wording may evolve across Claude Code versions; the regex is the only thing the spec ties itself to.
+  The spec targets `Current session` (the 5-hour window) and `Current week (all models)` (primary weekly budget). `Current week (Sonnet only)` is ignored — Sonnet is a sub-bucket that doesn't block Opus usage.
 
-- `tmux send-keys -t {session}.0 "/status" Enter` delivers the command; a short sleep (~400ms observed locally) lets the overlay render; `tmux capture-pane -p -t {session}.0` captures the full pane buffer including the overlay; `tmux send-keys -t {session}.0 Escape` dismisses the overlay and returns the pane to Claude's normal chat view.
-- The overlay does NOT add anything to Claude's chat transcript — it is a TUI overlay only. Claude's conversation context is not polluted.
+- Navigation sequence: `tmux send-keys -t {session}.0 "/status" Enter`, 400 ms settle, `Right Right`, 200 ms settle, `capture-pane -p`, parse, `Escape`.
+- The overlay does NOT add anything to Claude's chat transcript — it is a TUI overlay only. Claude's conversation context is not polluted. The overlay's tab selection does not persist across invocations; every capture starts at `Status` and must re-navigate.
 
 ## 5. Design
 
@@ -55,20 +69,20 @@ Three files, scoped narrowly:
 
 - **`lib/quota-scraper.cjs`** (new) — stateless I/O module. One exported fn:
   ```js
-  async function captureQuota({ tmuxSession, tmuxBin = "tmux", renderDelayMs = 400 }) → {
-    fiveHourRemainingPct: number,  // 0-100
-    weekRemainingPct: number,      // 0-100
+  async function captureQuota({ tmuxSession, tmuxBin = "tmux", renderDelayMs = 400, tabDelayMs = 200 }) → {
+    sessionRemainingPct: number,   // 0-100, from "Current session" block
+    weekRemainingPct: number,      // 0-100, from "Current week (all models)" block
     capturedAt: number,            // Date.now()
   } | null
   ```
-  Returns `null` on any failure (session gone, parse failed, tmux not installed).
+  Returns `null` on any failure (session gone, parse failed, tmux not installed). Performs the full send-keys sequence documented in §4.
 
 - **`lib/quota-cache.cjs`** (new) — two exported fns backed by a JSON file at `<IPC_BASE>/admin-quota.json`:
   ```js
   readQuota() → { current, previous, lastAlerted } | null
   writeQuota(current) → updates file atomically; shifts old current → previous
   ```
-  Shape of `lastAlerted`: `{ "5h_25": tsMs | null, "5h_10": tsMs | null, "7d_25": tsMs | null, "7d_10": tsMs | null }`.
+  Shape of `lastAlerted`: `{ "session_25": tsMs | null, "session_10": tsMs | null, "week_25": tsMs | null, "week_10": tsMs | null }`.
 
 - **`gateway.cjs`** (modify) — wire a background poller + extend the existing `/usage` handler:
   - `setInterval(quotaTick, 5 * 60 * 1000)` — every 5 min, call `captureQuota`, `writeQuota`, run `detectTransitions(previous, current)` pure fn, if any threshold breached write alert payload to admin's outbox.
@@ -78,15 +92,15 @@ Three files, scoped narrowly:
 
 #### 5.2.1 Happy poll (5-min tick)
 
-1. `captureQuota` → `{fiveHourRemainingPct: 62, weekRemainingPct: 88, capturedAt: ts}`.
+1. `captureQuota` → `{sessionRemainingPct: 62, weekRemainingPct: 88, capturedAt: ts}`.
 2. `writeQuota(current)` — previous snapshot shifts into `previous`; new snapshot becomes `current`.
 3. `detectTransitions(previous, current)` compares per-window per-threshold:
-   - `prev.fiveHour ≥ 25 && cur.fiveHour < 25 && lastAlerted["5h_25"] == null` → alert.
-   - `cur.fiveHour ≥ 25 && lastAlerted["5h_25"] != null` → clear `lastAlerted["5h_25"]` (window reset).
-   - Same four cases for `5h_10`, `7d_25`, `7d_10`.
+   - `prev.session ≥ 25 && cur.session < 25 && lastAlerted["session_25"] == null` → alert.
+   - `cur.session ≥ 25 && lastAlerted["session_25"] != null` → clear `lastAlerted["session_25"]` (window reset).
+   - Same four cases for `session_10`, `week_25`, `week_10`.
 4. For each breach returned: write a JSON file to `<ADMIN_USER_DIR>/outbox/{ts}-quota-{window}_{threshold}.json` with the schema already used elsewhere in the repo:
    ```json
-   {"action": "reply", "chat_id": "<ADMIN_JID>", "text": "⚠️ 5-hour quota at 24% remaining (crossed 25% threshold)"}
+   {"action": "reply", "chat_id": "<ADMIN_JID>", "text": "⚠️ Session quota at 24% remaining (crossed 25% threshold)"}
    ```
    Filename carries the `ts + window + threshold` tuple so concurrent breaches never collide. The existing outbox reconciler (see `2026-04-15-delivery-reliability-design.md`) handles retry, ack, and quarantine — this spec adds no new send path.
 5. Mark `lastAlerted[key] = capturedAt` for each fired alert; persist.
@@ -99,9 +113,10 @@ Three files, scoped narrowly:
    ```
 
    📊 Admin quota
-   5-hour: 62% remaining
-   Weekly: 88% remaining
+   Session: 62% remaining (resets 10am UTC)
+   Weekly: 88% remaining (resets Apr 21 5am UTC)
    ```
+   Reset-time strings come from the capture and are carried through as-is. If they fail to parse, omit the parenthetical.
 4. Reply sent via existing outbox path.
 
 #### 5.2.3 `/usage` call by non-admin
@@ -115,16 +130,25 @@ No change. The admin quota section is appended only when the caller's JID matche
 
 ### 5.4 Parsing
 
-The regex lives in `lib/quota-scraper.cjs`. Two patterns, applied to the captured pane buffer:
+The regexes live in `lib/quota-scraper.cjs`. Block-scoped patterns — each targets a named section header and captures the first `NN% used` after it:
 
 ```js
-const FIVE_HOUR_RE = /5-hour\s+limit\D+(\d{1,3})\s*%\s*used/i;
-const WEEK_RE      = /week'?s?\s+usage\D+(\d{1,3})\s*%\s*used/i;
+// Anchor on each section header, then find the next "NN% used" line within ~3 lines.
+const SESSION_RE = /Current session\s*(?:\r?\n[^\n]*){0,3}?(\d{1,3})\s*%\s*used/i;
+const WEEK_RE    = /Current week \(all models\)\s*(?:\r?\n[^\n]*){0,3}?(\d{1,3})\s*%\s*used/i;
 ```
 
-Remaining% = `100 - usedPct`. If either regex fails, `captureQuota` returns `null` (graceful).
+Both patterns run with `multiline = false` (default). The captured group is the `used` percentage; `remaining = 100 - used`. If either regex fails, `captureQuota` returns `null` — we never surface a half-populated quota to the caller.
 
-If Claude Code changes the wording, the fix is localized to this module.
+Reset-time extraction (optional, for `/usage` formatting):
+```js
+const SESSION_RESET_RE = /Current session[\s\S]*?Resets\s+([^\n]+)/i;
+const WEEK_RESET_RE    = /Current week \(all models\)[\s\S]*?Resets\s+([^\n]+)/i;
+```
+
+The `Current week (Sonnet only)` bucket is intentionally not parsed — anchoring on the `(all models)` literal prevents the week regex from matching the Sonnet-only block.
+
+If Claude Code changes the header wording, the fix is localized to these four patterns.
 
 ### 5.5 Admin identification
 
@@ -139,9 +163,9 @@ Derive admin tmux session name once at gateway boot, cache the string. On missin
 
 Each breach is one WhatsApp message. Wording is terse:
 
-- Below 25%: `⚠️ 5-hour quota at {N}% remaining (crossed 25% threshold)`
-- Below 10%: `🚨 5-hour quota at {N}% remaining — near exhaustion (crossed 10% threshold)`
-- Same patterns for "Weekly quota".
+- Below 25%: `⚠️ Session quota at {N}% remaining (crossed 25% threshold)`
+- Below 10%: `🚨 Session quota at {N}% remaining — near exhaustion (crossed 10% threshold)`
+- Same patterns for "Weekly quota" (replacing "Session" with "Weekly").
 
 If both 25% and 10% thresholds are crossed in the SAME poll (e.g., 32% → 8%), emit ONE alert — the 10% one. Rule: per window, fire the lowest-threshold alert transitioned on this tick.
 
@@ -166,6 +190,8 @@ No env vars, no admin-settable overrides. Revisit if polling rate becomes a prob
 | `/status` format change breaks regex | Same null path; one-time log per 24h via a timer-gated flag. Admin notices "(quota unavailable)" in next `/usage`. |
 | Claude Code is mid-response when `/status` sent | tmux send-keys still delivers; the overlay stacks on top. The Escape key post-capture dismisses it. The in-progress reply is not interrupted because `/status` is a TUI-level command not a message to Claude. Verified during exploration. |
 | Admin dismisses the overlay manually (hits Escape before we capture) | Capture runs after the overlay closes, pane shows normal Claude view, regex fails, `captureQuota` returns null. Next 5-min tick tries again. |
+| Right-arrow navigation lands on wrong tab (Claude Code reordered tabs) | Regex fails, `captureQuota` returns null. Fix is to adjust the arrow count in `lib/quota-scraper.cjs`. |
+| Terminal too narrow — section headers wrap differently | The regex uses a bounded `{0,3}` lookahead so a moderate amount of wrapping is tolerated. Extreme narrowing (< 30 chars) may still break; unlikely for a server-side tmux (column count ≥ 80 by default). |
 | Cache file corrupt on boot | `readQuota` returns null; next successful poll re-creates it. No alerts fire on the first post-corruption poll (no `previous` to compare). |
 | Both windows cross 25% at the same poll | Two separate alert messages (one per window). |
 | Window resets from 3% to 100% between polls | `detectTransitions` notices the jump; clears `lastAlerted["5h_10"]` and `lastAlerted["5h_25"]`. No alert sent on a reset. |
@@ -177,11 +203,12 @@ No env vars, no admin-settable overrides. Revisit if polling rate becomes a prob
 ### 7.1 `lib/quota-scraper.cjs` — unit tests (`test/quota-scraper.test.cjs`)
 
 Parsing (mock the tmux commands by injecting a `capturePane` callback):
-- Pane contains "5-hour limit 38% used" + "Week's usage 70% used" → `{fiveHourRemainingPct: 62, weekRemainingPct: 30}`.
-- Pane contains only 5-hour line → returns null.
-- Pane contains only week line → returns null.
-- Pane missing both → returns null.
-- "used" wording different (e.g. "USED" uppercase) → regex flag handles it.
+- Fixture = full live-captured Usage tab (session 34%, week all-models 21%, week Sonnet-only 6%) → `{sessionRemainingPct: 66, weekRemainingPct: 79}` (Sonnet-only ignored).
+- Pane missing "Current session" section → returns null.
+- Pane missing "Current week (all models)" section → returns null.
+- Pane contains only "Current week (Sonnet only)" (no all-models block) → returns null (week anchor misses).
+- Pane has both blocks but with extra whitespace in the header → regex still matches.
+- Reset-time strings round-trip into the optional return fields.
 - Concurrency: two concurrent `captureQuota` calls share one tmux invocation (inject a spy counting send-keys calls).
 
 ### 7.2 `lib/quota-cache.cjs` — unit tests (`test/quota-cache.test.cjs`)
@@ -196,11 +223,11 @@ Parsing (mock the tmux commands by injecting a `capturePane` callback):
 
 Pure fn `detectTransitions(prev, cur, lastAlerted)` → `{ alertsToFire: Array<{window, threshold, remaining}>, resetsToClear: Array<{window, threshold}> }`:
 - No prev → empty alerts, empty resets.
-- 30% → 22% with no prior alert → one alert `{window: "5h", threshold: 25}`.
+- 30% → 22% with no prior alert → one alert `{window: "session", threshold: 25}`.
 - 22% → 18% with prior 25%-alert → no alert (already below).
 - 22% → 8% with prior 25%-alert → one alert for 10% (lowest threshold transitioned).
 - 95% → 80% (no threshold crossed) → empty.
-- 8% → 95% (window reset) → empty alerts, resets include `5h_25` and `5h_10`.
+- 8% → 95% (window reset) → empty alerts, resets include `session_25` and `session_10`.
 - Both windows cross 25% in one poll → two alerts.
 
 ### 7.4 Integration — gateway wiring (`test/admin-quota-integration.test.cjs`)
