@@ -25,6 +25,8 @@ const crypto = require("crypto");
 const channelSlash = require("./lib/channel-slash.cjs");
 const tmuxHelper = require("./lib/tmux.cjs");
 const outboxReconciler = require("./lib/outbox-reconciler.cjs");
+const { dispatchAck } = require("./lib/ack-dispatcher.cjs");
+const { createAuditLogger } = require("./lib/audit-log.cjs");
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -73,6 +75,30 @@ function markAcked(id) {
   outboxAckedIds.add(id);
   setTimeout(() => outboxAckedIds.delete(id), OUTBOX_ACKED_TTL_MS);
 }
+
+const outboxErroredIds = new Set();
+function markErrored(id) {
+  if (!id || typeof id !== "string") return;
+  outboxErroredIds.add(id);
+  setTimeout(() => outboxErroredIds.delete(id), OUTBOX_ACKED_TTL_MS);
+}
+
+// msgId → {filename, chatId, dir} — purged by unregisterFile on sendState removal.
+const msgIdToFilename = new Map();
+function registerMsgIds(dir, filename, msgIds, chatId) {
+  for (const id of (msgIds || [])) {
+    if (typeof id !== "string") continue;
+    msgIdToFilename.set(id, { filename, chatId, dir });
+  }
+}
+function unregisterFile(dir, filename) {
+  for (const [id, v] of msgIdToFilename) {
+    if (v.dir === dir && v.filename === filename) msgIdToFilename.delete(id);
+  }
+}
+
+// dir → auditEvent(event, extras)
+const outboxAuditors = new Map();
 
 // ── USD wallet ─────────────────────────────────────────────────────
 // Pay-as-you-go USD balance per user. New users start at $0 (blocked).
@@ -1001,10 +1027,17 @@ async function connectWhatsApp() {
     try {
       if (!Array.isArray(updates)) return;
       for (const u of updates) {
-        if (!u || !u.key || !u.key.id) continue;
-        if (u.key.fromMe !== true) continue; // only track our own sent messages
-        const status = u.update && typeof u.update.status === "number" ? u.update.status : null;
-        if (status !== null && status >= 2) markAcked(u.key.id);
+        if (!u?.key?.id || !u?.update) continue;
+        if (u.key.fromMe !== true) continue;
+        const { event, target } = dispatchAck(u.update.status);
+        if (!event) continue;
+        const attr = msgIdToFilename.get(u.key.id);
+        const extras = { msg_id: u.key.id };
+        if (attr) { extras.filename = attr.filename; extras.chat_id = attr.chatId; }
+        const auditor = attr ? outboxAuditors.get(attr.dir) : null;
+        if (auditor) auditor(event, extras);
+        if (target === "acked") markAcked(u.key.id);
+        else if (target === "errored") markErrored(u.key.id);
       }
     } catch (e) { log(`messages.update handler error: ${e}`); }
   });
@@ -1483,14 +1516,20 @@ function makeSendFnUser(uid) {
 function reconcilerFor(dir, sendFn) {
   let r = outboxReconcilers.get(dir);
   if (!r) {
+    const audit = createAuditLogger({ outboxDir: dir, log });
+    outboxAuditors.set(dir, audit);
     r = outboxReconciler.createOutboxReconciler({
       outboxDir: dir,
       sendFn,
       ackedIds: outboxAckedIds,
+      erroredIds: outboxErroredIds,
       now: () => Date.now(),
-      stalenessMs: 5000,
+      stalenessMs: 15000,
       maxAgeMs: 5 * 60 * 1000,
-      maxRetries: 5,
+      maxRetries: 3,
+      auditEvent: audit,
+      registerMsgIds: (filename, msgIds, chatId) => registerMsgIds(dir, filename, msgIds, chatId),
+      unregisterFile: (filename) => unregisterFile(dir, filename),
       log,
     });
     outboxReconcilers.set(dir, r);
