@@ -1585,12 +1585,22 @@ const outboxReconcilers = new Map(); // dir -> reconciler tick fn
 // When a user DMs the bot and the underlying assistant hits an API
 // error (500, quota, auth) before it can call mcp__whatsapp__reply,
 // there's no outbox file and the user just sits in silence. We arm a
-// per-user timer on inbox; any reply disarms it; a timeout fires a
-// generic fallback. Error-text sniffing of the session pane lets us
-// include the specific reason when we can extract one without leaking
-// upstream-brand language.
+// per-user timer on inbox; any outbox action disarms it. When the
+// timer fires we diff the session pane against its snapshot-at-arm:
+//
+//   - pane changed & contains an error pattern  → fire error-specific
+//     fallback (the assistant was working on it but hit a failure we
+//     can recognise)
+//   - pane changed & no error pattern           → the assistant is
+//     still producing output; re-arm for another window instead of
+//     pre-empting the user with a false "stuck" message
+//   - pane unchanged                             → genuinely stuck,
+//     send the generic fallback
+//
+// Cap the total re-arm count so a runaway build can't silently loop.
 const STALL_WATCHDOG_MS = 3 * 60 * 1000;
-const stallWatchdogs = new Map(); // uid -> { timer, chatJid, armedAt }
+const STALL_MAX_REARMS = 4; // 5 windows × 3 min = 15 min of patience
+const stallWatchdogs = new Map(); // uid -> { timer, chatJid, paneSnapshot, rearmCount }
 const STALL_ERROR_PATTERNS = [
   { re: /API Error:\s*5\d\d\s+([^\n]+)/i,                     label: "Upstream API error" },
   { re: /Internal Server Error/i,                              label: "Upstream server error" },
@@ -1602,8 +1612,12 @@ const STALL_ERROR_PATTERNS = [
 
 function armStallWatchdog(uid, chatJid) {
   disarmStallWatchdog(uid);
-  const timer = setTimeout(() => fireStallFallback(uid, chatJid), STALL_WATCHDOG_MS);
-  stallWatchdogs.set(uid, { timer, chatJid, armedAt: Date.now() });
+  // Snapshot the pane NOW so the fire-path can diff against it and tell
+  // "quiet stall" from "actively producing output." paneSnapshotPromise
+  // resolves before the timer fires because 3min >> tmux capture latency.
+  const paneSnapshotPromise = captureUserPane(uid);
+  const timer = setTimeout(() => tickStallWatchdog(uid, chatJid), STALL_WATCHDOG_MS);
+  stallWatchdogs.set(uid, { timer, chatJid, paneSnapshotPromise, rearmCount: 0 });
 }
 
 function disarmStallWatchdog(uid) {
@@ -1622,31 +1636,64 @@ async function captureUserPane(uid) {
   });
 }
 
-function fireStallFallback(uid, chatJid) {
-  stallWatchdogs.delete(uid);
-  (async () => {
-    try {
-      const pane = await captureUserPane(uid);
-      let detail = "";
-      for (const p of STALL_ERROR_PATTERNS) {
-        const m = pane.match(p.re);
-        if (m) {
-          detail = p.label + (m[1] ? `: ${m[1].trim()}` : "");
-          break;
-        }
-      }
-      const text = detail
-        ? `⚠️ ${detail}. Please try again in a moment.`
-        : `⚠️ No response yet — something may be stuck. Please try rephrasing or retry.`;
-      const userDir = path.join(USERS_DIR, uid);
-      const outboxFile = path.join(userDir, "outbox", `${Date.now()}-stall-fallback.json`);
-      fs.mkdirSync(path.dirname(outboxFile), { recursive: true });
-      fs.writeFileSync(outboxFile, JSON.stringify({ action: "reply", chat_id: chatJid, text }));
-      log(`stall fallback emitted for ${uid} (${detail || "no detail"})`);
-    } catch (e) {
-      log(`stall fallback error for ${uid}: ${e.stack || e}`);
+function detectStallError(paneText) {
+  for (const p of STALL_ERROR_PATTERNS) {
+    const m = paneText.match(p.re);
+    if (m) return p.label + (m[1] ? `: ${m[1].trim()}` : "");
+  }
+  return "";
+}
+
+async function tickStallWatchdog(uid, chatJid) {
+  const w = stallWatchdogs.get(uid);
+  if (!w) return; // disarmed between setTimeout callback and now
+  try {
+    const [priorPane, currentPane] = await Promise.all([
+      w.paneSnapshotPromise,
+      captureUserPane(uid),
+    ]);
+    const errorDetail = detectStallError(currentPane);
+    const paneChanged = priorPane !== currentPane;
+
+    // Case 1: recognisable error text → fire immediately, no re-arm.
+    if (errorDetail) {
+      emitStallFallback(uid, chatJid, `⚠️ ${errorDetail}. Please try again in a moment.`);
+      stallWatchdogs.delete(uid);
+      return;
     }
-  })();
+    // Case 2: pane still changing and no error found → assistant is
+    // still working. Re-arm instead of interrupting with a false alarm.
+    if (paneChanged && w.rearmCount < STALL_MAX_REARMS) {
+      const nextPaneSnapshotPromise = Promise.resolve(currentPane);
+      const nextTimer = setTimeout(() => tickStallWatchdog(uid, chatJid), STALL_WATCHDOG_MS);
+      stallWatchdogs.set(uid, {
+        timer: nextTimer,
+        chatJid,
+        paneSnapshotPromise: nextPaneSnapshotPromise,
+        rearmCount: w.rearmCount + 1,
+      });
+      return;
+    }
+    // Case 3: pane unchanged (genuinely stuck) OR rearm budget exhausted
+    // → send the generic fallback.
+    emitStallFallback(uid, chatJid, `⚠️ No response yet — something may be stuck. Please try rephrasing or retry.`);
+    stallWatchdogs.delete(uid);
+  } catch (e) {
+    log(`stall watchdog tick error for ${uid}: ${e.stack || e}`);
+    stallWatchdogs.delete(uid);
+  }
+}
+
+function emitStallFallback(uid, chatJid, text) {
+  try {
+    const userDir = path.join(USERS_DIR, uid);
+    const outboxFile = path.join(userDir, "outbox", `${Date.now()}-stall-fallback.json`);
+    fs.mkdirSync(path.dirname(outboxFile), { recursive: true });
+    fs.writeFileSync(outboxFile, JSON.stringify({ action: "reply", chat_id: chatJid, text }));
+    log(`stall fallback emitted for ${uid}: ${text}`);
+  } catch (e) {
+    log(`stall fallback write error for ${uid}: ${e.stack || e}`);
+  }
 }
 
 async function sendFnGlobal(data) {
@@ -1690,11 +1737,14 @@ function makeSendFnUser(uid) {
       });
       return { msgIds: msg && msg.key && msg.key.id ? [msg.key.id] : [] };
     }
+    // Any outbox action whatsoever counts as "assistant is alive and
+    // producing side effects," so disarm the stall watchdog. This
+    // catches not just `reply` but also `typing_start`, `react`, and
+    // `download` — without this, long operations that start with a
+    // typing indicator still trigger the false-stall fallback.
+    disarmStallWatchdog(uid);
+
     if (data.action === "reply") {
-      // Any reply-type outbox send counts as "the assistant responded",
-      // so disarm the stall watchdog for this user — they won't get
-      // the "no response" fallback on top of a legit reply.
-      disarmStallWatchdog(uid);
       const msgIds = [];
       if (data.text) {
         const q = data.reply_to ? rawMessages.get(data.reply_to) : undefined;
