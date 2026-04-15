@@ -186,3 +186,163 @@ test("integration E — typing_start bypasses tracking (fireAndForget)", async (
   assert.equal(fs.existsSync(path.join(outboxDir, "1-a.json")), false);
   fs.rmSync(outboxDir, { recursive: true, force: true });
 });
+
+test("integration F — status=0 path: errored set triggers quarantine + audit", async () => {
+  const outboxDir = mkTmp("outbox-integ-");
+  fs.writeFileSync(path.join(outboxDir, "1-a.json"),
+    JSON.stringify({ action: "reply", chat_id: "c", text: "hello" }));
+
+  const sock = makeFakeSock();
+  const ackedIds = new Set();
+  const erroredIds = new Set();
+  const events = [];
+  const tick = createOutboxReconciler({
+    outboxDir,
+    sendFn: makeSendFn(sock),
+    ackedIds, erroredIds,
+    now: () => 1000,
+    stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+    auditEvent: (event, extras) => events.push({ event, ...extras }),
+  });
+
+  await tick();
+  assert.equal(sock.sent.length, 1);
+  const sentId = sock.sent[0].id;
+  erroredIds.add(sentId);
+  await tick();
+
+  const failedPath = path.join(outboxDir, "failed", "1-a.json");
+  assert.ok(fs.existsSync(failedPath), "file moved to failed/");
+  assert.equal(fs.existsSync(path.join(outboxDir, "1-a.json")), false);
+  const kinds = events.map((e) => e.event);
+  assert.deepEqual(kinds, ["send", "quarantine"]);
+  assert.equal(events[1].reason, "server error");
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
+
+test("integration G — server_ack without delivery_ack: resends, then delivery_ack unlinks", async () => {
+  const outboxDir = mkTmp("outbox-integ-");
+  fs.writeFileSync(path.join(outboxDir, "1-a.json"),
+    JSON.stringify({ action: "reply", chat_id: "c", text: "hello" }));
+
+  const sock = makeFakeSock();
+  const ackedIds = new Set();       // <- this is the "delivery_ack" set in this test
+  const events = [];
+  let clock = 1000;
+  const tick = createOutboxReconciler({
+    outboxDir,
+    sendFn: makeSendFn(sock),
+    ackedIds,
+    erroredIds: new Set(),
+    now: () => clock,
+    stalenessMs: 100, maxAgeMs: 300000, maxRetries: 5,
+    auditEvent: (event, extras) => events.push({ event, ...extras }),
+  });
+
+  await tick();                         // first send
+  assert.equal(sock.sent.length, 1);
+  // Simulate "server_ack only" — no ackedIds mutation, no erroredIds mutation.
+  clock += 500;                         // advance past stalenessMs=100
+  await tick();                         // resend
+  assert.equal(sock.sent.length, 2, "resend after staleness with no delivery ack");
+  const secondId = sock.sent[1].id;
+
+  ackedIds.add(secondId);               // now simulate DELIVERY_ACK for the resent msg
+  clock += 50;
+  await tick();
+  assert.equal(fs.existsSync(path.join(outboxDir, "1-a.json")), false);
+  const kinds = events.map((e) => e.event);
+  assert.deepEqual(kinds, ["send", "retry", "send"]);
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
+
+test("integration H — audit log JSONL format: send → delivery unlink", async () => {
+  const outboxDir = mkTmp("outbox-integ-");
+  fs.writeFileSync(path.join(outboxDir, "1-a.json"),
+    JSON.stringify({ action: "reply", chat_id: "c", text: "hello" }));
+
+  const { createAuditLogger } = require("../lib/audit-log.cjs");
+  const sock = makeFakeSock();
+  const ackedIds = new Set();
+  let clock = 1000;
+  const audit = createAuditLogger({ outboxDir, now: () => clock });
+  const tick = createOutboxReconciler({
+    outboxDir,
+    sendFn: makeSendFn(sock),
+    ackedIds,
+    erroredIds: new Set(),
+    now: () => clock,
+    stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+    auditEvent: audit,
+  });
+
+  await tick();
+  clock += 1;
+  // Simulate the gateway's listener audit-writing on delivery_ack:
+  const sentId = sock.sent[0].id;
+  audit("server_ack", { msg_id: sentId, filename: "1-a.json", chat_id: "c" });
+  clock += 1;
+  audit("delivery_ack", { msg_id: sentId, filename: "1-a.json", chat_id: "c" });
+  ackedIds.add(sentId);
+  clock += 1;
+  await tick();
+
+  const lines = fs.readFileSync(path.join(outboxDir, "audit.jsonl"), "utf8")
+    .trim().split("\n").map(JSON.parse);
+  const events = lines.map((l) => l.event);
+  assert.deepEqual(events, ["send", "server_ack", "delivery_ack"]);
+  assert.equal(lines[0].filename, "1-a.json");
+  assert.deepEqual(lines[0].msg_ids, [sentId]);
+  assert.equal(lines[1].msg_id, sentId);
+  assert.equal(lines[2].msg_id, sentId);
+  assert.ok(lines[0].ts < lines[1].ts && lines[1].ts < lines[2].ts, "ts monotonic");
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
+
+test("integration I — unattributed late ack: audit writes with only msg_id, reconciler unaffected", async () => {
+  const outboxDir = mkTmp("outbox-integ-");
+  fs.writeFileSync(path.join(outboxDir, "1-a.json"),
+    JSON.stringify({ action: "reply", chat_id: "c", text: "hello" }));
+
+  const { createAuditLogger } = require("../lib/audit-log.cjs");
+  const sock = makeFakeSock();
+  const ackedIds = new Set();
+  const erroredIds = new Set();
+  let clock = 1000;
+  const audit = createAuditLogger({ outboxDir, now: () => clock });
+  const tick = createOutboxReconciler({
+    outboxDir,
+    sendFn: makeSendFn(sock),
+    ackedIds, erroredIds,
+    now: () => clock,
+    stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+    auditEvent: audit,
+  });
+
+  // Send, deliver, unlink.
+  await tick();
+  const sentId = sock.sent[0].id;
+  ackedIds.add(sentId);
+  clock += 10;
+  await tick();
+  assert.equal(fs.existsSync(path.join(outboxDir, "1-a.json")), false, "file unlinked");
+
+  // Now simulate a late status=0 ack for the same id (post-delete).
+  // Gateway's listener would write audit with only msg_id (no reverse index).
+  clock += 100;
+  audit("error", { msg_id: sentId });  // no filename/chat_id
+  erroredIds.add(sentId);               // even if set populated, no sendState to trigger quarantine
+
+  // Next tick must be a no-op for this file (already gone) and must not spawn new state.
+  await tick();
+  assert.equal(sock.sent.length, 1, "no new sends");
+
+  const lines = fs.readFileSync(path.join(outboxDir, "audit.jsonl"), "utf8")
+    .trim().split("\n").map(JSON.parse);
+  const errLine = lines.find((l) => l.event === "error");
+  assert.ok(errLine, "error line present");
+  assert.equal(errLine.msg_id, sentId);
+  assert.equal("filename" in errLine, false, "unattributed — filename omitted");
+  assert.equal("chat_id" in errLine, false, "unattributed — chat_id omitted");
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+});
