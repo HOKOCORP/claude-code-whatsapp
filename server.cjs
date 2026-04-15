@@ -628,6 +628,25 @@ mcp.setNotificationHandler(
     // Skip if already aborting from a recent deny
     if (Date.now() - lastDenyAt < DENY_COOLDOWN_MS) return;
 
+    // Auto-allow the bot's own WhatsApp tool calls. These are the
+    // assistant saying its reply / reacting / fetching a message —
+    // exactly what a chat agent is expected to do, and pestering admin
+    // for approval on every reply is the UX version of a smoke alarm
+    // at a BBQ. Bash and other potentially-destructive tools still
+    // require approval. The admin already consented implicitly to
+    // these four by adding the WhatsApp channel in the first place.
+    const toolName = params.tool_name || "";
+    const AUTO_ALLOW_MCP = new Set([
+      "mcp__whatsapp__reply",
+      "mcp__whatsapp__react",
+      "mcp__whatsapp__download_attachment",
+      "mcp__whatsapp__fetch_messages",
+    ]);
+    if (AUTO_ALLOW_MCP.has(toolName)) {
+      log(`auto-allow mcp tool: ${toolName}`);
+      return;
+    }
+
     // Build human-friendly description
     const sender = lastSender ? lastSender.number : "unknown";
     const senderMsg = lastSender ? lastSender.text : "";
