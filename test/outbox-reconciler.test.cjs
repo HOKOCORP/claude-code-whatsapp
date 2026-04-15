@@ -108,6 +108,59 @@ test("delete requires at least one msgId tracked (empty set = not delivered)", (
   assert.equal(action.kind, "wait");
 });
 
+test("quarantine when any msgId is in erroredIds", () => {
+  const action = r.reconcileOutboxFile({
+    sendState: {
+      msgIds: new Set(["A", "B"]),
+      firstSentAt: 500, lastSentAt: 600, attempts: 1,
+    },
+    ackedIds: new Set(),
+    erroredIds: new Set(["B"]),
+    now: 1000, stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+  });
+  assert.equal(action.kind, "quarantine");
+  assert.match(action.reason, /error/);
+});
+
+test("errored beats delivered (both sets match) — quarantine wins", () => {
+  const action = r.reconcileOutboxFile({
+    sendState: {
+      msgIds: new Set(["A"]),
+      firstSentAt: 500, lastSentAt: 600, attempts: 1,
+    },
+    ackedIds: new Set(["A"]),
+    erroredIds: new Set(["A"]),
+    now: 1000, stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+  });
+  assert.equal(action.kind, "quarantine");
+  assert.match(action.reason, /error/);
+});
+
+test("erroredIds entries for other files do not trigger (intersection is empty)", () => {
+  const action = r.reconcileOutboxFile({
+    sendState: {
+      msgIds: new Set(["A"]),
+      firstSentAt: 500, lastSentAt: 600, attempts: 1,
+    },
+    ackedIds: new Set(),
+    erroredIds: new Set(["X", "Y"]),
+    now: 1000, stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+  });
+  assert.equal(action.kind, "wait");
+});
+
+test("erroredIds omitted (undefined) is safe — treated as empty", () => {
+  const action = r.reconcileOutboxFile({
+    sendState: {
+      msgIds: new Set(["A"]),
+      firstSentAt: 500, lastSentAt: 600, attempts: 1,
+    },
+    ackedIds: new Set(["A"]),
+    now: 1000, stalenessMs: 5000, maxAgeMs: 300000, maxRetries: 5,
+  });
+  assert.equal(action.kind, "delete");
+});
+
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
