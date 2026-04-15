@@ -10,9 +10,9 @@
 
 The 2026-04-14 fix stopped silent drops from stale sockets and server-side rejections *before* `messages.update` status 2. But `status >= 2` (SERVER_ACK) only means "WhatsApp servers accepted the frame for relay". Device-level delivery is signalled by `status >= 3` (DELIVERY_ACK, the visible second grey tick).
 
-**Symptom observed today (2026-04-15):** Admin sent "Is there any ways to avoid this?"; gateway received it, bridge dispatched it to Claude, Claude generated a reply, gateway called `sendMessage`, `status=2` arrived, outbox file was unlinked. User never saw the reply. No trace in logs beyond the ack line.
+**Symptom observed today (2026-04-15):** Admin sent "Is there any ways to avoid this?"; user never saw the reply. Today's drop is **not conclusively diagnosed** — it could be (a) SERVER_ACK arrived but DELIVERY_ACK never did (the gap this spec addresses), (b) `status=0` arrived silently and was ignored (secondary gap below), or (c) Claude never produced a reply after auto-compact/respawn (unrelated, upstream of the gateway). The audit log introduced in §5.4 is specifically designed to disambiguate these causes on the *next* occurrence.
 
-**Root cause:** Our "delivered" definition stops one hop short.
+**Root cause of the known gap:** Our "delivered" definition stops one hop short — we unlink on SERVER_ACK, which is "WhatsApp accepted for relay", not "recipient device has it".
 
 **Secondary gap:** `status === 0` (explicit server error, e.g., blocked number, malformed payload) is currently ignored. The reconciler silently retries until `maxRetries=5`, wasting ~25 s of retries on cases that will never succeed.
 
@@ -124,9 +124,11 @@ Writes are synchronous `fs.appendFileSync` — low volume (<10 events per messag
 
 | Knob | Before | After | Reason |
 |---|---|---|---|
-| `stalenessMs` | 5000 | 10000 | DELIVERY_ACK latency is 500 ms – 2 s typical; 5 s too aggressive, triggered false-positive resends on normal network hiccups. 10 s gives 5× typical. |
-| `maxRetries` | 5 | 5 | Unchanged. Over 10 s staleness, 5 retries ≈ 50 s — still caps blast radius when phone offline. |
+| `stalenessMs` | 5000 | 15000 | DELIVERY_ACK latency is 500 ms – 2 s typical; 5 s was too aggressive for the new threshold. 15 s gives 7× typical headroom while still catching real drops fast. |
+| `maxRetries` | 5 | 3 | Blast radius when recipient phone is offline for a minute: 4 total sends (1 initial + 3 retries) over ~45 s → at most 4 visible duplicates when phone returns. Was 6 at 10 s / 5 retries. |
 | `maxAgeMs` | 300000 (5 min) | 300000 | Unchanged. |
+
+**Duplicate budget worked example** (recipient phone offline 60 s, messages all eventually deliver from WhatsApp's queue): initial send at `t=0` gets SERVER_ACK, retries at `t=15/30/45`, quarantine at `t=~60`. Phone returns at `t=60`; up to 4 duplicates land together. The 4th is the quarantined one (WhatsApp may or may not deliver it — quarantine just means we stop *tracking* it, we don't tell WhatsApp to cancel).
 
 ### 5.6 Restart semantics
 
@@ -150,7 +152,7 @@ Unchanged from 2026-04-14 §5.5: on restart `sendState`, `ackedIds`, `erroredIds
 | `status=0` arrives for one msg in a multi-part bundle (text+attachment) | Entire bundle quarantined. Text send wasted but no data loss — file is in `failed/` for manual inspection. |
 | `status=3` arrives out-of-order before `status=2` | Treated normally. `ackedIds.add` fires, file eligible for unlink on next tick. No harm. |
 | Late `status=0` after `status=3` | `sendState` already deleted, `erroredIds.add(id)` is a no-op against reconciler state. Audit log records the oddity. |
-| Phone offline 30 min | After 5 retries × 10 s staleness = ~50 s, quarantine with reason "retries exhausted". When phone returns, any still-queued messages on WhatsApp side deliver; quarantined file can be manually re-sent from `failed/` if needed. |
+| Phone offline 30 min | After 3 retries × 15 s staleness = ~45 s, quarantine with reason "retries exhausted". When phone returns, any still-queued messages on WhatsApp side deliver; quarantined file can be manually re-sent from `failed/` if needed. |
 | `audit.jsonl` write throws (disk full) | `try/catch` around `appendFileSync`; log to gateway stderr once per error. Reconciler continues. |
 | Gateway boots with existing `audit.jsonl` | Appends. No rotation. File size monitored manually for v1. |
 | User reacts to a message before DELIVERY_ACK | Unrelated — reactions are separate events on a different code path. |
@@ -178,6 +180,7 @@ Add:
 - Scenario E — **explicit error**: fake socket emits `status=0` after sendMessage; assert file in `failed/`, audit log has `error` + `quarantine`.
 - Scenario F — **server_ack without delivery_ack**: emit `status=2` only; advance clock past staleness; assert resend; then emit `status=3` for new msgId; assert unlink.
 - Scenario G — **audit log format**: run Scenario A; read `audit.jsonl`; assert schema, event ordering (`send` → `server_ack` → `delivery_ack`).
+- Scenario H — **unattributed ack**: file sent, then unlinked (status=3), then a late `status=0` arrives for the same `msg_id` after `sendState.delete(filename)`; assert an audit line is written with only `ts` + `event: "error"` + `msg_id`, and the reconciler's next tick does *not* observe any new quarantine or resend.
 
 All integration tests continue to use real filesystem + real reconciler + fake socket.
 
