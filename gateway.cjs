@@ -1712,7 +1712,11 @@ async function connectWhatsApp() {
           (botId && quotedParticipant.includes(botId.split(":")[0])) ||
           (botLid && quotedParticipant.includes(botLid.split(":")[0]))
         );
-        if (!mentioned && !prefixed && !containsTrigger && !isReplyToBot) {
+        // Slash commands ("/help", "/usage", …) are self-declaring — no
+        // @ai mention needed. The `/` prefix already says "this is a
+        // command for the bot", matching every major chat product.
+        const isSlashCommand = cleanText.trimStart().startsWith("/");
+        if (!isSlashCommand && !mentioned && !prefixed && !containsTrigger && !isReplyToBot) {
           continue;
         }
       }
