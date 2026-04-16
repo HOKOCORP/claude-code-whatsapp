@@ -1067,10 +1067,15 @@ function spawnUserSession(userId, userJid) {
   // → admin's accounts/*.json (group-readable through ccm-auth).
   //
   // --dangerously-load-development-channels was removed in Claude
-  // 2.1.109 ("ignored" warning). Pass --mcp-config so the WhatsApp
-  // MCP server actually loads.
+  // 2.1.109 ("ignored" warning). Pass --mcp-config pointing at the
+  // per-user .mcp.json that ensureUserConfig() just wrote — that one
+  // routes through bridge.cjs against the per-user inbox/outbox so
+  // each isolated session sees only its own messages. Pointing at the
+  // global /root/.mcp.json (which uses server.cjs against the channel-
+  // wide STATE_DIR) breaks delivery in isolation mode because the
+  // gateway writes inbox JSON under the per-user dir, not STATE_DIR.
   const homeExport = projectUser ? `export HOME="${projectUser.homeDir}"` : "";
-  const mcpConfigPath = process.env.HOME ? path.join(process.env.HOME, ".mcp.json") : path.join(os.homedir(), ".mcp.json");
+  const mcpConfigPath = path.join(launchWorkDir, ".mcp.json");
   const launcherBody = [
     "#!/bin/bash",
     envPreamble,
