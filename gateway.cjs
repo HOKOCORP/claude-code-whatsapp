@@ -1067,13 +1067,17 @@ function spawnUserSession(userId, userJid) {
   // → admin's accounts/*.json (group-readable through ccm-auth).
   //
   // --dangerously-load-development-channels was removed in Claude
-  // 2.1.109 ("ignored" warning). Pass --mcp-config pointing at the
-  // per-user .mcp.json that ensureUserConfig() just wrote — that one
-  // routes through bridge.cjs against the per-user inbox/outbox so
-  // each isolated session sees only its own messages. Pointing at the
-  // global /root/.mcp.json (which uses server.cjs against the channel-
-  // wide STATE_DIR) breaks delivery in isolation mode because the
-  // gateway writes inbox JSON under the per-user dir, not STATE_DIR.
+  // 2.1.109 ("ignored" warning) and replaced by --channels <servers>.
+  // Without that flag, MCP servers can register the experimental
+  // claude/channel capability and mcp.notification("notifications/
+  // claude/channel") will *succeed* — but the cli silently drops the
+  // notification with "Channel notifications skipped: server X not in
+  // --channels list for this session" (visible only in mcp-logs-X
+  // jsonl). Result: bridge thinks delivery worked, no jsonl entry is
+  // ever written, reconciler retries 3x and quarantines.
+  //
+  // Use --mcp-config pointing at the per-user .mcp.json + --channels
+  // whatsapp so the bridge's channel notifications actually land.
   const homeExport = projectUser ? `export HOME="${projectUser.homeDir}"` : "";
   const mcpConfigPath = path.join(launchWorkDir, ".mcp.json");
   const launcherBody = [
@@ -1082,7 +1086,7 @@ function spawnUserSession(userId, userJid) {
     homeExport,
     portExport,
     `cd "${launchWorkDir}"`,
-    `exec cc-watchdog --mcp-config "${mcpConfigPath}" --permission-mode bypassPermissions --allowedTools ${allowedTools}`,
+    `exec cc-watchdog --mcp-config "${mcpConfigPath}" --channels whatsapp --permission-mode bypassPermissions --allowedTools ${allowedTools}`,
   ].filter(Boolean).join("\n") + "\n";
 
   fs.writeFileSync(launcher, launcherBody);
