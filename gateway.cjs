@@ -1086,7 +1086,7 @@ function spawnUserSession(userId, userJid) {
     homeExport,
     portExport,
     `cd "${launchWorkDir}"`,
-    `exec cc-watchdog --mcp-config "${mcpConfigPath}" --channels whatsapp --permission-mode bypassPermissions --allowedTools ${allowedTools}`,
+    `exec cc-watchdog --mcp-config "${mcpConfigPath}" --channels server:whatsapp --permission-mode bypassPermissions --allowedTools ${allowedTools}`,
   ].filter(Boolean).join("\n") + "\n";
 
   fs.writeFileSync(launcher, launcherBody);
