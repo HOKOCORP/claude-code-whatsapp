@@ -668,24 +668,33 @@ function getUserSubdomainUrl(userId) {
   return `https://${entry.subdomain}`;
 }
 
+// Hash displayed in /users for a given userId + meta. Matches what
+// users see so /topup / /rename lookups stay consistent.
+//   - DMs (isolation on): ccm-<12> hex from isolationGetUsername
+//   - Groups and non-isolation: first 12 chars of the userId
+function displayHashFor(uid, meta) {
+  if (!meta?.isGroup && ISOLATION) {
+    return isolationGetUsername(uid).replace(/^ccm-/, "");
+  }
+  return uid.slice(0, 12);
+}
+
 // Resolve a hash prefix (or full ccm-XXXXX form) to a userId by scanning
-// USERS_DIR. Returns { userId, username } or null.
+// USERS_DIR. Returns { userId, username, isGroup } or null. Groups are
+// included so admin can /topup or /rename them too.
 function findUserByHashPrefix(hashPrefix) {
-  if (!ISOLATION) return null;
   const needle = String(hashPrefix || "").trim().replace(/^ccm-/i, "").toLowerCase();
   if (needle.length < 4) return null;
   let entries;
   try { entries = fs.readdirSync(USERS_DIR); } catch { return null; }
   const matches = [];
   for (const uid of entries) {
-    try {
-      const meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8"));
-      if (meta.isGroup) continue;
-    } catch { continue; }
-    const username = isolationGetUsername(uid);
-    const hash = username.replace(/^ccm-/, "");
+    let meta;
+    try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8")); } catch { continue; }
+    const hash = displayHashFor(uid, meta);
     if (hash.toLowerCase().startsWith(needle)) {
-      matches.push({ userId: uid, username });
+      const username = meta.isGroup ? null : (ISOLATION ? isolationGetUsername(uid) : null);
+      matches.push({ userId: uid, username, isGroup: !!meta.isGroup });
     }
   }
   if (matches.length === 1) return matches[0];
@@ -722,20 +731,26 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
       if (ownNumber && uid === ownNumber) continue;
       let meta = {};
       try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8")); } catch { continue; }
-      if (meta.isGroup) continue;
-      const username = ISOLATION ? isolationGetUsername(uid) : null;
-      const hash = username ? username.replace(/^ccm-/, "") : uid.slice(0, 12);
+      const isGroup = !!meta.isGroup;
+      // Groups have their own wallet keyed by the group JID — show them
+      // so admin can /topup them. No Linux account, so the hash is
+      // derived from the userId prefix rather than isolationGetUsername().
+      const hash = displayHashFor(uid, meta);
       const name = meta.name || meta.pushName || formatJid(meta.jid || uid);
-      const isAdminRow = adminJid && (meta.jid === adminJid || toJid(adminJid) === meta.jid);
+      const isAdminRow = !isGroup && adminJid && (meta.jid === adminJid || toJid(adminJid) === meta.jid);
       const u = loadUserUsage(uid);
       const lastSeen = meta.lastSeen ? meta.lastSeen.slice(0, 10) : "—";
-      rows.push({ hash, name, isAdmin: isAdminRow, balance: u.balance || 0, lastSeen });
+      rows.push({ hash, name, isAdmin: isAdminRow, isGroup, balance: u.balance || 0, lastSeen });
     }
-    rows.sort((a, b) => Number(b.isAdmin) - Number(a.isAdmin) || a.name.localeCompare(b.name));
+    rows.sort((a, b) =>
+      Number(b.isAdmin) - Number(a.isAdmin)
+      || Number(a.isGroup) - Number(b.isGroup)  // users above groups
+      || a.name.localeCompare(b.name)
+    );
     const lines = [`👥 *Users* (${rows.length})`, ""];
     if (rows.length === 0) lines.push("No users yet — share an /invite link.");
     for (const r of rows) {
-      const badge = r.isAdmin ? " 👑" : "";
+      const badge = r.isAdmin ? " 👑" : (r.isGroup ? " 👥" : "");
       const balText = r.isAdmin ? "unlimited (admin)" : `$${r.balance.toFixed(2)}`;
       lines.push(`\`${r.hash}\` · ${r.name}${badge}`);
       lines.push(`  bal ${balText} · last ${r.lastSeen}`);
@@ -759,8 +774,9 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
     try { meta = JSON.parse(fs.readFileSync(metaFile, "utf8")); } catch {}
     meta.name = newName;
     fs.writeFileSync(metaFile, JSON.stringify(meta, null, 2) + "\n");
-    log(`renamed ${target.username} -> ${newName} by ${formatJid(jid)}`);
-    try { await sock.sendMessage(jid, { text: `✅ \`${target.username.replace(/^ccm-/, "")}\` is now *${newName}*.` }); } catch {}
+    const labelHash = target.username ? target.username.replace(/^ccm-/, "") : target.userId.slice(0, 12);
+    log(`renamed ${target.username || target.userId} -> ${newName} by ${formatJid(jid)}`);
+    try { await sock.sendMessage(jid, { text: `✅ \`${labelHash}\` is now *${newName}*.` }); } catch {}
     return true;
   }
 
@@ -783,11 +799,12 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
     u.history = u.history || [];
     u.history.push({ date: todayKey(), action: "topup", amount, note: "admin top-up" });
     saveUserUsage(target.userId, u);
-    log(`topup +$${amount.toFixed(2)} -> ${target.username} by ${formatJid(jid)} (new balance $${u.balance.toFixed(2)})`);
+    log(`topup +$${amount.toFixed(2)} -> ${target.username || target.userId} by ${formatJid(jid)} (new balance $${u.balance.toFixed(2)})`);
     try {
       let meta = {}; try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, target.userId, "meta.json"), "utf8")); } catch {}
       const displayName = meta.name || meta.pushName || formatJid(meta.jid || target.userId);
-      await sock.sendMessage(jid, { text: `✅ Topped up *${displayName}* with $${amount.toFixed(2)} — new balance $${u.balance.toFixed(2)}.` });
+      const kind = target.isGroup ? "group" : "user";
+      await sock.sendMessage(jid, { text: `✅ Topped up ${kind} *${displayName}* with $${amount.toFixed(2)} — new balance $${u.balance.toFixed(2)}.` });
     } catch {}
     return true;
   }
