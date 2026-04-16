@@ -1696,6 +1696,8 @@ async function connectWhatsApp() {
           userWorkDir.replace(/\//g, "-").replace(/-\./g, "."),
         ].map(slug => path.join(projectUserHome, ".claude", "projects", slug));
         const sessionName = getUserSessionName(userId);
+        const slashAdmin = loadAdmin();
+        const slashIsAdmin = slashAdmin && (slashAdmin.jid === jid || toJid(slashAdmin.jid) === jid);
         const handled = await channelSlash.handleChannelSlashCommand({
           userId,
           text,
@@ -1705,6 +1707,7 @@ async function connectWhatsApp() {
           },
           tmux: tmuxHelper,
           paths: { projectDirCandidates, sessionName },
+          isAdmin: slashIsAdmin,
         });
         if (handled) continue;
       }
@@ -1713,8 +1716,21 @@ async function connectWhatsApp() {
       if (text && text.trim().toLowerCase() === "/domain") {
         const url = getUserSubdomainUrl(userId);
         const reply = url
-          ? `🌐 Your project URL: ${url}\n\nBind your dev server to \`$PORT\` (already exported in your shell) and Claude can run it on this URL.`
+          ? `🌐 Your project URL: ${url}\n\nBind your dev server to \`$PORT\` (already exported in your shell) and I can run it on this URL.`
           : "🌐 No subdomain assigned yet — you don't have an isolated project space on this server.";
+        try { await sock.sendMessage(jid, { text: reply }); } catch {}
+        continue;
+      }
+
+      // /topup (bare) — user-facing credits message. Admin with this bare
+      // form gets a usage hint instead; /topup HASH USD for actual admin
+      // top-up is handled earlier in handleAdminUserCommands.
+      if (text && text.trim().toLowerCase() === "/topup") {
+        const topupAdmin = loadAdmin();
+        const topupIsAdmin = topupAdmin && (topupAdmin.jid === jid || toJid(topupAdmin.jid) === jid);
+        const reply = topupIsAdmin
+          ? "💰 Admin top-up usage: `/topup HASH USD` — see /users for hashes.\n\n(Bare /topup from a non-admin user shows the beta credit-request message.)"
+          : "💰 HOKO Coder is in beta.\n\nPlease contact the admin if you need more API credits.";
         try { await sock.sendMessage(jid, { text: reply }); } catch {}
         continue;
       }
