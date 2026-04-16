@@ -1057,12 +1057,27 @@ function spawnUserSession(userId, userJid) {
     portExport = `export PORT=${projectUser.port}`;
   }
 
+  // sudo -u <user> bash <launcher> doesn't reset HOME by default —
+  // it stays as root's $HOME, which makes claude look for credentials
+  // at /root/.claude/.credentials.json instead of the project user's
+  // own home. Even though the symlink would chain through to admin's
+  // creds, claude's interactive flow gives up and falls back to OAuth
+  // when HOME-relative discovery fails. Set HOME explicitly so claude
+  // resolves creds via its own user's home → .credentials.json symlink
+  // → admin's accounts/*.json (group-readable through ccm-auth).
+  //
+  // --dangerously-load-development-channels was removed in Claude
+  // 2.1.109 ("ignored" warning). Pass --mcp-config so the WhatsApp
+  // MCP server actually loads.
+  const homeExport = projectUser ? `export HOME="${projectUser.homeDir}"` : "";
+  const mcpConfigPath = process.env.HOME ? path.join(process.env.HOME, ".mcp.json") : path.join(os.homedir(), ".mcp.json");
   const launcherBody = [
     "#!/bin/bash",
     envPreamble,
+    homeExport,
     portExport,
     `cd "${launchWorkDir}"`,
-    `exec cc-watchdog --dangerously-load-development-channels "server:whatsapp" --permission-mode bypassPermissions --allowedTools ${allowedTools}`,
+    `exec cc-watchdog --mcp-config "${mcpConfigPath}" --permission-mode bypassPermissions --allowedTools ${allowedTools}`,
   ].filter(Boolean).join("\n") + "\n";
 
   fs.writeFileSync(launcher, launcherBody);
