@@ -594,6 +594,36 @@ async function handleInviteCommands({ sock, msg, jid }) {
   return false;
 }
 
+// Grant the admin's isolated ccm user read access to /root/.env so
+// their claude session inherits GITHUB_TOKEN / CF_TOKEN / etc from
+// ccm Settings. Uses a POSIX ACL so /root/.env stays 600 root:root
+// — only this specific ccm user gets an extra read ACE, no new group.
+// Plus a symlink in the user's home so cc-watchdog's "source
+// ~/.env" line picks up the live file (updates via ccm Settings
+// propagate to new sessions without a copy step).
+function grantAdminEnvAccess(username, homeDir) {
+  const rootEnv = path.join(os.homedir(), ".env");
+  if (!fs.existsSync(rootEnv)) return;
+  try {
+    execFileSync("setfacl", ["-m", `u:${username}:r`, rootEnv]);
+  } catch (e) {
+    log(`setfacl on ~/.env failed for ${username}: ${e.message}`);
+    return;
+  }
+  const userEnv = path.join(homeDir, ".env");
+  try {
+    // Remove stale file/symlink before re-linking so this is idempotent.
+    const st = fs.lstatSync(userEnv);
+    if (st.isSymbolicLink() || st.isFile()) fs.unlinkSync(userEnv);
+  } catch {}
+  try {
+    fs.symlinkSync(rootEnv, userEnv);
+    execFileSync("chown", ["-h", `${username}:${username}`, userEnv]);
+  } catch (e) {
+    log(`~/.env symlink failed for ${username}: ${e.message}`);
+  }
+}
+
 // In-group admin commands — enable/disable the bot for a group and
 // configure its trigger word, without needing SSH or DM'ing a JID in.
 // Must be invoked BEFORE isAllowed() so the very first /enable-group in
@@ -881,6 +911,14 @@ function ensureProjectUser(userId, userJid) {
         port = undefined;
       }
     }
+    // If this user is the admin, (re-)apply the /root/.env ACL +
+    // symlink so tokens are available. Idempotent; safe on re-entry
+    // (e.g. ccm-install added the user before an admin was set, and
+    // the admin is now set).
+    const _adminCheck = loadAdmin();
+    if (_adminCheck && (_adminCheck.jid === userJid || toJid(_adminCheck.jid) === userJid)) {
+      grantAdminEnvAccess(username, homeDir);
+    }
     return { username, homeDir, port };
   } catch {
     // User does not exist — create below
@@ -1039,6 +1077,13 @@ function ensureProjectUser(userId, userJid) {
 
   fs.mkdirSync(path.dirname(ISOLATION_MAP), { recursive: true });
   fs.writeFileSync(ISOLATION_MAP, JSON.stringify(mapping, null, 2));
+
+  // If this user is the admin, grant /root/.env access (ACL + symlink)
+  // so claude sessions inherit GITHUB_TOKEN etc from ccm Settings.
+  const _adminCheck2 = loadAdmin();
+  if (_adminCheck2 && (_adminCheck2.jid === userJid || toJid(_adminCheck2.jid) === userJid)) {
+    grantAdminEnvAccess(username, homeDir);
+  }
 
   return { username, homeDir, port: mapping[username].port };
 }
