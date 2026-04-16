@@ -23,6 +23,7 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const channelSlash = require("./lib/channel-slash.cjs");
+const invites = require("./lib/invites.cjs");
 const tmuxHelper = require("./lib/tmux.cjs");
 const outboxReconciler = require("./lib/outbox-reconciler.cjs");
 const { dispatchAck } = require("./lib/ack-dispatcher.cjs");
@@ -506,6 +507,60 @@ function extractMediaInfo(msg) {
 }
 function mimeToExt(m) { return { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif", "video/mp4": "mp4", "audio/ogg; codecs=opus": "ogg", "audio/ogg": "ogg", "audio/mpeg": "mp3", "audio/mp4": "m4a", "application/pdf": "pdf" }[m] || "bin"; }
 function formatJid(jid) { return jid.replace(/@s\.whatsapp\.net$/, "").replace(/@g\.us$/, "").replace(/@lid$/, "").replace(/:\d+$/, ""); }
+
+async function handleInviteCommands({ sock, msg, jid }) {
+  const rawText = extractText(msg.message || {}).trim();
+  const lower = rawText.toLowerCase();
+
+  if (lower === "/invite") {
+    const adminCheck = loadAdmin();
+    const isAdminUser = adminCheck && (adminCheck.jid === jid || toJid(adminCheck.jid) === jid);
+    if (!isAdminUser) {
+      try { await sock.sendMessage(jid, { text: "🚫 /invite is admin-only." }); } catch {}
+      return true;
+    }
+    const invite = invites.createInvite(STATE_DIR, jid);
+    const expiry = new Date(invite.expires_at).toISOString().split("T")[0];
+    const link = `https://wa.me/${PHONE}?text=${encodeURIComponent(`/redeem ${invite.code}`)}`;
+    const text = [
+      "🎟️ *Invite created*",
+      "",
+      `Code: \`${invite.code}\` (single-use, expires ${expiry})`,
+      "",
+      "Forward this link — recipient taps it and sends the prefilled message:",
+      link,
+    ].join("\n");
+    try { await sock.sendMessage(jid, { text }); } catch (e) { log(`/invite reply failed: ${e}`); }
+    log(`invite created: ${invite.code} by ${formatJid(jid)}`);
+    try { await sock.readMessages([msg.key]); } catch {}
+    return true;
+  }
+
+  const redeemMatch = /^\/redeem\s+(\S+)\s*$/i.exec(rawText);
+  if (redeemMatch) {
+    try { await sock.readMessages([msg.key]); } catch {}
+    const result = invites.redeemInvite(STATE_DIR, redeemMatch[1], jid);
+    if (!result.ok) {
+      const reasonText = {
+        missing_code: "Code missing — usage: `/redeem CODE`.",
+        unknown: "Invite code not recognised.",
+        expired: "That invite expired. Ask the admin for a fresh one.",
+        already_used: "That invite has already been redeemed.",
+      }[result.reason] || "Invite couldn't be redeemed.";
+      try { await sock.sendMessage(jid, { text: `❌ ${reasonText}` }); } catch {}
+      log(`invite redeem failed (${result.reason}): ${formatJid(jid)} tried ${redeemMatch[1]}`);
+      return true;
+    }
+    addToWhitelist(jid);
+    try {
+      await sock.sendMessage(jid, { text: "✅ You're in! Send me a message to get started." });
+    } catch (e) { log(`/redeem welcome failed: ${e}`); }
+    log(`invite redeemed: ${result.invite.code} by ${formatJid(jid)}`);
+    return true;
+  }
+
+  return false;
+}
 
 // ── Caches ──────────────────────────────────────────────────────────
 
@@ -1314,6 +1369,14 @@ async function connectWhatsApp() {
         gm.jid = jid; gm.isGroup = true; gm.lastSeen = new Date().toISOString();
         if (!gm.name) { try { const gInfo = await sock.groupMetadata(jid); if (gInfo?.subject) gm.name = gInfo.subject; } catch {} }
         fs.writeFileSync(gMeta, JSON.stringify(gm, null, 2) + "\n");
+      }
+
+      // /invite + /redeem — must run BEFORE the whitelist gate so a user
+      // who isn't on the whitelist yet can redeem their way in. DM-only
+      // (group invites would leak the code on a single screen).
+      if (!jid.endsWith("@g.us")) {
+        const inviteHandled = await handleInviteCommands({ sock, msg, jid });
+        if (inviteHandled) continue;
       }
 
       if (!isAllowed(jid, participant || undefined)) continue;
