@@ -525,7 +525,7 @@ async function handleInviteCommands({ sock, msg, jid }) {
     const expiry = new Date(invite.expires_at).toISOString().split("T")[0];
     const link = `https://wa.me/${PHONE}?text=${encodeURIComponent(`/redeem ${invite.code}`)}`;
     // Reply IS the forwardable invite — admin long-presses + forwards as-is.
-    const lines = ["👋 You've been invited to a Claude Code WhatsApp agent.", ""];
+    const lines = ["👋 You've been invited to HOKO Coder — your personal coding agent on WhatsApp.", ""];
     if (preFundUsd > 0) lines.push(`💰 Includes $${preFundUsd.toFixed(2)} of credit.`, "");
     lines.push(`Tap below to accept (single-use, expires ${expiry}):`, link);
     try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch (e) { log(`/invite reply failed: ${e}`); }
@@ -573,7 +573,7 @@ async function handleInviteCommands({ sock, msg, jid }) {
       const lines = [
         "👋 *Welcome to HOKO Coder*",
         "",
-        "I'm your personal Claude Code agent on WhatsApp — describe what you want to build and I'll go.",
+        "I'm your personal coding agent on WhatsApp — describe what you want to build and I'll go.",
         "",
       ];
       if (preFund > 0) lines.push(`💰 Starting balance: $${preFund.toFixed(2)}`, "");
