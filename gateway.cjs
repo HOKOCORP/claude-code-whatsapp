@@ -1066,18 +1066,20 @@ function spawnUserSession(userId, userJid) {
   // resolves creds via its own user's home → .credentials.json symlink
   // → admin's accounts/*.json (group-readable through ccm-auth).
   //
-  // --dangerously-load-development-channels was removed in Claude
-  // 2.1.109 ("ignored" warning) and replaced by --channels <servers>.
-  // Without that flag, MCP servers can register the experimental
-  // claude/channel capability and mcp.notification("notifications/
-  // claude/channel") will *succeed* — but the cli silently drops the
-  // notification with "Channel notifications skipped: server X not in
-  // --channels list for this session" (visible only in mcp-logs-X
-  // jsonl). Result: bridge thinks delivery worked, no jsonl entry is
-  // ever written, reconciler retries 3x and quarantines.
+  // Channel routing in 2.1.109 has two flags:
+  //   --channels <server:NAME>                       — for plugins on
+  //     the approved channels allowlist (managed-settings only)
+  //   --dangerously-load-development-channels <...>  — escape hatch
+  //     for self-hosted MCP servers that aren't on the allowlist
   //
-  // Use --mcp-config pointing at the per-user .mcp.json + --channels
-  // whatsapp so the bridge's channel notifications actually land.
+  // Our whatsapp bridge is the latter (self-hosted), so we MUST use
+  // the dangerously-load form. Without channel routing, the bridge's
+  // mcp.notification("notifications/claude/channel") *resolves
+  // cleanly* but cli silently drops the payload — visible only in
+  // mcp-logs-whatsapp/*.jsonl as "Channel notifications skipped:
+  // server whatsapp is not on the approved channels allowlist (use
+  // --dangerously-load-development-channels for local dev)". The
+  // reconciler then retries 3x and quarantines every message.
   const homeExport = projectUser ? `export HOME="${projectUser.homeDir}"` : "";
   const mcpConfigPath = path.join(launchWorkDir, ".mcp.json");
   const launcherBody = [
@@ -1086,7 +1088,7 @@ function spawnUserSession(userId, userJid) {
     homeExport,
     portExport,
     `cd "${launchWorkDir}"`,
-    `exec cc-watchdog --mcp-config "${mcpConfigPath}" --channels server:whatsapp --permission-mode bypassPermissions --allowedTools ${allowedTools}`,
+    `exec cc-watchdog --mcp-config "${mcpConfigPath}" --dangerously-load-development-channels server:whatsapp --permission-mode bypassPermissions --allowedTools ${allowedTools}`,
   ].filter(Boolean).join("\n") + "\n";
 
   fs.writeFileSync(launcher, launcherBody);
