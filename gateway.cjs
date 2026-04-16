@@ -918,6 +918,17 @@ function ensureProjectUser(userId, userJid) {
   // reaches a usable prompt. Keep in sync with isolation.sh.
   const claudeJsonPath = path.join(homeDir, ".claude.json");
   const workspaceDir = path.join(homeDir, "workspace");
+  // Copy cachedGrowthBookFeatures from admin — these include
+  // tengu_harbor which gates the "channels feature" (i.e. whether MCP
+  // notifications/claude/channel is allowed at all). Without it the
+  // spawned claude sees NP6()=false and marks channels "disabled",
+  // dropping all inbound WhatsApp messages on the floor — which looks
+  // to the user like "bot never responds in the group".
+  let cachedGB = {};
+  try {
+    const adminClaudeJson = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".claude.json"), "utf8"));
+    cachedGB = adminClaudeJson.cachedGrowthBookFeatures || {};
+  } catch {}
   const claudeJson = {
     numStartups: 1,
     firstStartTime: new Date().toISOString(),
@@ -925,6 +936,7 @@ function ensureProjectUser(userId, userJid) {
     bypassPermissionsModeAccepted: true,
     effortCalloutV2Dismissed: true,
     hasVisitedPasses: true,
+    cachedGrowthBookFeatures: cachedGB,
     projects: {
       [workspaceDir]: {
         allowedTools: [],
