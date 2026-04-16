@@ -105,10 +105,17 @@ const inboxPoll = setInterval(processInbox, 1000);
 
 // ── Outbox helper ───────────────────────────────────────────────────
 
+let _outboxSeq = 0;
 function writeOutbox(data) {
+  // Two writeOutbox calls within the same millisecond used to collide:
+  // second rename atomically overwrote the first, silently dropping a
+  // message. Typical pattern — a reply action fires writeOutbox twice
+  // in quick succession (typing_stop + reply). Append a monotonically
+  // increasing sequence so filenames are always unique.
   const ts = Date.now();
-  const tmp = path.join(OUTBOX_DIR, `.${ts}.tmp`);
-  const final = path.join(OUTBOX_DIR, `${ts}.json`);
+  const seq = (++_outboxSeq).toString().padStart(4, "0");
+  const tmp = path.join(OUTBOX_DIR, `.${ts}-${seq}.tmp`);
+  const final = path.join(OUTBOX_DIR, `${ts}-${seq}.json`);
   fs.writeFileSync(tmp, JSON.stringify(data));
   fs.renameSync(tmp, final);
 }
