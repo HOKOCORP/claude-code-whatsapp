@@ -558,7 +558,7 @@ async function handleInviteCommands({ sock, msg, jid }) {
       u.balance = (u.balance || 0) + preFund;
       u.total_added = (u.total_added || 0) + preFund;
       u.history = u.history || [];
-      u.history.push({ date: todayKey(), action: "topup", amount: preFund, note: `invite from ${formatJid(result.invite.created_by_jid)}` });
+      u.history.push({ date: todayKey(), action: "topup", amount: preFund, note: "invite from admin" });
       saveUserUsage(redeemerUserId, u);
     }
     // Subdomain isn't provisioned until first spawn (ensureProjectUser
@@ -715,7 +715,7 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
     u.balance = (u.balance || 0) + amount;
     u.total_added = (u.total_added || 0) + amount;
     u.history = u.history || [];
-    u.history.push({ date: todayKey(), action: "topup", amount, note: `admin top-up by ${formatJid(jid)}` });
+    u.history.push({ date: todayKey(), action: "topup", amount, note: "admin top-up" });
     saveUserUsage(target.userId, u);
     log(`topup +$${amount.toFixed(2)} -> ${target.username} by ${formatJid(jid)} (new balance $${u.balance.toFixed(2)})`);
     try {
