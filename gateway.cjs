@@ -634,7 +634,8 @@ async function handleGroupAdminCommands({ sock, msg, jid, participant }) {
   const lower = rawText.toLowerCase();
   const match = lower === "/enable-group"
              || lower === "/disable-group"
-             || /^\/trigger\s+\S+/i.test(rawText);
+             || /^\/trigger\s+\S+/i.test(rawText)
+             || /^\/group-token(\s|$)/i.test(rawText);
   if (!match) return false;
 
   const senderJid = participant || "";
@@ -684,6 +685,93 @@ async function handleGroupAdminCommands({ sock, msg, jid, participant }) {
     persist();
     try { await sock.sendMessage(jid, { text: `✅ Trigger set to *${newTrigger}*. Mention it in any enabled group to summon me.` }); } catch {}
     log(`trigger changed to "${newTrigger}" by ${formatJid(senderJid)}`);
+    return true;
+  }
+
+  // /group-token — per-group env vars. Kept separate from /root/.env so
+  // regular group members can't exfiltrate admin-wide tokens. Admin sets
+  // specific tokens per group; the launcher for that group exports only
+  // those. Storage: <groupUserDir>/env (line-based KEY=VALUE).
+  if (/^\/group-token(\s|$)/i.test(rawText)) {
+    const groupUserId = sanitizeUserId(jid);
+    const groupUserDir = path.join(USERS_DIR, groupUserId);
+    const envFile = path.join(groupUserDir, "env");
+    fs.mkdirSync(groupUserDir, { recursive: true });
+
+    const parseEnv = () => {
+      const out = {};
+      try {
+        for (const line of fs.readFileSync(envFile, "utf8").split("\n")) {
+          const m = /^([A-Z_][A-Z0-9_]*)=(.*)$/.exec(line);
+          if (m) out[m[1]] = m[2];
+        }
+      } catch {}
+      return out;
+    };
+    const writeEnv = (obj) => {
+      const body = Object.keys(obj).sort().map((k) => `${k}=${obj[k]}`).join("\n") + (Object.keys(obj).length ? "\n" : "");
+      fs.writeFileSync(envFile, body);
+      try { fs.chmodSync(envFile, 0o640); } catch {}
+      if (ISOLATION) {
+        const gUser = isolationGetUsername(groupUserId);
+        try { execFileSync("chown", [`${gUser}:ccm-gw`, envFile]); } catch {}
+      }
+    };
+
+    const body = rawText.replace(/^\/group-token\s*/i, "").trim();
+
+    if (body === "" || /^list$/i.test(body)) {
+      const env = parseEnv();
+      const keys = Object.keys(env).sort();
+      const lines = keys.length
+        ? ["🔐 Group tokens:", ...keys.map((k) => `• ${k}  (${env[k].length} chars)`)]
+        : ["🔐 No group tokens set yet.", "", "Set one: /group-token KEY=VALUE"];
+      try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
+      return true;
+    }
+
+    const unsetMatch = /^unset\s+([A-Z_][A-Z0-9_]*)\s*$/i.exec(body);
+    if (unsetMatch) {
+      const key = unsetMatch[1].toUpperCase();
+      const env = parseEnv();
+      if (env[key] == null) {
+        try { await sock.sendMessage(jid, { text: `❌ ${key} isn't set for this group.` }); } catch {}
+        return true;
+      }
+      delete env[key];
+      writeEnv(env);
+      log(`group-token unset ${key} in ${jid} by ${formatJid(senderJid)}`);
+      try { await sock.sendMessage(jid, { text: `✅ Unset ${key}. Restart spawn by messaging the bot to pick up the change.` }); } catch {}
+      return true;
+    }
+
+    const setMatch = /^([A-Z_][A-Z0-9_]*)\s*=\s*(.+)$/i.exec(body);
+    if (setMatch) {
+      const key = setMatch[1].toUpperCase();
+      const value = setMatch[2];
+      if (value.length > 4096) {
+        try { await sock.sendMessage(jid, { text: "❌ Value too long (max 4096 chars)." }); } catch {}
+        return true;
+      }
+      const env = parseEnv();
+      env[key] = value;
+      writeEnv(env);
+      log(`group-token set ${key} in ${jid} by ${formatJid(senderJid)}`);
+      // Delete the original message so the raw token doesn't sit in the
+      // group chat history. Best-effort — only works if we're admin.
+      try { await sock.sendMessage(jid, { delete: msg.key }); } catch {}
+      try { await sock.sendMessage(jid, { text: `✅ Set ${key} for this group (${value.length} chars). I tried to delete your original message so the raw value isn't in chat history — check that it's gone.` }); } catch {}
+      return true;
+    }
+
+    try {
+      await sock.sendMessage(jid, { text:
+        "Usage:\n"
+        + "/group-token KEY=VALUE   set a token\n"
+        + "/group-token unset KEY   remove a token\n"
+        + "/group-token list        show current tokens"
+      });
+    } catch {}
     return true;
   }
 
@@ -1488,11 +1576,23 @@ function spawnUserSession(userId, userJid) {
   // reconciler then retries 3x and quarantines every message.
   const homeExport = projectUser ? `export HOME="${projectUser.homeDir}"` : "";
   const mcpConfigPath = path.join(launchWorkDir, ".mcp.json");
+  // Group sessions get their own env file set via /group-token. Source
+  // it BEFORE cc-watchdog so claude inherits the per-group tokens, but
+  // AFTER homeExport so the env file path resolves correctly. Not
+  // exposed for non-group users — they either use /root/.env (admin)
+  // or get no tokens.
+  const groupEnvFile = userJid.endsWith("@g.us")
+    ? path.join(USERS_DIR, sanitizeUserId(userJid), "env")
+    : null;
+  const groupEnvSource = groupEnvFile
+    ? `if [ -r "${groupEnvFile}" ]; then set -a; . "${groupEnvFile}"; set +a; fi`
+    : "";
   const launcherBody = [
     "#!/bin/bash",
     envPreamble,
     homeExport,
     portExport,
+    groupEnvSource,
     `cd "${launchWorkDir}"`,
     `exec cc-watchdog --mcp-config "${mcpConfigPath}" --dangerously-load-development-channels server:whatsapp --permission-mode bypassPermissions --allowedTools ${allowedTools}`,
   ].filter(Boolean).join("\n") + "\n";
