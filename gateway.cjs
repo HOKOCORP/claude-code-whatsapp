@@ -619,24 +619,32 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
   if (lower === "/users") {
     let entries;
     try { entries = fs.readdirSync(USERS_DIR); } catch { entries = []; }
+    const adminJid = adminCheck?.jid;
+    // The bot's own phone shows up as a "user" if anything ever DMed it
+    // from itself — filter it out, it's never a real user.
+    const ownNumber = String(PHONE || "");
     const rows = [];
     for (const uid of entries) {
+      if (ownNumber && uid === ownNumber) continue;
       let meta = {};
       try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8")); } catch { continue; }
       if (meta.isGroup) continue;
       const username = ISOLATION ? isolationGetUsername(uid) : null;
       const hash = username ? username.replace(/^ccm-/, "") : uid.slice(0, 12);
       const name = meta.name || meta.pushName || formatJid(meta.jid || uid);
+      const isAdminRow = adminJid && (meta.jid === adminJid || toJid(adminJid) === meta.jid);
       const u = loadUserUsage(uid);
       const lastSeen = meta.lastSeen ? meta.lastSeen.slice(0, 10) : "—";
-      rows.push({ hash, name, balance: u.balance || 0, lastSeen });
+      rows.push({ hash, name, isAdmin: isAdminRow, balance: u.balance || 0, lastSeen });
     }
-    rows.sort((a, b) => a.name.localeCompare(b.name));
+    rows.sort((a, b) => Number(b.isAdmin) - Number(a.isAdmin) || a.name.localeCompare(b.name));
     const lines = [`👥 *Users* (${rows.length})`, ""];
     if (rows.length === 0) lines.push("No users yet — share an /invite link.");
     for (const r of rows) {
-      lines.push(`\`${r.hash}\` · ${r.name}`);
-      lines.push(`  bal $${r.balance.toFixed(2)} · last ${r.lastSeen}`);
+      const badge = r.isAdmin ? " 👑" : "";
+      const balText = r.isAdmin ? "unlimited (admin)" : `$${r.balance.toFixed(2)}`;
+      lines.push(`\`${r.hash}\` · ${r.name}${badge}`);
+      lines.push(`  bal ${balText} · last ${r.lastSeen}`);
     }
     try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch (e) { log(`/users reply failed: ${e}`); }
     try { await sock.readMessages([msg.key]); } catch {}
