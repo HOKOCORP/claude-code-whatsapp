@@ -522,12 +522,11 @@ async function handleInviteCommands({ sock, msg, jid }) {
     const invite = invites.createInvite(STATE_DIR, jid);
     const expiry = new Date(invite.expires_at).toISOString().split("T")[0];
     const link = `https://wa.me/${PHONE}?text=${encodeURIComponent(`/redeem ${invite.code}`)}`;
+    // Reply IS the forwardable invite — admin long-presses + forwards as-is.
     const text = [
-      "🎟️ *Invite created*",
+      "👋 You've been invited to a Claude Code WhatsApp agent.",
       "",
-      `Code: \`${invite.code}\` (single-use, expires ${expiry})`,
-      "",
-      "Forward this link — recipient taps it and sends the prefilled message:",
+      `Tap below to accept (single-use, expires ${expiry}):`,
       link,
     ].join("\n");
     try { await sock.sendMessage(jid, { text }); } catch (e) { log(`/invite reply failed: ${e}`); }
