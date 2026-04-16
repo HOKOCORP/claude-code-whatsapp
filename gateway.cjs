@@ -441,7 +441,13 @@ async function ensureQuotaScrapeSession() {
             "new-session", "-d",
             "-s", QUOTA_SCRAPE_SESSION,
             "-c", QUOTA_SCRAPE_WORKDIR,
-            "claude --dangerously-skip-permissions",
+            // Claude Code 2.1.110 refuses --dangerously-skip-permissions
+            // and --permission-mode bypassPermissions when the process
+            // runs as root/sudo. Our quota scraper only sends "/status"
+            // into a read-only dialog — no tool execution happens, so
+            // no permission flag is needed at all. Just start plain
+            // claude; tmux will attach a PTY and the scraper drives it.
+            "claude",
           ],
           (err) => (err ? reject(err) : resolve()),
         );
