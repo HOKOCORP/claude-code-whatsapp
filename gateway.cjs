@@ -550,28 +550,56 @@ async function handleInviteCommands({ sock, msg, jid }) {
       return true;
     }
     addToWhitelist(jid);
+    const redeemerUserId = sanitizeUserId(jid);
     // Apply pre-fund credit (if any) to redeemer's balance + log to audit.
     const preFund = Number(result.invite.pre_fund_usd) || 0;
     if (preFund > 0) {
-      const userId = sanitizeUserId(jid);
-      const u = loadUserUsage(userId);
+      const u = loadUserUsage(redeemerUserId);
       u.balance = (u.balance || 0) + preFund;
       u.total_added = (u.total_added || 0) + preFund;
       u.history = u.history || [];
       u.history.push({ date: todayKey(), action: "topup", amount: preFund, note: `invite from ${formatJid(result.invite.created_by_jid)}` });
-      saveUserUsage(userId, u);
+      saveUserUsage(redeemerUserId, u);
+    }
+    // Subdomain isn't provisioned until first spawn (ensureProjectUser
+    // runs domainsProvision then). Predict the URL deterministically
+    // from the same hash inputs so the welcome message can include it.
+    let subdomainNote = "";
+    if (ISOLATION && process.env.DOMAIN_ROOT) {
+      const hash = isolationHash(path.basename(STATE_DIR), redeemerUserId);
+      subdomainNote = `🌐 Your project will be hosted at: https://${hash}.${process.env.DOMAIN_ROOT}\n\n`;
     }
     try {
-      const welcome = preFund > 0
-        ? `✅ You're in! Starting balance: $${preFund.toFixed(2)}. Send me a message to get going.`
-        : "✅ You're in! Send me a message to get started.";
-      await sock.sendMessage(jid, { text: welcome });
+      const lines = [
+        "👋 *Welcome to HOKO Coder*",
+        "",
+        "I'm your personal Claude Code agent on WhatsApp — describe what you want to build and I'll go.",
+        "",
+      ];
+      if (preFund > 0) lines.push(`💰 Starting balance: $${preFund.toFixed(2)}`, "");
+      if (subdomainNote) lines.push(subdomainNote.trimEnd());
+      lines.push("Send `/help` to see all commands. Then send me your first message to get started.");
+      await sock.sendMessage(jid, { text: lines.join("\n") });
     } catch (e) { log(`/redeem welcome failed: ${e}`); }
     log(`invite redeemed: ${result.invite.code}${preFund > 0 ? ` (+$${preFund.toFixed(2)})` : ""} by ${formatJid(jid)}`);
     return true;
   }
 
   return false;
+}
+
+// Look up the public subdomain assigned to a userId via the isolation
+// map. Returns the URL string (e.g. "https://b6ed73fb17c7.clawdas.com")
+// or null if the user doesn't have one (no isolation, no domains, or
+// the mapping hasn't been written yet).
+function getUserSubdomainUrl(userId) {
+  if (!ISOLATION) return null;
+  const username = isolationGetUsername(userId);
+  let mapping = {};
+  try { mapping = JSON.parse(fs.readFileSync(ISOLATION_MAP, "utf8")); } catch { return null; }
+  const entry = mapping[username];
+  if (!entry?.subdomain) return null;
+  return `https://${entry.subdomain}`;
 }
 
 // Resolve a hash prefix (or full ccm-XXXXX form) to a userId by scanning
@@ -1679,6 +1707,16 @@ async function connectWhatsApp() {
           paths: { projectDirCandidates, sessionName },
         });
         if (handled) continue;
+      }
+
+      // /domain — show the user their hosted project URL.
+      if (text && text.trim().toLowerCase() === "/domain") {
+        const url = getUserSubdomainUrl(userId);
+        const reply = url
+          ? `🌐 Your project URL: ${url}\n\nBind your dev server to \`$PORT\` (already exported in your shell) and Claude can run it on this URL.`
+          : "🌐 No subdomain assigned yet — you don't have an isolated project space on this server.";
+        try { await sock.sendMessage(jid, { text: reply }); } catch {}
+        continue;
       }
 
       // /usage command — check BEFORE sender prefix so it works in groups too
