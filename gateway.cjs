@@ -512,25 +512,24 @@ async function handleInviteCommands({ sock, msg, jid }) {
   const rawText = extractText(msg.message || {}).trim();
   const lower = rawText.toLowerCase();
 
-  if (lower === "/invite") {
+  const inviteMatch = /^\/invite(?:\s+(\d+(?:\.\d{1,2})?))?\s*$/i.exec(rawText);
+  if (inviteMatch) {
     const adminCheck = loadAdmin();
     const isAdminUser = adminCheck && (adminCheck.jid === jid || toJid(adminCheck.jid) === jid);
     if (!isAdminUser) {
       try { await sock.sendMessage(jid, { text: "🚫 /invite is admin-only." }); } catch {}
       return true;
     }
-    const invite = invites.createInvite(STATE_DIR, jid);
+    const preFundUsd = inviteMatch[1] ? Number(inviteMatch[1]) : 0;
+    const invite = invites.createInvite(STATE_DIR, jid, { preFundUsd });
     const expiry = new Date(invite.expires_at).toISOString().split("T")[0];
     const link = `https://wa.me/${PHONE}?text=${encodeURIComponent(`/redeem ${invite.code}`)}`;
     // Reply IS the forwardable invite — admin long-presses + forwards as-is.
-    const text = [
-      "👋 You've been invited to a Claude Code WhatsApp agent.",
-      "",
-      `Tap below to accept (single-use, expires ${expiry}):`,
-      link,
-    ].join("\n");
-    try { await sock.sendMessage(jid, { text }); } catch (e) { log(`/invite reply failed: ${e}`); }
-    log(`invite created: ${invite.code} by ${formatJid(jid)}`);
+    const lines = ["👋 You've been invited to a Claude Code WhatsApp agent.", ""];
+    if (preFundUsd > 0) lines.push(`💰 Includes $${preFundUsd.toFixed(2)} of credit.`, "");
+    lines.push(`Tap below to accept (single-use, expires ${expiry}):`, link);
+    try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch (e) { log(`/invite reply failed: ${e}`); }
+    log(`invite created: ${invite.code}${preFundUsd > 0 ? ` ($${preFundUsd.toFixed(2)})` : ""} by ${formatJid(jid)}`);
     try { await sock.readMessages([msg.key]); } catch {}
     return true;
   }
@@ -551,10 +550,143 @@ async function handleInviteCommands({ sock, msg, jid }) {
       return true;
     }
     addToWhitelist(jid);
+    // Apply pre-fund credit (if any) to redeemer's balance + log to audit.
+    const preFund = Number(result.invite.pre_fund_usd) || 0;
+    if (preFund > 0) {
+      const userId = sanitizeUserId(jid);
+      const u = loadUserUsage(userId);
+      u.balance = (u.balance || 0) + preFund;
+      u.total_added = (u.total_added || 0) + preFund;
+      u.history = u.history || [];
+      u.history.push({ date: todayKey(), action: "topup", amount: preFund, note: `invite from ${formatJid(result.invite.created_by_jid)}` });
+      saveUserUsage(userId, u);
+    }
     try {
-      await sock.sendMessage(jid, { text: "✅ You're in! Send me a message to get started." });
+      const welcome = preFund > 0
+        ? `✅ You're in! Starting balance: $${preFund.toFixed(2)}. Send me a message to get going.`
+        : "✅ You're in! Send me a message to get started.";
+      await sock.sendMessage(jid, { text: welcome });
     } catch (e) { log(`/redeem welcome failed: ${e}`); }
-    log(`invite redeemed: ${result.invite.code} by ${formatJid(jid)}`);
+    log(`invite redeemed: ${result.invite.code}${preFund > 0 ? ` (+$${preFund.toFixed(2)})` : ""} by ${formatJid(jid)}`);
+    return true;
+  }
+
+  return false;
+}
+
+// Resolve a hash prefix (or full ccm-XXXXX form) to a userId by scanning
+// USERS_DIR. Returns { userId, username } or null.
+function findUserByHashPrefix(hashPrefix) {
+  if (!ISOLATION) return null;
+  const needle = String(hashPrefix || "").trim().replace(/^ccm-/i, "").toLowerCase();
+  if (needle.length < 4) return null;
+  let entries;
+  try { entries = fs.readdirSync(USERS_DIR); } catch { return null; }
+  const matches = [];
+  for (const uid of entries) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8"));
+      if (meta.isGroup) continue;
+    } catch { continue; }
+    const username = isolationGetUsername(uid);
+    const hash = username.replace(/^ccm-/, "");
+    if (hash.toLowerCase().startsWith(needle)) {
+      matches.push({ userId: uid, username });
+    }
+  }
+  if (matches.length === 1) return matches[0];
+  return null;
+}
+
+async function handleAdminUserCommands({ sock, msg, jid }) {
+  const rawText = extractText(msg.message || {}).trim();
+  const lower = rawText.toLowerCase();
+
+  // All commands here are admin-only.
+  if (lower !== "/users"
+      && !/^\/rename\s+/i.test(rawText)
+      && !/^\/topup\s+/i.test(rawText)) {
+    return false;
+  }
+
+  const adminCheck = loadAdmin();
+  const isAdminUser = adminCheck && (adminCheck.jid === jid || toJid(adminCheck.jid) === jid);
+  if (!isAdminUser) {
+    try { await sock.sendMessage(jid, { text: "🚫 That command is admin-only." }); } catch {}
+    return true;
+  }
+
+  if (lower === "/users") {
+    let entries;
+    try { entries = fs.readdirSync(USERS_DIR); } catch { entries = []; }
+    const rows = [];
+    for (const uid of entries) {
+      let meta = {};
+      try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8")); } catch { continue; }
+      if (meta.isGroup) continue;
+      const username = ISOLATION ? isolationGetUsername(uid) : null;
+      const hash = username ? username.replace(/^ccm-/, "") : uid.slice(0, 12);
+      const name = meta.name || meta.pushName || formatJid(meta.jid || uid);
+      const u = loadUserUsage(uid);
+      const lastSeen = meta.lastSeen ? meta.lastSeen.slice(0, 10) : "—";
+      rows.push({ hash, name, balance: u.balance || 0, lastSeen });
+    }
+    rows.sort((a, b) => a.name.localeCompare(b.name));
+    const lines = [`👥 *Users* (${rows.length})`, ""];
+    if (rows.length === 0) lines.push("No users yet — share an /invite link.");
+    for (const r of rows) {
+      lines.push(`\`${r.hash}\` · ${r.name}`);
+      lines.push(`  bal $${r.balance.toFixed(2)} · last ${r.lastSeen}`);
+    }
+    try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch (e) { log(`/users reply failed: ${e}`); }
+    try { await sock.readMessages([msg.key]); } catch {}
+    return true;
+  }
+
+  const renameMatch = /^\/rename\s+(\S+)\s+(.+?)\s*$/i.exec(rawText);
+  if (renameMatch) {
+    try { await sock.readMessages([msg.key]); } catch {}
+    const target = findUserByHashPrefix(renameMatch[1]);
+    if (!target) {
+      try { await sock.sendMessage(jid, { text: `❌ No unique user matched \`${renameMatch[1]}\`. Use 4+ chars from /users.` }); } catch {}
+      return true;
+    }
+    const newName = renameMatch[2].trim().slice(0, 64);
+    const metaFile = path.join(USERS_DIR, target.userId, "meta.json");
+    let meta = {};
+    try { meta = JSON.parse(fs.readFileSync(metaFile, "utf8")); } catch {}
+    meta.name = newName;
+    fs.writeFileSync(metaFile, JSON.stringify(meta, null, 2) + "\n");
+    log(`renamed ${target.username} -> ${newName} by ${formatJid(jid)}`);
+    try { await sock.sendMessage(jid, { text: `✅ \`${target.username.replace(/^ccm-/, "")}\` is now *${newName}*.` }); } catch {}
+    return true;
+  }
+
+  const topupMatch = /^\/topup\s+(\S+)\s+(\d+(?:\.\d{1,2})?)\s*$/i.exec(rawText);
+  if (topupMatch) {
+    try { await sock.readMessages([msg.key]); } catch {}
+    const target = findUserByHashPrefix(topupMatch[1]);
+    if (!target) {
+      try { await sock.sendMessage(jid, { text: `❌ No unique user matched \`${topupMatch[1]}\`. Use 4+ chars from /users.` }); } catch {}
+      return true;
+    }
+    const amount = Number(topupMatch[2]);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      try { await sock.sendMessage(jid, { text: "❌ Amount must be a positive number." }); } catch {}
+      return true;
+    }
+    const u = loadUserUsage(target.userId);
+    u.balance = (u.balance || 0) + amount;
+    u.total_added = (u.total_added || 0) + amount;
+    u.history = u.history || [];
+    u.history.push({ date: todayKey(), action: "topup", amount, note: `admin top-up by ${formatJid(jid)}` });
+    saveUserUsage(target.userId, u);
+    log(`topup +$${amount.toFixed(2)} -> ${target.username} by ${formatJid(jid)} (new balance $${u.balance.toFixed(2)})`);
+    try {
+      let meta = {}; try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, target.userId, "meta.json"), "utf8")); } catch {}
+      const displayName = meta.name || meta.pushName || formatJid(meta.jid || target.userId);
+      await sock.sendMessage(jid, { text: `✅ Topped up *${displayName}* with $${amount.toFixed(2)} — new balance $${u.balance.toFixed(2)}.` });
+    } catch {}
     return true;
   }
 
@@ -1376,6 +1508,8 @@ async function connectWhatsApp() {
       if (!jid.endsWith("@g.us")) {
         const inviteHandled = await handleInviteCommands({ sock, msg, jid });
         if (inviteHandled) continue;
+        const adminCmdHandled = await handleAdminUserCommands({ sock, msg, jid });
+        if (adminCmdHandled) continue;
       }
 
       if (!isAllowed(jid, participant || undefined)) continue;
