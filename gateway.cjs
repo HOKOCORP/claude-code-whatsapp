@@ -787,11 +787,49 @@ function ensureProjectUser(userId, userJid) {
     fs.symlinkSync(adminCreds, userCreds);
   }
 
-  // Copy base settings
+  // Copy base settings + inject skipDangerousModePermissionPrompt so the
+  // spawned claude doesn't halt on the bypass-permissions warning on
+  // first run. Mirrors lib/isolation.sh isolation_create_user so the
+  // gateway-spawn path and the ccm-install path converge on the same
+  // first-run seeds.
   const adminSettings = path.join(os.homedir(), ".claude", "settings.json");
+  const userSettingsFile = path.join(claudeDir, "settings.json");
+  let userSettings = {};
   if (fs.existsSync(adminSettings)) {
-    fs.copyFileSync(adminSettings, path.join(claudeDir, "settings.json"));
+    try { userSettings = JSON.parse(fs.readFileSync(adminSettings, "utf8")); } catch {}
   }
+  userSettings.skipDangerousModePermissionPrompt = true;
+  fs.writeFileSync(userSettingsFile, JSON.stringify(userSettings, null, 2) + "\n");
+
+  // Seed ~/.claude.json with the markers Claude Code looks for to decide
+  // "onboarding complete" — without this, every spawned session halts on
+  // the theme picker → bypass-warning → effort-callout chain and never
+  // reaches a usable prompt. Keep in sync with isolation.sh.
+  const claudeJsonPath = path.join(homeDir, ".claude.json");
+  const workspaceDir = path.join(homeDir, "workspace");
+  const claudeJson = {
+    numStartups: 1,
+    firstStartTime: new Date().toISOString(),
+    hasCompletedOnboarding: true,
+    bypassPermissionsModeAccepted: true,
+    effortCalloutV2Dismissed: true,
+    hasVisitedPasses: true,
+    projects: {
+      [workspaceDir]: {
+        allowedTools: [],
+        mcpContextUris: [],
+        mcpServers: {},
+        enabledMcpjsonServers: ["whatsapp"],
+        disabledMcpjsonServers: [],
+        hasTrustDialogAccepted: true,
+        projectOnboardingSeenCount: 1,
+        hasClaudeMdExternalIncludesApproved: true,
+        hasClaudeMdExternalIncludesWarningShown: true,
+      },
+    },
+  };
+  fs.writeFileSync(claudeJsonPath, JSON.stringify(claudeJson, null, 2) + "\n");
+  try { fs.chmodSync(claudeJsonPath, 0o600); } catch {}
 
   // User-global security CLAUDE.md
   fs.writeFileSync(path.join(claudeDir, "CLAUDE.md"), [
