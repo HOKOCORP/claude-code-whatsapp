@@ -588,6 +588,72 @@ async function handleInviteCommands({ sock, msg, jid }) {
   return false;
 }
 
+// In-group admin commands — enable/disable the bot for a group and
+// configure its trigger word, without needing SSH or DM'ing a JID in.
+// Must be invoked BEFORE isAllowed() so the very first /enable-group in
+// a brand-new group can register it.
+async function handleGroupAdminCommands({ sock, msg, jid, participant }) {
+  if (!jid.endsWith("@g.us")) return false;
+  const rawText = extractText(msg.message || {}).trim();
+  const lower = rawText.toLowerCase();
+  const match = lower === "/enable-group"
+             || lower === "/disable-group"
+             || /^\/trigger\s+\S+/i.test(rawText);
+  if (!match) return false;
+
+  const senderJid = participant || "";
+  const adminCheck = loadAdmin();
+  const isAdminSender = adminCheck && (
+    adminCheck.jid === senderJid
+    || toJid(adminCheck.jid) === senderJid
+    || formatJid(adminCheck.jid) === formatJid(senderJid)
+  );
+  if (!isAdminSender) {
+    // Silent: don't leak the command surface to non-admin group members.
+    return false;
+  }
+
+  const access = loadAccess();
+  const persist = () => fs.writeFileSync(ACCESS_FILE, JSON.stringify(access, null, 2) + "\n");
+
+  if (lower === "/enable-group") {
+    access.allowGroups = true;
+    if (!access.allowedGroups.includes(jid)) access.allowedGroups.push(jid);
+    persist();
+    const trigger = access.groupTrigger || "@ai";
+    try {
+      await sock.sendMessage(jid, { text:
+        "✅ Group enabled. I'll respond when:\n"
+        + `• you mention *${trigger}*\n`
+        + "• you reply to one of my messages\n\n"
+        + "Admins can run `/disable-group` to turn me off here, or `/trigger WORD` to change the mention keyword."
+      });
+    } catch {}
+    log(`group enabled: ${jid} by ${formatJid(senderJid)}`);
+    return true;
+  }
+
+  if (lower === "/disable-group") {
+    access.allowedGroups = access.allowedGroups.filter((g) => g !== jid);
+    persist();
+    try { await sock.sendMessage(jid, { text: "✅ Group disabled. I'll stop responding here. Run `/enable-group` to turn me back on." }); } catch {}
+    log(`group disabled: ${jid} by ${formatJid(senderJid)}`);
+    return true;
+  }
+
+  const triggerMatch = /^\/trigger\s+(\S+)\s*$/i.exec(rawText);
+  if (triggerMatch) {
+    const newTrigger = triggerMatch[1].slice(0, 32);
+    access.groupTrigger = newTrigger;
+    persist();
+    try { await sock.sendMessage(jid, { text: `✅ Trigger set to *${newTrigger}*. Mention it in any enabled group to summon me.` }); } catch {}
+    log(`trigger changed to "${newTrigger}" by ${formatJid(senderJid)}`);
+    return true;
+  }
+
+  return false;
+}
+
 // Look up the public subdomain assigned to a userId via the isolation
 // map. Returns the URL string (e.g. "https://b6ed73fb17c7.clawdas.com")
 // or null if the user doesn't have one (no isolation, no domains, or
@@ -1584,6 +1650,14 @@ async function connectWhatsApp() {
         if (inviteHandled) continue;
         const adminCmdHandled = await handleAdminUserCommands({ sock, msg, jid });
         if (adminCmdHandled) continue;
+      }
+
+      // /enable-group + /disable-group + /trigger — in-group admin commands.
+      // Also run BEFORE the whitelist gate so the first /enable-group in a
+      // fresh group can register it.
+      if (jid.endsWith("@g.us")) {
+        const groupAdminHandled = await handleGroupAdminCommands({ sock, msg, jid, participant });
+        if (groupAdminHandled) continue;
       }
 
       if (!isAllowed(jid, participant || undefined)) continue;
