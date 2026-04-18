@@ -2325,14 +2325,35 @@ async function connectWhatsApp() {
   // ── Group lifecycle: freeze on bot removal or group deletion ────
   // Baileys fires group-participants.update when members are added/removed.
   // If the bot itself is removed, freeze the group's session + workspace.
+  //
+  // Safety: ignore group events that arrive within 30s of connection open.
+  // On reconnect, Baileys may replay stale participant events from history
+  // sync — these are not real-time removals and must not trigger a freeze.
+  const GROUP_EVENT_GRACE_MS = 30000;
+
   sock.ev.on("group-participants.update", async ({ id, participants, action }) => {
     if (action !== "remove") return;
+    // Ignore events during reconnect grace period
+    if (!connectedAt || Date.now() - connectedAt < GROUP_EVENT_GRACE_MS) {
+      log(`group-participants.update ignored (grace period) for ${id}`);
+      return;
+    }
     // Check if the bot was removed
     const botNumber = String(PHONE);
     const botRemoved = participants.some(
       (p) => p.includes(botNumber) || (sock?.user?.id && p.includes(sock.user.id.split(":")[0]))
     );
     if (!botRemoved) return;
+
+    // Double-check: try to fetch group metadata. If we're still in the
+    // group, this was a stale event — do not freeze.
+    try {
+      await sock.groupMetadata(id);
+      log(`freeze aborted for ${id} — bot still in group (stale event)`);
+      return;
+    } catch {
+      // groupMetadata throws if we're not in the group — proceed with freeze
+    }
 
     const userId = sanitizeUserId(id);
     log(`bot removed from group ${id} — freezing session ${userId}`);
@@ -2357,6 +2378,9 @@ async function connectWhatsApp() {
   // Baileys fires groups.update when group metadata changes — including deletion.
   // A deleted group has announce === undefined and subject === undefined.
   sock.ev.on("groups.update", async (updates) => {
+    // Ignore during reconnect grace period
+    if (!connectedAt || Date.now() - connectedAt < GROUP_EVENT_GRACE_MS) return;
+
     for (const update of updates) {
       // Detect group deletion: Baileys sends an update where the group
       // is essentially emptied. We check if subject becomes empty/null.
