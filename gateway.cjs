@@ -2079,6 +2079,19 @@ async function connectWhatsApp() {
         const trigger = (loadAccess().groupTrigger || "@ai");
         text = text.replace(new RegExp(trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "").trim();
       }
+      // If text is empty after trigger stripping but the message quotes
+      // another message, include the quoted text so Claude has context.
+      // Common case: user sends a message without @ai, then quotes it
+      // and types only "@ai" — without this, Claude would get "(empty)".
+      if (isGroup && !text) {
+        const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+        if (quotedMsg) {
+          const quotedText = extractText(quotedMsg);
+          if (quotedText) {
+            text = `[Quoted message] ${quotedText}`;
+          }
+        }
+      }
       // Channel slash commands (/help, /clear, /compact, OTP confirm) — check
       // before /usage so they short-circuit cleanly. Falls through (returns
       // false) for any text that isn't one of these commands or a pending OTP.
