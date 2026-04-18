@@ -2011,7 +2011,6 @@ async function connectWhatsApp() {
         // command for the bot", matching every major chat product.
         const isSlashCommand = cleanText.trimStart().startsWith("/");
         if (!isSlashCommand && !mentioned && !prefixed && !containsTrigger && !isReplyToBot) {
-          log(`group skip: jid=${jid} text=${JSON.stringify(cleanText.slice(0,80))} trigger=${trigger} mentioned=${!!mentioned} quoted=${quotedParticipant.slice(0,20)} botId=${botId.split(":")[0]} stanzaId=${!!quotedCtx.stanzaId}`);
           continue;
         }
       }
