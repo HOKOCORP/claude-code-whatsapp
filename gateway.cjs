@@ -1306,6 +1306,129 @@ function domainsDeprovision(username) {
   } catch {}
 }
 
+// ── Group freeze / cleanup ──────────────────────────────────────
+// When the bot is removed from a group or the group is deleted,
+// freeze the session: kill tmux, stop processes, disable subdomain.
+// Data is retained for FREEZE_RETENTION_DAYS before full deletion.
+
+const FREEZE_RETENTION_DAYS = 60;
+
+function freezeGroupSession(userId, reason) {
+  const userDir = path.join(USERS_DIR, userId);
+  if (!fs.existsSync(userDir)) return;
+
+  // Already frozen?
+  const frozenFile = path.join(userDir, "frozen.json");
+  if (fs.existsSync(frozenFile)) {
+    log(`freeze: ${userId} already frozen — skipping`);
+    return;
+  }
+
+  // 1. Kill tmux session
+  const sessionName = getUserSessionName(userId);
+  try { execFileSync("tmux", ["kill-session", "-t", sessionName], { stdio: "ignore" }); } catch {}
+  userActivity.delete(userId);
+
+  // 2. Kill all processes owned by the isolated user (if isolation)
+  if (ISOLATION) {
+    const username = isolationGetUsername(userId);
+    try {
+      // SIGTERM first, give 3s, then SIGKILL stragglers
+      execFileSync("pkill", ["-u", username], { stdio: "ignore" });
+      setTimeout(() => {
+        try { execFileSync("pkill", ["-9", "-u", username], { stdio: "ignore" }); } catch {}
+      }, 3000);
+    } catch {} // pkill returns 1 if no processes matched — that's fine
+
+    // 3. Disable subdomain (remove nginx symlink, reload)
+    domainsDeprovision(username);
+  }
+
+  // 4. Write frozen marker
+  const frozen = {
+    frozenAt: new Date().toISOString(),
+    frozenAtUnix: Math.floor(Date.now() / 1000),
+    reason,
+    deleteAfter: new Date(Date.now() + FREEZE_RETENTION_DAYS * 86400000).toISOString(),
+  };
+  fs.writeFileSync(frozenFile, JSON.stringify(frozen, null, 2) + "\n");
+
+  log(`frozen: ${userId} — reason: ${reason}, delete after ${frozen.deleteAfter}`);
+}
+
+function unfreezeGroupSession(userId) {
+  const frozenFile = path.join(USERS_DIR, userId, "frozen.json");
+  if (!fs.existsSync(frozenFile)) return;
+
+  try { fs.unlinkSync(frozenFile); } catch {}
+
+  // Re-provision subdomain if isolation + domains are on
+  if (ISOLATION && domainsAvailable()) {
+    const username = isolationGetUsername(userId);
+    const homeDir = `/home/${username}`;
+    let mapping = {};
+    try { mapping = JSON.parse(fs.readFileSync(ISOLATION_MAP, "utf8")); } catch {}
+    const entry = mapping[username];
+    if (entry && entry.port) {
+      const hash = isolationHash(path.basename(STATE_DIR), userId);
+      domainsProvision(username, hash, entry.port, homeDir);
+    }
+  }
+
+  log(`unfrozen: ${userId}`);
+}
+
+function cleanupFrozenSessions() {
+  let entries;
+  try { entries = fs.readdirSync(USERS_DIR); } catch { return; }
+  const now = Date.now();
+
+  for (const uid of entries) {
+    const frozenFile = path.join(USERS_DIR, uid, "frozen.json");
+    if (!fs.existsSync(frozenFile)) continue;
+
+    let frozen;
+    try { frozen = JSON.parse(fs.readFileSync(frozenFile, "utf8")); } catch { continue; }
+
+    const frozenAt = frozen.frozenAtUnix * 1000;
+    const elapsed = now - frozenAt;
+    const retentionMs = FREEZE_RETENTION_DAYS * 86400000;
+
+    if (elapsed < retentionMs) continue;
+
+    // Retention expired — full delete
+    log(`cleanup: deleting frozen session ${uid} (frozen ${Math.floor(elapsed / 86400000)} days ago)`);
+
+    if (ISOLATION) {
+      const username = isolationGetUsername(uid);
+      // Remove nginx vhost (may already be gone from freeze)
+      domainsDeprovision(username);
+      // Delete Linux user + home directory
+      try { execFileSync("userdel", ["-r", username], { stdio: "ignore" }); } catch (e) {
+        log(`cleanup: userdel ${username} failed: ${e}`);
+      }
+      // Remove from isolation map
+      try {
+        const mapping = JSON.parse(fs.readFileSync(ISOLATION_MAP, "utf8"));
+        delete mapping[username];
+        fs.writeFileSync(ISOLATION_MAP, JSON.stringify(mapping, null, 2));
+      } catch {}
+    }
+
+    // Remove user directory from channels state
+    try { fs.rmSync(path.join(USERS_DIR, uid), { recursive: true, force: true }); } catch (e) {
+      log(`cleanup: rmSync ${uid} failed: ${e}`);
+    }
+
+    log(`cleanup: ${uid} fully deleted`);
+  }
+}
+
+// Run cleanup check every 6 hours
+setInterval(cleanupFrozenSessions, 6 * 3600000);
+// Also run once at startup (after 30s to let things settle)
+setTimeout(cleanupFrozenSessions, 30000);
+
 // ── Capacity / account exhaustion ────────────────────────────────
 
 const CAPACITY_FLAG = "/var/lib/ccm/capacity-blocked";
@@ -2145,6 +2268,15 @@ async function connectWhatsApp() {
         continue;  // do not spawn; keep processing other messages in this batch
       }
 
+      // Auto-unfreeze: if the group was frozen (bot removed/group deleted)
+      // but we're now receiving a message, the bot was re-added. Unfreeze
+      // so the session resumes with its existing workspace intact.
+      const frozenFile = path.join(userDir, "frozen.json");
+      if (fs.existsSync(frozenFile)) {
+        log(`auto-unfreeze: ${userId} — received message in frozen session`);
+        unfreezeGroupSession(userId);
+      }
+
       spawnUserSession(userId, sessionJid);
       armStallWatchdog(userId, sessionJid);
     }
@@ -2186,6 +2318,69 @@ async function connectWhatsApp() {
         }
 
         log(`poll vote: ${behavior} for request ${requestId} (user ${uid})`);
+      }
+    }
+  });
+
+  // ── Group lifecycle: freeze on bot removal or group deletion ────
+  // Baileys fires group-participants.update when members are added/removed.
+  // If the bot itself is removed, freeze the group's session + workspace.
+  sock.ev.on("group-participants.update", async ({ id, participants, action }) => {
+    if (action !== "remove") return;
+    // Check if the bot was removed
+    const botNumber = String(PHONE);
+    const botRemoved = participants.some(
+      (p) => p.includes(botNumber) || (sock?.user?.id && p.includes(sock.user.id.split(":")[0]))
+    );
+    if (!botRemoved) return;
+
+    const userId = sanitizeUserId(id);
+    log(`bot removed from group ${id} — freezing session ${userId}`);
+    freezeGroupSession(userId, "bot_removed_from_group");
+
+    // Notify admin
+    const admin = loadAdmin();
+    if (admin?.jid) {
+      let groupName = id;
+      try {
+        const meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, userId, "meta.json"), "utf8"));
+        if (meta.name) groupName = meta.name;
+      } catch {}
+      try {
+        await sock.sendMessage(toJid(admin.jid), {
+          text: `🧊 Bot was removed from group *${groupName}*.\n\nSession frozen. Workspace data retained for ${FREEZE_RETENTION_DAYS} days.\nTo unfreeze (if re-added): the session will auto-resume on next message.`,
+        });
+      } catch {}
+    }
+  });
+
+  // Baileys fires groups.update when group metadata changes — including deletion.
+  // A deleted group has announce === undefined and subject === undefined.
+  sock.ev.on("groups.update", async (updates) => {
+    for (const update of updates) {
+      // Detect group deletion: Baileys sends an update where the group
+      // is essentially emptied. We check if subject becomes empty/null.
+      if (update.id && update.subject === null) {
+        const userId = sanitizeUserId(update.id);
+        const userDir = path.join(USERS_DIR, userId);
+        if (!fs.existsSync(userDir)) continue;
+
+        log(`group ${update.id} appears deleted — freezing session ${userId}`);
+        freezeGroupSession(userId, "group_deleted");
+
+        const admin = loadAdmin();
+        if (admin?.jid) {
+          let groupName = update.id;
+          try {
+            const meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, userId, "meta.json"), "utf8"));
+            if (meta.name) groupName = meta.name;
+          } catch {}
+          try {
+            await sock.sendMessage(toJid(admin.jid), {
+              text: `🧊 Group *${groupName}* was deleted.\n\nSession frozen. Data retained for ${FREEZE_RETENTION_DAYS} days.`,
+            });
+          } catch {}
+        }
       }
     }
   });
