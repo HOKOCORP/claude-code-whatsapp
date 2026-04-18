@@ -658,12 +658,20 @@ async function handleGroupAdminCommands({ sock, msg, jid, participant }) {
     if (!access.allowedGroups.includes(jid)) access.allowedGroups.push(jid);
     persist();
     const trigger = access.groupTrigger || "@ai";
+    // Predict subdomain (same logic as invite welcome message)
+    let subdomainNote = "";
+    if (ISOLATION && process.env.DOMAIN_ROOT) {
+      const groupUserId = sanitizeUserId(jid);
+      const hash = isolationHash(path.basename(STATE_DIR), groupUserId);
+      subdomainNote = `\n🌐 Project subdomain: https://${hash}.${process.env.DOMAIN_ROOT}\n`;
+    }
     try {
       await sock.sendMessage(jid, { text:
         "✅ Group enabled. I'll respond when:\n"
         + `• you mention *${trigger}*\n`
-        + "• you reply to one of my messages\n\n"
-        + "Admins can run `/disable-group` to turn me off here, or `/trigger WORD` to change the mention keyword."
+        + "• you reply to one of my messages\n"
+        + subdomainNote
+        + "\nAdmins can run `/disable-group` to turn me off here, or `/trigger WORD` to change the mention keyword."
       });
     } catch {}
     log(`group enabled: ${jid} by ${formatJid(senderJid)}`);
