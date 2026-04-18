@@ -794,10 +794,10 @@ function getUserSubdomainUrl(userId) {
 
 // Hash displayed in /users for a given userId + meta. Matches what
 // users see so /topup / /rename lookups stay consistent.
-//   - DMs (isolation on): ccm-<12> hex from isolationGetUsername
-//   - Groups and non-isolation: first 12 chars of the userId
+//   - Isolation on (users AND groups): ccm-<12> hex from isolationGetUsername
+//   - Non-isolation: first 12 chars of the userId
 function displayHashFor(uid, meta) {
-  if (!meta?.isGroup && ISOLATION) {
+  if (ISOLATION) {
     return isolationGetUsername(uid).replace(/^ccm-/, "");
   }
   return uid.slice(0, 12);
@@ -817,7 +817,7 @@ function findUserByHashPrefix(hashPrefix) {
     try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8")); } catch { continue; }
     const hash = displayHashFor(uid, meta);
     if (hash.toLowerCase().startsWith(needle)) {
-      const username = meta.isGroup ? null : (ISOLATION ? isolationGetUsername(uid) : null);
+      const username = ISOLATION ? isolationGetUsername(uid) : null;
       matches.push({ userId: uid, username, isGroup: !!meta.isGroup });
     }
   }
@@ -857,8 +857,8 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
       try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8")); } catch { continue; }
       const isGroup = !!meta.isGroup;
       // Groups have their own wallet keyed by the group JID — show them
-      // so admin can /topup them. No Linux account, so the hash is
-      // derived from the userId prefix rather than isolationGetUsername().
+      // so admin can /topup them. In isolation mode, groups get their own
+      // Linux account and subdomain, same as individual users.
       const hash = displayHashFor(uid, meta);
       const name = meta.name || meta.pushName || formatJid(meta.jid || uid);
       const isAdminRow = !isGroup && adminJid && (meta.jid === adminJid || toJid(adminJid) === meta.jid);
