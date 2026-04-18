@@ -1990,8 +1990,9 @@ async function connectWhatsApp() {
         const groupText = extractText(msg.message || {});
         const cleanText = groupText.replace(/[\u2066\u2067\u2068\u2069\u200E\u200F\u200B\u200C\u200D\uFEFF]/g, "");
         const trigger = (access.groupTrigger || "@ai").toLowerCase();
+        const botLidNum = (sock?.user?.lid || "").split(":")[0];
         const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.some(
-          (m) => m.includes(PHONE) || (sock?.user?.id && m.includes(sock.user.id.split(":")[0]))
+          (m) => m.includes(PHONE) || (sock?.user?.id && m.includes(sock.user.id.split(":")[0])) || (botLidNum && m.includes(botLidNum))
         );
         const prefixed = cleanText.toLowerCase().startsWith(trigger);
         const containsTrigger = cleanText.toLowerCase().includes(trigger);
