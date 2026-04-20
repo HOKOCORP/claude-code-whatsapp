@@ -1978,7 +1978,7 @@ async function connectWhatsApp() {
         const gMeta = path.join(gDir, "meta.json");
         let gm = {}; try { gm = JSON.parse(fs.readFileSync(gMeta, "utf8")); } catch {}
         gm.jid = jid; gm.isGroup = true; gm.lastSeen = new Date().toISOString();
-        if (!gm.name) { try { const gInfo = await sock.groupMetadata(jid); if (gInfo?.subject) gm.name = gInfo.subject; } catch {} }
+        try { const gInfo = await sock.groupMetadata(jid); if (gInfo?.subject) gm.name = gInfo.subject; } catch {}
         fs.writeFileSync(gMeta, JSON.stringify(gm, null, 2) + "\n");
       }
 
@@ -2080,13 +2080,10 @@ async function connectWhatsApp() {
       userMeta.lastSeen = new Date().toISOString();
       if (isGroup) {
         userMeta.isGroup = true;
-        // Try to get group name via sock
-        if (!userMeta.name) {
-          try { const gMeta = await sock.groupMetadata(jid); if (gMeta?.subject) userMeta.name = gMeta.subject; } catch {}
-        }
+        // Always sync group name so renames are reflected
+        try { const gMeta = await sock.groupMetadata(jid); if (gMeta?.subject) userMeta.name = gMeta.subject; } catch {}
       } else {
-        if (pushName) userMeta.pushName = pushName;
-        if (!userMeta.name && pushName) userMeta.name = pushName;
+        if (pushName) { userMeta.pushName = pushName; userMeta.name = pushName; }
       }
       fs.writeFileSync(metaFile, JSON.stringify(userMeta, null, 2) + "\n");
 
