@@ -1039,6 +1039,22 @@ function syncAdminSkills(claudeDir, username) {
   try { execFileSync("chown", ["-R", `${username}:${username}`, userSkills]); } catch {}
 }
 
+/** Ensure OAuth credential files and their parent directory are readable
+ *  by ccm-auth group members. Claude Code resets these to 0600 on token
+ *  refresh, breaking isolated users' auth. Called on every ensureProjectUser
+ *  entry so the fix is self-healing. */
+function fixCredentialPermissions() {
+  const accountsDir = path.join(os.homedir(), ".claude", "accounts");
+  try { fs.chmodSync(accountsDir, 0o750); } catch {}
+  try {
+    for (const f of fs.readdirSync(accountsDir)) {
+      if (f.endsWith(".json") && !f.startsWith(".")) {
+        fs.chmodSync(path.join(accountsDir, f), 0o640);
+      }
+    }
+  } catch {}
+}
+
 function ensureProjectUser(userId, userJid) {
   if (!ISOLATION) return null;
 
@@ -1066,6 +1082,11 @@ function ensureProjectUser(userId, userJid) {
         port = undefined;
       }
     }
+    // Ensure credential files stay group-readable (Claude Code resets
+    // them to 0600 on token refresh; fix on every entry so isolated
+    // users never lose access).
+    fixCredentialPermissions();
+
     // If this user is the admin, (re-)apply the /root/.env ACL +
     // symlink so tokens are available. Idempotent; safe on re-entry
     // (e.g. ccm-install added the user before an admin was set, and
@@ -1096,17 +1117,8 @@ function ensureProjectUser(userId, userJid) {
   if (fs.existsSync(adminCreds) && !fs.existsSync(userCreds)) {
     fs.symlinkSync(adminCreds, userCreds);
   }
-  // Ensure the accounts/*.json files are group-readable (claude CLI
-  // writes them as 0600 on token refresh, but ccm-auth members need
-  // read access through the credential symlink chain).
-  const accountsDir = path.join(os.homedir(), ".claude", "accounts");
-  try {
-    for (const f of fs.readdirSync(accountsDir)) {
-      if (f.endsWith(".json") && !f.startsWith(".")) {
-        fs.chmodSync(path.join(accountsDir, f), 0o640);
-      }
-    }
-  } catch {}
+  // Ensure credential files + directory are group-readable by ccm-auth
+  fixCredentialPermissions();
 
   // Copy base settings + inject skipDangerousModePermissionPrompt so the
   // spawned claude doesn't halt on the bypass-permissions warning on
