@@ -1160,6 +1160,24 @@ function ensureProjectUser(userId, userJid) {
   // Create workspace
   fs.mkdirSync(path.join(homeDir, "workspace"), { recursive: true });
 
+  // Symlink gstack skills, plugins, and config so isolated users get the same
+  // skill set as admin (browse, qa, ship, etc.) without copying files.
+  const adminSkills = path.join(os.homedir(), ".claude", "skills");
+  const userSkills = path.join(claudeDir, "skills");
+  if (fs.existsSync(adminSkills) && !fs.existsSync(userSkills)) {
+    fs.symlinkSync(adminSkills, userSkills);
+  }
+  const adminPlugins = path.join(os.homedir(), ".claude", "plugins");
+  const userPlugins = path.join(claudeDir, "plugins");
+  if (fs.existsSync(adminPlugins) && !fs.existsSync(userPlugins)) {
+    fs.symlinkSync(adminPlugins, userPlugins);
+  }
+  const adminGstack = path.join(os.homedir(), ".gstack");
+  const userGstack = path.join(homeDir, ".gstack");
+  if (fs.existsSync(adminGstack) && !fs.existsSync(userGstack)) {
+    fs.symlinkSync(adminGstack, userGstack);
+  }
+
   // Fix ownership (chown -R does not follow symlinks, so admin's creds file stays owned by admin)
   try {
     execFileSync("chown", ["-R", `${username}:${username}`, homeDir]);
