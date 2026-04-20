@@ -635,6 +635,7 @@ async function handleGroupAdminCommands({ sock, msg, jid, participant }) {
   const lower = rawText.toLowerCase();
   const match = lower === "/enable-group"
              || lower === "/disable-group"
+             || lower === "/direct on" || lower === "/direct off"
              || /^\/trigger\s+\S+/i.test(rawText)
              || /^\/group-token(\s|$)/i.test(rawText);
   if (!match) return false;
@@ -694,6 +695,24 @@ async function handleGroupAdminCommands({ sock, msg, jid, participant }) {
     persist();
     try { await sock.sendMessage(jid, { text: `✅ Trigger set to *${newTrigger}*. Mention it in any enabled group to summon me.` }); } catch {}
     log(`trigger changed to "${newTrigger}" by ${formatJid(senderJid)}`);
+    return true;
+  }
+
+  // /direct on|off — toggle direct mode for this group
+  if (lower === "/direct on") {
+    if (!access.directGroups) access.directGroups = [];
+    if (!access.directGroups.includes(jid)) access.directGroups.push(jid);
+    persist();
+    try { await sock.sendMessage(jid, { text: "✅ Direct mode *ON*. I'll respond to every message in this group — no @ai or reply needed." }); } catch {}
+    log(`direct mode ON for ${jid} by ${formatJid(senderJid)}`);
+    return true;
+  }
+  if (lower === "/direct off") {
+    if (access.directGroups) access.directGroups = access.directGroups.filter((g) => g !== jid);
+    persist();
+    const trigger = access.groupTrigger || "@ai";
+    try { await sock.sendMessage(jid, { text: `✅ Direct mode *OFF*. Back to normal — mention *${trigger}* or reply to my messages.` }); } catch {}
+    log(`direct mode OFF for ${jid} by ${formatJid(senderJid)}`);
     return true;
   }
 
@@ -2329,7 +2348,8 @@ async function connectWhatsApp() {
         // @ai mention needed. The `/` prefix already says "this is a
         // command for the bot", matching every major chat product.
         const isSlashCommand = cleanText.trimStart().startsWith("/");
-        if (!isSlashCommand && !mentioned && !prefixed && !containsTrigger && !isReplyToBot) {
+        const isDirectMode = (access.directGroups || []).includes(jid);
+        if (!isDirectMode && !isSlashCommand && !mentioned && !prefixed && !containsTrigger && !isReplyToBot) {
           continue;
         }
       }
