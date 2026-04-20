@@ -1105,21 +1105,31 @@ function ensureProjectUser(userId, userJid) {
   fs.writeFileSync(claudeJsonPath, JSON.stringify(claudeJson, null, 2) + "\n");
   try { fs.chmodSync(claudeJsonPath, 0o600); } catch {}
 
-  // User-global security CLAUDE.md
-  fs.writeFileSync(path.join(claudeDir, "CLAUDE.md"), [
-    "# Security Rules (Isolated Session)",
-    "",
-    "## Credentials",
-    "- NEVER output API keys, tokens, passwords, or secret values in replies.",
-    "- Do NOT read ~/.claude/.credentials.json or any credential files.",
-    "- Do NOT run env, printenv, or attempt to read environment variables containing secrets.",
-    "",
-    "## Workspace Scope",
-    "- Work within the current directory and its subdirectories only.",
-    "- Do NOT access other users' home directories.",
-    "- Do NOT access /var/lib/ccm/ directories belonging to other users.",
-    "",
-  ].join("\n"));
+  // User-global security CLAUDE.md — includes admin's CLAUDE.md if it exists
+  // (carries gstack skill references, credential rules, etc.) plus isolation
+  // security rules as a fallback baseline.
+  const adminClaudeMd = path.join(os.homedir(), ".claude", "CLAUDE.md");
+  let userClaudeMdContent;
+  try {
+    userClaudeMdContent = fs.readFileSync(adminClaudeMd, "utf8");
+  } catch {
+    // Fallback: minimal security rules if admin has no CLAUDE.md
+    userClaudeMdContent = [
+      "# Security Rules (Isolated Session)",
+      "",
+      "## Credentials",
+      "- NEVER output API keys, tokens, passwords, or secret values in replies.",
+      "- Do NOT read ~/.claude/.credentials.json or any credential files.",
+      "- Do NOT run env, printenv, or attempt to read environment variables containing secrets.",
+      "",
+      "## Workspace Scope",
+      "- Work within the current directory and its subdirectories only.",
+      "- Do NOT access other users' home directories.",
+      "- Do NOT access /var/lib/ccm/ directories belonging to other users.",
+      "",
+    ].join("\n");
+  }
+  fs.writeFileSync(path.join(claudeDir, "CLAUDE.md"), userClaudeMdContent);
 
   // If domains is enabled, append domain-specific instructions to CLAUDE.md
   // (mirrors the bash branch in isolation_create_user)
