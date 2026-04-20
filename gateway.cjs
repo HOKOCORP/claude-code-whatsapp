@@ -1246,7 +1246,6 @@ function ensureProjectUser(userId, userJid) {
   // Copy skill SKILL.md files (Claude Code won't follow symlinked SKILL.md).
   // syncAdminSkills handles both initial copy and subsequent updates.
   syncAdminSkills(claudeDir, username);
-  }
 
   // Fix ownership (chown -R does not follow symlinks, so admin's creds file stays owned by admin)
   try {
