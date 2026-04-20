@@ -980,6 +980,65 @@ function isolationGetUsername(userId) {
   return `ccm-${isolationHash(path.basename(STATE_DIR), userId)}`;
 }
 
+/**
+ * Copy admin's gstack skill SKILL.md files into an isolated user's
+ * ~/.claude/skills/ directory. Claude Code refuses to follow symlinked
+ * SKILL.md files, so we must use real copies. To keep them in sync with
+ * admin updates (e.g. /gstack-upgrade), this function compares mtimes
+ * and re-copies only when the admin's file is newer.
+ */
+function syncAdminSkills(claudeDir, username) {
+  const adminSkills = path.join(os.homedir(), ".claude", "skills");
+  if (!fs.existsSync(adminSkills)) return;
+  // Ensure admin skill dirs are world-readable
+  try { execFileSync("chmod", ["-R", "o+rX", adminSkills]); } catch {}
+
+  const userSkills = path.join(claudeDir, "skills");
+  // Remove stale directory-level symlink from older code
+  try { if (fs.lstatSync(userSkills).isSymbolicLink()) fs.unlinkSync(userSkills); } catch {}
+  fs.mkdirSync(userSkills, { recursive: true });
+
+  // Symlink the gstack repo itself (needed for SKILL.md references inside skills)
+  const userGstackSkill = path.join(userSkills, "gstack");
+  const adminGstackSkill = path.join(adminSkills, "gstack");
+  if (fs.existsSync(adminGstackSkill) && !fs.existsSync(userGstackSkill)) {
+    fs.symlinkSync(adminGstackSkill, userGstackSkill);
+  }
+
+  // For each skill dir in admin, create real dir + copy SKILL.md if newer
+  for (const entry of fs.readdirSync(adminSkills)) {
+    if (entry === "gstack") continue;
+    const adminDir = path.join(adminSkills, entry);
+    let adminMd;
+    // Resolve through symlinks to find the actual SKILL.md
+    try {
+      const candidate = path.join(adminDir, "SKILL.md");
+      if (!fs.existsSync(candidate)) continue;
+      adminMd = fs.realpathSync(candidate);
+    } catch { continue; }
+
+    const userDir = path.join(userSkills, entry);
+    const userMd = path.join(userDir, "SKILL.md");
+    fs.mkdirSync(userDir, { recursive: true });
+
+    // Copy only if admin's file is newer or user's doesn't exist
+    let needsCopy = !fs.existsSync(userMd);
+    if (!needsCopy) {
+      try {
+        const adminMtime = fs.statSync(adminMd).mtimeMs;
+        const userMtime = fs.statSync(userMd).mtimeMs;
+        needsCopy = adminMtime > userMtime;
+      } catch { needsCopy = true; }
+    }
+    if (needsCopy) {
+      fs.copyFileSync(adminMd, userMd);
+    }
+  }
+
+  // Fix ownership
+  try { execFileSync("chown", ["-R", `${username}:${username}`, userSkills]); } catch {}
+}
+
 function ensureProjectUser(userId, userJid) {
   if (!ISOLATION) return null;
 
@@ -1170,32 +1229,23 @@ function ensureProjectUser(userId, userJid) {
   // Create workspace
   fs.mkdirSync(path.join(homeDir, "workspace"), { recursive: true });
 
-  // Symlink gstack skills, plugins, and config so isolated users get the same
-  // skill set as admin (browse, qa, ship, etc.) without copying files.
-  // Also ensure the target dirs are world-readable (gstack installs skills
-  // as 700 by default, which blocks isolated users reading through symlinks).
-  const shareTargets = [];
-  const adminSkills = path.join(os.homedir(), ".claude", "skills");
-  const userSkills = path.join(claudeDir, "skills");
-  if (fs.existsSync(adminSkills) && !fs.existsSync(userSkills)) {
-    fs.symlinkSync(adminSkills, userSkills);
-    shareTargets.push(adminSkills);
-  }
+  // Share admin's plugins and gstack config via symlinks (plugins use a
+  // different discovery mechanism that follows symlinks fine).
   const adminPlugins = path.join(os.homedir(), ".claude", "plugins");
   const userPlugins = path.join(claudeDir, "plugins");
   if (fs.existsSync(adminPlugins) && !fs.existsSync(userPlugins)) {
     fs.symlinkSync(adminPlugins, userPlugins);
-    shareTargets.push(adminPlugins);
+    try { execFileSync("chmod", ["-R", "o+rX", adminPlugins]); } catch {}
   }
   const adminGstack = path.join(os.homedir(), ".gstack");
   const userGstack = path.join(homeDir, ".gstack");
   if (fs.existsSync(adminGstack) && !fs.existsSync(userGstack)) {
     fs.symlinkSync(adminGstack, userGstack);
-    shareTargets.push(adminGstack);
+    try { execFileSync("chmod", ["-R", "o+rX", adminGstack]); } catch {}
   }
-  // Make symlink targets world-readable so isolated users can access them
-  for (const t of shareTargets) {
-    try { execFileSync("chmod", ["-R", "o+rX", t]); } catch {}
+  // Copy skill SKILL.md files (Claude Code won't follow symlinked SKILL.md).
+  // syncAdminSkills handles both initial copy and subsequent updates.
+  syncAdminSkills(claudeDir, username);
   }
 
   // Fix ownership (chown -R does not follow symlinks, so admin's creds file stays owned by admin)
@@ -1541,6 +1591,11 @@ function ensureUserConfig(userId, userJid) {
     : path.join(userDir, "workspace");
   const userHomeDir = projectUser ? projectUser.homeDir : os.homedir();
   fs.mkdirSync(userWorkDir, { recursive: true });
+
+  // Sync admin skills to isolated user (copies SKILL.md files, mtime-aware)
+  if (projectUser) {
+    syncAdminSkills(path.join(projectUser.homeDir, ".claude"), projectUser.username);
+  }
 
   // Security rules go in .claude/CLAUDE.md (hidden directory) — written once
   // on first creation only. This leaves the visible CLAUDE.md free for
