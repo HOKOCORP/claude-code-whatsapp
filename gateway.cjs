@@ -1162,20 +1162,30 @@ function ensureProjectUser(userId, userJid) {
 
   // Symlink gstack skills, plugins, and config so isolated users get the same
   // skill set as admin (browse, qa, ship, etc.) without copying files.
+  // Also ensure the target dirs are world-readable (gstack installs skills
+  // as 700 by default, which blocks isolated users reading through symlinks).
+  const shareTargets = [];
   const adminSkills = path.join(os.homedir(), ".claude", "skills");
   const userSkills = path.join(claudeDir, "skills");
   if (fs.existsSync(adminSkills) && !fs.existsSync(userSkills)) {
     fs.symlinkSync(adminSkills, userSkills);
+    shareTargets.push(adminSkills);
   }
   const adminPlugins = path.join(os.homedir(), ".claude", "plugins");
   const userPlugins = path.join(claudeDir, "plugins");
   if (fs.existsSync(adminPlugins) && !fs.existsSync(userPlugins)) {
     fs.symlinkSync(adminPlugins, userPlugins);
+    shareTargets.push(adminPlugins);
   }
   const adminGstack = path.join(os.homedir(), ".gstack");
   const userGstack = path.join(homeDir, ".gstack");
   if (fs.existsSync(adminGstack) && !fs.existsSync(userGstack)) {
     fs.symlinkSync(adminGstack, userGstack);
+    shareTargets.push(adminGstack);
+  }
+  // Make symlink targets world-readable so isolated users can access them
+  for (const t of shareTargets) {
+    try { execFileSync("chmod", ["-R", "o+rX", t]); } catch {}
   }
 
   // Fix ownership (chown -R does not follow symlinks, so admin's creds file stays owned by admin)
