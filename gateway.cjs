@@ -1443,6 +1443,9 @@ function ensureProjectUser(userId, userJid) {
   // syncAdminSkills handles both initial copy and subsequent updates.
   syncAdminSkills(claudeDir, username);
 
+  // Provision databases for this workspace
+  const _newDbs = databasesProvision(username);
+
   // Fix ownership (chown -R does not follow symlinks, so admin's creds file stays owned by admin)
   try {
     execFileSync("chown", ["-R", `${username}:${username}`, homeDir]);
@@ -1454,6 +1457,7 @@ function ensureProjectUser(userId, userJid) {
   let mapping = {};
   try { mapping = JSON.parse(fs.readFileSync(ISOLATION_MAP, "utf8")); } catch {}
   mapping[username] = { userId, channel: path.basename(STATE_DIR), created: Math.floor(Date.now() / 1000) };
+  if (_newDbs) mapping[username].databases = _newDbs;
 
   // If domains is available, allocate port and provision vhost
   if (domainsAvailable()) {
@@ -1467,6 +1471,12 @@ function ensureProjectUser(userId, userJid) {
 
   fs.mkdirSync(path.dirname(ISOLATION_MAP), { recursive: true });
   fs.writeFileSync(ISOLATION_MAP, JSON.stringify(mapping, null, 2));
+
+  // Write database env vars + update CLAUDE.md
+  if (mapping[username].databases) {
+    databasesWriteEnv(userId, username);
+    databasesAppendClaudeMd(claudeDir);
+  }
 
   // If this user is the admin, grant /root/.env access (ACL + symlink)
   // so claude sessions inherit GITHUB_TOKEN etc from ccm Settings.
@@ -1705,6 +1715,8 @@ function cleanupFrozenSessions() {
       const username = isolationGetUsername(uid);
       // Remove nginx vhost (may already be gone from freeze)
       domainsDeprovision(username);
+      // Drop databases + users before deleting Linux user
+      databasesDeprovision(username);
       // Delete Linux user + home directory
       try { execFileSync("userdel", ["-r", username], { stdio: "ignore" }); } catch (e) {
         log(`cleanup: userdel ${username} failed: ${e}`);
@@ -1790,6 +1802,25 @@ function ensureUserConfig(userId, userJid) {
   // Sync admin skills to isolated user (copies SKILL.md files, mtime-aware)
   if (projectUser) {
     syncAdminSkills(path.join(projectUser.homeDir, ".claude"), projectUser.username);
+  }
+
+  // Provision databases for isolated users (catches newly-installed engines)
+  if (projectUser) {
+    const engines = databasesInstalled();
+    if (engines.postgresql || engines.mariadb || engines.redis) {
+      let mapping = {};
+      try { mapping = JSON.parse(fs.readFileSync(ISOLATION_MAP, "utf8")); } catch {}
+      const entry = mapping[projectUser.username];
+      if (entry && !entry.databases) {
+        const newDbs = databasesProvision(projectUser.username);
+        if (newDbs) {
+          entry.databases = newDbs;
+          fs.writeFileSync(ISOLATION_MAP, JSON.stringify(mapping, null, 2));
+        }
+      }
+      databasesWriteEnv(userId, projectUser.username);
+      databasesAppendClaudeMd(path.join(projectUser.homeDir, ".claude"));
+    }
   }
 
   // Security rules go in .claude/CLAUDE.md (hidden directory) — written once
