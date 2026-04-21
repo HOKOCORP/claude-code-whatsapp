@@ -1762,6 +1762,67 @@ setInterval(cleanupFrozenSessions, 6 * 3600000);
 // Also run once at startup (after 30s to let things settle)
 setTimeout(cleanupFrozenSessions, 30000);
 
+// ── OAuth token watchdog ────────────────────────────────────────
+// Periodically checks token expiry, fixes broken symlinks, and alerts
+// admin before sessions start failing with 401.
+
+let _tokenAlertSent = 0; // timestamp of last alert (avoid spam)
+
+function credentialWatchdog() {
+  const credsFile = path.join(os.homedir(), ".claude", ".credentials.json");
+  const accountsDir = path.join(os.homedir(), ".claude", "accounts");
+  const defaultAccount = path.join(accountsDir, "default.json");
+
+  // 1. Fix broken symlink: /login writes a regular file, breaking the chain
+  try {
+    const stat = fs.lstatSync(credsFile);
+    if (!stat.isSymbolicLink() && stat.isFile()) {
+      // .credentials.json is a regular file — copy to accounts/default.json and re-symlink
+      fs.copyFileSync(credsFile, defaultAccount);
+      fs.unlinkSync(credsFile);
+      fs.symlinkSync(defaultAccount, credsFile);
+      try { fs.chmodSync(defaultAccount, 0o640); } catch {}
+      try { fs.chownSync(defaultAccount, 0, (() => { try { return parseInt(execFileSync("getent", ["group", "ccm-auth"], { encoding: "utf8" }).split(":")[2]); } catch { return 0; } })()); } catch {}
+      log("credential-watchdog: restored .credentials.json symlink after /login overwrote it");
+    }
+  } catch {}
+
+  // 2. Fix permissions (Claude Code resets to 0600 on token refresh)
+  fixCredentialPermissions();
+
+  // 3. Check token expiry
+  let oauth = {};
+  try {
+    const creds = JSON.parse(fs.readFileSync(defaultAccount, "utf8"));
+    oauth = creds.claudeAiOauth || {};
+  } catch { return; }
+
+  const expiresAt = oauth.expiresAt || 0;
+  const now = Date.now();
+  const remainingMin = (expiresAt - now) / 60000;
+
+  if (expiresAt > 0 && remainingMin < 30 && now - _tokenAlertSent > 3600000) {
+    // Token expires in <30 min (or already expired) — alert admin
+    const admin = loadAdmin();
+    if (admin?.jid && sock && connectionReady) {
+      const status = remainingMin <= 0
+        ? "⚠️ *OAuth token EXPIRED.* All isolated sessions will fail with 401."
+        : `⚠️ *OAuth token expires in ${Math.round(remainingMin)} minutes.*`;
+      const msg = `${status}\n\nSSH into this server and run:\n\`\`\`\nclaude\n/login\n\`\`\`\nThis refreshes credentials for all workspaces.`;
+      try {
+        sock.sendMessage(toJid(admin.jid), { text: msg });
+        _tokenAlertSent = now;
+        log(`credential-watchdog: sent token expiry alert (${Math.round(remainingMin)}min remaining)`);
+      } catch {}
+    }
+  }
+}
+
+// Check every 10 minutes
+setInterval(credentialWatchdog, 10 * 60000);
+// Run once at startup (after 60s)
+setTimeout(credentialWatchdog, 60000);
+
 // ── Capacity / account exhaustion ────────────────────────────────
 
 const CAPACITY_FLAG = "/var/lib/ccm/capacity-blocked";
