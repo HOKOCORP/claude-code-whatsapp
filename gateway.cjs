@@ -1918,15 +1918,19 @@ function ensureUserConfig(userId, userJid) {
     if (!fs.existsSync(sf)) fs.writeFileSync(sf, autoApproveSettings);
   }
 
-  // Pre-populate .claude.json project entry so Claude Code auto-trusts the MCP server
+  // Pre-populate .claude.json project entry so Claude Code auto-trusts the MCP server.
+  // Always re-apply enabledMcpjsonServers because Claude Code strips it on startup.
   const claudeJsonPath = path.join(userHomeDir, ".claude.json");
   try {
     const claudeJson = JSON.parse(fs.readFileSync(claudeJsonPath, "utf8"));
     if (!claudeJson.projects) claudeJson.projects = {};
     const projKey = userWorkDir;
-    if (!claudeJson.projects[projKey] || !claudeJson.projects[projKey].hasTrustDialogAccepted) {
+    const proj = claudeJson.projects[projKey] || {};
+    const needsUpdate = !proj.hasTrustDialogAccepted
+      || !proj.enabledMcpjsonServers || !proj.enabledMcpjsonServers.includes("whatsapp");
+    if (needsUpdate) {
       claudeJson.projects[projKey] = {
-        ...(claudeJson.projects[projKey] || {}),
+        ...proj,
         allowedTools: ["mcp__whatsapp__reply", "mcp__whatsapp__react", "mcp__whatsapp__download_attachment", "mcp__whatsapp__fetch_messages"],
         mcpServers: {},
         enabledMcpjsonServers: ["whatsapp"],
