@@ -2539,49 +2539,62 @@ async function connectWhatsApp() {
       fs.writeFileSync(metaFile, JSON.stringify(userMeta, null, 2) + "\n");
 
       // ── TOS acceptance gate ─────────────────────────────────────
-      // Non-admin users must agree to TOS before using the bot.
-      // Admin is always exempt. Acceptance stored in meta.json.
+      // Each user must individually agree to TOS before using the bot.
+      // In groups, tracked per-sender in meta.json.tosAcceptedUsers[].
+      // In DMs, tracked as tosAccepted on the user's own meta.
+      // Admin is always exempt.
       const adminCheck = loadAdmin();
-      const isAdmin = adminCheck && (
+      const isAdminSender = adminCheck && (
         adminCheck.jid === senderJid || toJid(adminCheck.jid) === senderJid
         || formatJid(adminCheck.jid) === formatJid(senderJid)
       );
-      if (!isAdmin && !userMeta.tosAccepted) {
-        const rawText = (extractText(msg.message) || "").trim().toLowerCase();
-        // Strict match: must be exactly "agree" or "i agree" (not "i don't agree", etc.)
-        const isAccept = /^(i\s+)?agree\.?$/i.test(rawText);
-        if (isAccept) {
-          userMeta.tosAccepted = true;
-          userMeta.tosAcceptedAt = new Date().toISOString();
-          userMeta.tosAcceptedBy = senderJid;
-          fs.writeFileSync(metaFile, JSON.stringify(userMeta, null, 2) + "\n");
-          try {
-            await sock.sendMessage(jid, { text: "✅ Terms accepted. Let's get started! How can I help?" });
-          } catch {}
-          log(`tos: accepted by ${formatJid(senderJid)} in ${userId}`);
+      if (!isAdminSender) {
+        const acceptedUsers = userMeta.tosAcceptedUsers || [];
+        const senderAccepted = isGroup
+          ? acceptedUsers.includes(senderJid) || acceptedUsers.includes(formatJid(senderJid))
+          : userMeta.tosAccepted;
+        if (!senderAccepted) {
+          const rawText = (extractText(msg.message) || "").trim();
+          // Strict match: exactly "agree" or "I agree" (not "I don't agree")
+          const isAccept = /^(i\s+)?agree\.?$/i.test(rawText);
+          if (isAccept) {
+            if (isGroup) {
+              if (!userMeta.tosAcceptedUsers) userMeta.tosAcceptedUsers = [];
+              userMeta.tosAcceptedUsers.push(senderJid);
+            } else {
+              userMeta.tosAccepted = true;
+            }
+            userMeta.tosLastAcceptedAt = new Date().toISOString();
+            fs.writeFileSync(metaFile, JSON.stringify(userMeta, null, 2) + "\n");
+            try {
+              await sock.sendMessage(jid, { text: "✅ Terms accepted. Let's get started! How can I help?" });
+            } catch {}
+            log(`tos: accepted by ${formatJid(senderJid)} in ${userId}`);
+            continue;
+          }
+          // Not yet accepted — send TOS prompt (once per sender via _tosSentTo)
+          const tosSentTo = userMeta._tosSentTo || [];
+          if (!tosSentTo.includes(senderJid)) {
+            try {
+              await sock.sendMessage(jid, { text:
+                "👋 Welcome! Before we begin, please review our terms:\n\n"
+                + "• All code and assets generated here are intellectual property of HOKO CORP LIMITED\n"
+                + "• AI-generated prototypes require professional review before production use\n"
+                + "• Deployment and source code licensing available through HOKOCORP\n\n"
+                + "Full terms: https://ccm.hokocorp.com/terms\n\n"
+                + "Reply *agree* to continue."
+              });
+            } catch {}
+            if (!userMeta._tosSentTo) userMeta._tosSentTo = [];
+            userMeta._tosSentTo.push(senderJid);
+            fs.writeFileSync(metaFile, JSON.stringify(userMeta, null, 2) + "\n");
+          } else {
+            try {
+              await sock.sendMessage(jid, { text: "Please reply *agree* to accept the terms before we can get started.\n\nFull terms: https://ccm.hokocorp.com/terms" });
+            } catch {}
+          }
           continue;
         }
-        // Not yet accepted — send TOS prompt
-        if (!userMeta._tosSent) {
-          try {
-            await sock.sendMessage(jid, { text:
-              "👋 Welcome! Before we begin, please review our terms:\n\n"
-              + "• All code and assets generated here are intellectual property of HOKO CORP LIMITED\n"
-              + "• AI-generated prototypes require professional review before production use\n"
-              + "• Deployment and source code licensing available through HOKOCORP\n\n"
-              + "Full terms: https://ccm.hokocorp.com/terms\n\n"
-              + "Reply *agree* to continue."
-            });
-          } catch {}
-          userMeta._tosSent = true;
-          fs.writeFileSync(metaFile, JSON.stringify(userMeta, null, 2) + "\n");
-        } else {
-          // Already sent TOS, user sent something else — gentle reminder
-          try {
-            await sock.sendMessage(jid, { text: "Please reply *agree* to accept the terms before we can get started.\n\nFull terms: https://ccm.hokocorp.com/terms" });
-          } catch {}
-        }
-        continue;
       }
 
       let text = extractText(msg.message); const media = extractMediaInfo(msg.message);
