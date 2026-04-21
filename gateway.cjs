@@ -742,7 +742,7 @@ async function handleGroupAdminCommands({ sock, msg, jid, participant }) {
       try { fs.chmodSync(envFile, 0o640); } catch {}
       if (ISOLATION) {
         const gUser = isolationGetUsername(groupUserId);
-        try { execFileSync("chown", [`${gUser}:ccm-gw`, envFile]); } catch {}
+        try { execFileSync("id", [gUser], { stdio: "ignore" }); execFileSync("chown", [`${gUser}:ccm-gw`, envFile]); } catch {}
       }
     };
 
@@ -978,13 +978,20 @@ function sanitizeUserId(jid) { return formatJid(jid).replace(/[^a-zA-Z0-9]/g, "_
 function getUserDir(userId) {
   const dir = path.join(USERS_DIR, userId);
   for (const sub of ["inbox", "outbox", "permissions", "downloads"]) fs.mkdirSync(path.join(dir, sub), { recursive: true });
-  // In isolation mode, the project user owns the IPC directory; admin (gateway) accesses via root
+  // In isolation mode, fix ownership ONLY if the project user already exists.
+  // On first message the user hasn't been created yet (ensureProjectUser runs
+  // later in ensureUserConfig). Trying to chown to a non-existent user causes
+  // cascading errors that can skip domain/database provisioning.
   if (ISOLATION) {
     const username = isolationGetUsername(userId);
-    // Owner: project user (can read/write their own IPC)
-    // Group: ccm-gw (admin/gateway can read/write, other project users cannot)
-    try { execFileSync("chown", ["-R", `${username}:ccm-gw`, dir]); } catch {}
-    try { execFileSync("chmod", ["770", dir]); } catch {}
+    try {
+      execFileSync("id", [username], { stdio: "ignore" });
+      // User exists — safe to chown
+      try { execFileSync("chown", ["-R", `${username}:ccm-gw`, dir]); } catch {}
+      try { execFileSync("chmod", ["770", dir]); } catch {}
+    } catch {
+      // User doesn't exist yet — skip chown, ensureProjectUser will handle it
+    }
   }
   return dir;
 }
@@ -1873,6 +1880,12 @@ function isSessionRunning(sessionName) {
 function ensureUserConfig(userId, userJid) {
   const userDir = getUserDir(userId);
   const projectUser = ISOLATION ? ensureProjectUser(userId, userJid) : null;
+  // Fix IPC dir ownership now that ensureProjectUser has created the user
+  // (getUserDir skips chown if user doesn't exist yet on first message)
+  if (projectUser) {
+    try { execFileSync("chown", ["-R", `${projectUser.username}:ccm-gw`, userDir]); } catch {}
+    try { execFileSync("chmod", ["770", userDir]); } catch {}
+  }
   const userWorkDir = projectUser
     ? path.join(projectUser.homeDir, "workspace")
     : path.join(userDir, "workspace");
