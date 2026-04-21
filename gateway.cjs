@@ -2550,8 +2550,9 @@ async function connectWhatsApp() {
       );
       if (!isAdminSender) {
         const acceptedUsers = userMeta.tosAcceptedUsers || [];
+        // Groups: check per-user list OR group-level flag (grandfathered groups)
         const senderAccepted = isGroup
-          ? acceptedUsers.includes(senderJid) || acceptedUsers.includes(formatJid(senderJid))
+          ? userMeta.tosAccepted || acceptedUsers.includes(senderJid) || acceptedUsers.includes(formatJid(senderJid))
           : userMeta.tosAccepted;
         if (!senderAccepted) {
           const rawText = (extractText(msg.message) || "").trim();
