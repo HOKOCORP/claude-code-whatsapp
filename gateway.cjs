@@ -1808,21 +1808,23 @@ function credentialWatchdog() {
   const now = Date.now();
   const remainingMin = (expiresAt - now) / 60000;
 
-  if (expiresAt > 0 && remainingMin < 10 && now - _tokenAlertSent > 3600000) {
-    // Token expires in <10 min (or already expired) — alert admin
-    // Threshold is 10min (not 30) because cron auto-refreshes every 20min
+  // Only alert if token is ACTUALLY expired (cron handles pre-expiry refresh).
+  // Log a warning for near-expiry but don't message the admin — the cron
+  // auto-refreshes every 20 min and false alerts are worse than no alert.
+  if (expiresAt > 0 && remainingMin <= 0 && now - _tokenAlertSent > 3600000) {
     const admin = loadAdmin();
     if (admin?.jid && sock && connectionReady) {
-      const status = remainingMin <= 0
-        ? "⚠️ *OAuth token EXPIRED.* All isolated sessions will fail with 401."
-        : `⚠️ *OAuth token expires in ${Math.round(remainingMin)} minutes.*`;
-      const msg = `${status}\n\nSSH into this server and run:\n\`\`\`\nclaude\n/login\n\`\`\`\nThis refreshes credentials for all workspaces.`;
+      const msg = "⚠️ *OAuth token EXPIRED.* Auto-refresh cron may have failed.\n\n"
+        + "SSH into this server and run:\n```\nclaude\n/login\n```\n"
+        + "Then check: `cat /tmp/claude-token-refresh.log`";
       try {
         sock.sendMessage(toJid(admin.jid), { text: msg });
         _tokenAlertSent = now;
-        log(`credential-watchdog: sent token expiry alert (${Math.round(remainingMin)}min remaining)`);
+        log(`credential-watchdog: token EXPIRED — sent alert`);
       } catch {}
     }
+  } else if (expiresAt > 0 && remainingMin < 15) {
+    log(`credential-watchdog: token low (${Math.round(remainingMin)}min) — cron should refresh`);
   }
 }
 
