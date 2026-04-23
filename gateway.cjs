@@ -1808,8 +1808,9 @@ function credentialWatchdog() {
   const now = Date.now();
   const remainingMin = (expiresAt - now) / 60000;
 
-  if (expiresAt > 0 && remainingMin < 30 && now - _tokenAlertSent > 3600000) {
-    // Token expires in <30 min (or already expired) — alert admin
+  if (expiresAt > 0 && remainingMin < 10 && now - _tokenAlertSent > 3600000) {
+    // Token expires in <10 min (or already expired) — alert admin
+    // Threshold is 10min (not 30) because cron auto-refreshes every 20min
     const admin = loadAdmin();
     if (admin?.jid && sock && connectionReady) {
       const status = remainingMin <= 0
