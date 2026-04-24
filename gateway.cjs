@@ -2802,7 +2802,7 @@ async function connectWhatsApp() {
 
       // Block terminal-only slash commands that hijack the Claude Code session
       // (e.g. /btw opens a side conversation that hangs waiting for terminal input)
-      const BLOCKED_COMMANDS = ["/btw", "/login", "/logout", "/doctor", "/config", "/fast", "/slow"];
+      const BLOCKED_COMMANDS = ["/btw", "/login", "/logout", "/doctor", "/config"];
       const trimmedText = (text || "").trimStart().toLowerCase();
       const blockedCmd = BLOCKED_COMMANDS.find((cmd) => trimmedText === cmd || trimmedText.startsWith(cmd + " "));
       if (blockedCmd) {
