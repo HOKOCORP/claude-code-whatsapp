@@ -2800,6 +2800,18 @@ async function connectWhatsApp() {
       if (isGroup) { meta.group = "true"; meta.sender_name = senderName; }
       if (media) { meta.attachment_count = "1"; meta.attachments = `${media.filename || media.type + "." + mimeToExt(media.mimetype)} (${media.mimetype}, ${(media.size / 1024).toFixed(0)}KB)`; }
 
+      // Block terminal-only slash commands that hijack the Claude Code session
+      // (e.g. /btw opens a side conversation that hangs waiting for terminal input)
+      const BLOCKED_COMMANDS = ["/btw", "/login", "/logout", "/doctor", "/config", "/fast", "/slow", "/effort"];
+      const trimmedText = (text || "").trimStart().toLowerCase();
+      const blockedCmd = BLOCKED_COMMANDS.find((cmd) => trimmedText === cmd || trimmedText.startsWith(cmd + " "));
+      if (blockedCmd) {
+        try {
+          await sock.sendMessage(jid, { text: `⚠️ \`${blockedCmd}\` is a terminal-only command and can't be used via WhatsApp. Just send your message normally.` });
+        } catch {}
+        continue;
+      }
+
       const inboxMsg = { content: text || (media ? `(${media.type})` : "(empty)"), meta, raw_msg_id: msgId };
       const tmp = path.join(userDir, "inbox", `.${Date.now()}-${msgId}.tmp`);
       const final = path.join(userDir, "inbox", `${Date.now()}-${msgId}.json`);
