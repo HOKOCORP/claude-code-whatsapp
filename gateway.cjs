@@ -326,9 +326,10 @@ function checkUserLimit(userId) {
   const balance = usage.balance || 0;
   const warnAt = config.warn_balance || 1.00; // warn at $1.00
 
-  // Admin is unlimited — still track cost but never block
+  // Admin is unlimited — still track cost but never block.
+  // Multi-admin: any admin's userId matches.
   const admin = loadAdmin();
-  const isAdmin = admin && userId === sanitizeUserId(admin.jid);
+  const isAdmin = !!admin && (admin.jids || []).some(a => sanitizeUserId(a) === userId);
   if (isAdmin) {
     return { allowed: true, balance, warned: false, isAdmin: true };
   }
@@ -366,27 +367,71 @@ function addToWhitelist(jid) {
   if (!access.allowFrom.some((a) => toJid(a) === jid || a === jid)) { access.allowFrom.push(jid); fs.writeFileSync(ACCESS_FILE, JSON.stringify(access, null, 2) + "\n"); log(`whitelist: added ${jid}`); }
 }
 function loadAdmin() {
+  // Returns { jid, jids } — `jid` is the primary (first) admin for
+  // backward compat with code that reads admin.jid; `jids` is the
+  // full list of admin JIDs. Returns null if no admins configured.
+  //
+  // Reads either old single-admin format `{"jid": "..."}` or new
+  // multi-admin format `{"jids": ["...", "..."]}`. On every read we
+  // also normalise to the new shape for callers.
+  //
   // Prefer the server-level global admin when present. Fall back to
   // the per-channel admin file for backward compatibility — on every
   // successful fallback we also write the global file so the next
   // boot sees it natively (auto-migration without needing a separate
   // step). Both reads swallow errors and return null on any parse
   // failure, so a corrupt file can't crash the gateway.
+  function _normalize(obj) {
+    if (!obj) return null;
+    let jids = [];
+    if (Array.isArray(obj.jids)) jids = obj.jids.filter(Boolean);
+    else if (obj.jid) jids = [obj.jid];
+    if (jids.length === 0) return null;
+    return { jid: jids[0], jids };
+  }
   try {
     const g = JSON.parse(fs.readFileSync(GLOBAL_ADMIN_FILE, "utf8"));
-    if (g && g.jid) return g;
+    const n = _normalize(g);
+    if (n) return n;
   } catch {}
   try {
     const local = JSON.parse(fs.readFileSync(ADMIN_FILE, "utf8"));
-    if (local && local.jid) {
+    const n = _normalize(local);
+    if (n) {
       try {
         fs.mkdirSync(path.dirname(GLOBAL_ADMIN_FILE), { recursive: true });
         fs.writeFileSync(GLOBAL_ADMIN_FILE, JSON.stringify(local) + "\n");
       } catch {}
-      return local;
+      return n;
     }
   } catch {}
   return null;
+}
+
+// Does `targetJid` match any admin in `admin.jids`? Handles all the JID
+// format variants (LID, s.whatsapp.net, raw number). Pass `admin` from
+// loadAdmin() to avoid reloading.
+function isAdminJid(targetJid, admin) {
+  if (!admin || !Array.isArray(admin.jids) || admin.jids.length === 0) return false;
+  if (!targetJid) return false;
+  const targetFmt = formatJid(targetJid);
+  return admin.jids.some(a =>
+    a === targetJid || toJid(a) === targetJid || formatJid(a) === targetFmt
+  );
+}
+
+// Persist a list of admin JIDs. Writes the new {jids: [...]} format to
+// both the per-channel and global admin files for backward compat.
+// Pass [] to clear all admins (rare; usually you want to /admin remove
+// individually).
+function saveAdmins(jids) {
+  const obj = { jids: Array.isArray(jids) ? jids.filter(Boolean) : [] };
+  const txt = JSON.stringify(obj) + "\n";
+  fs.writeFileSync(ADMIN_FILE, txt);
+  try {
+    fs.mkdirSync(path.dirname(GLOBAL_ADMIN_FILE), { recursive: true });
+    fs.writeFileSync(GLOBAL_ADMIN_FILE, txt);
+  } catch {}
 }
 
 function adminQuotaFilePath() { return path.join(IPC_BASE, "admin-quota.json"); }
@@ -522,8 +567,7 @@ async function handleInviteCommands({ sock, msg, jid }) {
   const inviteMatch = /^\/invite(?:\s+(\d+(?:\.\d{1,2})?))?\s*$/i.exec(rawText);
   if (inviteMatch) {
     const adminCheck = loadAdmin();
-    const isAdminUser = adminCheck && (adminCheck.jid === jid || toJid(adminCheck.jid) === jid);
-    if (!isAdminUser) {
+    if (!isAdminJid(jid, adminCheck)) {
       try { await sock.sendMessage(jid, { text: "🚫 /invite is admin-only." }); } catch {}
       return true;
     }
@@ -642,12 +686,7 @@ async function handleGroupAdminCommands({ sock, msg, jid, participant }) {
 
   const senderJid = participant || "";
   const adminCheck = loadAdmin();
-  const isAdminSender = adminCheck && (
-    adminCheck.jid === senderJid
-    || toJid(adminCheck.jid) === senderJid
-    || formatJid(adminCheck.jid) === formatJid(senderJid)
-  );
-  if (!isAdminSender) {
+  if (!isAdminJid(senderJid, adminCheck)) {
     // Silent: don't leak the command surface to non-admin group members.
     return false;
   }
@@ -858,23 +897,132 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
   const lower = rawText.toLowerCase();
 
   // All commands here are admin-only.
+  const isAdminCmd = (
+    lower === "/admin"
+    || lower === "/admin list"
+    || /^\/admin\s+(add|remove)\s+/i.test(rawText)
+    || rawText === "I CONFIRM SAME PERSON"
+  );
   if (lower !== "/users"
       && !/^\/rename\s+/i.test(rawText)
-      && !/^\/topup\s+/i.test(rawText)) {
+      && !/^\/topup\s+/i.test(rawText)
+      && !isAdminCmd) {
     return false;
   }
 
   const adminCheck = loadAdmin();
-  const isAdminUser = adminCheck && (adminCheck.jid === jid || toJid(adminCheck.jid) === jid);
-  if (!isAdminUser) {
+  if (!isAdminJid(jid, adminCheck)) {
     try { await sock.sendMessage(jid, { text: "🚫 That command is admin-only." }); } catch {}
+    return true;
+  }
+
+  // ── /admin add/remove/list ──────────────────────────────────
+  // Multi-admin support. All admins must be the same human (per
+  // Anthropic Consumer Terms §2 — account sharing is prohibited).
+  // Add flow is two-step: bot prompts with same-person warning,
+  // requester replies "I CONFIRM SAME PERSON" within 5 minutes.
+  if (isAdminCmd) {
+    const PENDING_FILE = path.join(STATE_DIR, "admin-pending.json");
+    const PENDING_TTL_MS = 5 * 60 * 1000;
+    const loadPending = () => {
+      try { return JSON.parse(fs.readFileSync(PENDING_FILE, "utf8")); } catch { return {}; }
+    };
+    const savePending = (obj) => {
+      try { fs.writeFileSync(PENDING_FILE, JSON.stringify(obj, null, 2) + "\n"); } catch {}
+    };
+
+    if (lower === "/admin" || lower === "/admin list") {
+      const lines = [`👑 *Admins* (${adminCheck.jids.length})`, ""];
+      for (const a of adminCheck.jids) lines.push(`• ${formatJid(a)}`);
+      lines.push("", "Manage:", "  `/admin add +<number>`", "  `/admin remove +<number>`");
+      try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
+      return true;
+    }
+
+    const addMatch = /^\/admin\s+add\s+\+?(\d{6,15})\s*$/i.exec(rawText);
+    if (addMatch) {
+      const newJid = toJid(addMatch[1]);
+      if (isAdminJid(newJid, adminCheck)) {
+        try { await sock.sendMessage(jid, { text: `ℹ️ \`${formatJid(newJid)}\` is already an admin.` }); } catch {}
+        return true;
+      }
+      const pending = loadPending();
+      pending[jid] = { newJid, expiresAt: Date.now() + PENDING_TTL_MS };
+      savePending(pending);
+      try {
+        await sock.sendMessage(jid, { text:
+          "⚠️ *Confirmation required*\n\n"
+          + `You're about to add \`${formatJid(newJid)}\` as an admin.\n\n`
+          + "*Important — Anthropic ToS §2:* All admin numbers must belong to the *same person* who owns the linked Anthropic account. Sharing the account across people violates the Consumer Terms.\n\n"
+          + "If this number belongs to *the same human* who owns the Anthropic account, reply with exactly:\n\n"
+          + "*I CONFIRM SAME PERSON*\n\n"
+          + "Anything else cancels. Expires in 5 minutes."
+        });
+      } catch {}
+      log(`admin: ${formatJid(jid)} requested add of ${formatJid(newJid)} (pending confirm)`);
+      return true;
+    }
+
+    const removeMatch = /^\/admin\s+remove\s+\+?(\d{6,15})\s*$/i.exec(rawText);
+    if (removeMatch) {
+      const targetJid = toJid(removeMatch[1]);
+      if (!isAdminJid(targetJid, adminCheck)) {
+        try { await sock.sendMessage(jid, { text: `❌ \`${formatJid(targetJid)}\` is not currently an admin.` }); } catch {}
+        return true;
+      }
+      const remaining = adminCheck.jids.filter(a =>
+        !(a === targetJid || toJid(a) === targetJid || formatJid(a) === formatJid(targetJid))
+      );
+      if (remaining.length === 0) {
+        try { await sock.sendMessage(jid, { text: "❌ Cannot remove the last admin. Add another admin first, or use ccm to reset." }); } catch {}
+        return true;
+      }
+      saveAdmins(remaining);
+      log(`admin: ${formatJid(jid)} removed ${formatJid(targetJid)} (${remaining.length} admin(s) remain)`);
+      try { await sock.sendMessage(jid, { text: `✅ Removed \`${formatJid(targetJid)}\` from admins. (${remaining.length} remain)` }); } catch {}
+      return true;
+    }
+
+    if (rawText === "I CONFIRM SAME PERSON") {
+      const pending = loadPending();
+      const entry = pending[jid];
+      if (!entry || !entry.newJid) {
+        try { await sock.sendMessage(jid, { text: "ℹ️ No pending admin add to confirm. Use `/admin add +<number>` first." }); } catch {}
+        return true;
+      }
+      if (Date.now() > (entry.expiresAt || 0)) {
+        delete pending[jid];
+        savePending(pending);
+        try { await sock.sendMessage(jid, { text: "⏱️ Confirmation expired. Run `/admin add +<number>` again to retry." }); } catch {}
+        return true;
+      }
+      // Add and persist
+      const newJids = [...adminCheck.jids];
+      if (!isAdminJid(entry.newJid, adminCheck)) newJids.push(entry.newJid);
+      saveAdmins(newJids);
+      delete pending[jid];
+      savePending(pending);
+      log(`admin: ${formatJid(jid)} confirmed add of ${formatJid(entry.newJid)} (${newJids.length} admin(s) total)`);
+      try { await sock.sendMessage(jid, { text: `✅ Added \`${formatJid(entry.newJid)}\` as admin. (${newJids.length} total)` }); } catch {}
+      return true;
+    }
+
+    // /admin without a recognised subcommand — show usage
+    try {
+      await sock.sendMessage(jid, { text:
+        "Admin management:\n"
+        + "  `/admin` or `/admin list` — list current admins\n"
+        + "  `/admin add +<number>` — add (requires same-person confirmation)\n"
+        + "  `/admin remove +<number>` — remove"
+      });
+    } catch {}
     return true;
   }
 
   if (lower === "/users") {
     let entries;
     try { entries = fs.readdirSync(USERS_DIR); } catch { entries = []; }
-    const adminJid = adminCheck?.jid;
+    const adminJids = (adminCheck && adminCheck.jids) || [];
     // The bot's own phone shows up as a "user" if anything ever DMed it
     // from itself — filter it out, it's never a real user.
     const ownNumber = String(PHONE || "");
@@ -889,7 +1037,7 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
       // Linux account and subdomain, same as individual users.
       const hash = displayHashFor(uid, meta);
       const name = meta.name || meta.pushName || formatJid(meta.jid || uid);
-      const isAdminRow = !isGroup && adminJid && (meta.jid === adminJid || toJid(adminJid) === meta.jid);
+      const isAdminRow = !isGroup && adminJids.length > 0 && isAdminJid(meta.jid, adminCheck);
       const u = loadUserUsage(uid);
       const lastSeen = meta.lastSeen ? meta.lastSeen.slice(0, 10) : "—";
       rows.push({ hash, name, isAdmin: isAdminRow, isGroup, balance: u.balance || 0, lastSeen });
@@ -1302,7 +1450,7 @@ function ensureProjectUser(userId, userJid) {
     // (e.g. ccm-install added the user before an admin was set, and
     // the admin is now set).
     const _adminCheck = loadAdmin();
-    if (_adminCheck && (_adminCheck.jid === userJid || toJid(_adminCheck.jid) === userJid)) {
+    if (isAdminJid(userJid, _adminCheck)) {
       grantAdminEnvAccess(username, homeDir);
     }
     return { username, homeDir, port };
@@ -1507,7 +1655,7 @@ function ensureProjectUser(userId, userJid) {
   // If this user is the admin, grant /root/.env access (ACL + symlink)
   // so claude sessions inherit GITHUB_TOKEN etc from ccm Settings.
   const _adminCheck2 = loadAdmin();
-  if (_adminCheck2 && (_adminCheck2.jid === userJid || toJid(_adminCheck2.jid) === userJid)) {
+  if (isAdminJid(userJid, _adminCheck2)) {
     grantAdminEnvAccess(username, homeDir);
   }
 
@@ -2115,7 +2263,7 @@ function spawnUserSession(userId, userJid) {
   // and env/printenv tool access. Non-admin users get ANTHROPIC_API_KEY
   // only, preventing exfiltration of GITHUB_TOKEN, CF keys, etc.
   const admin = loadAdmin();
-  const isAdmin = admin && (admin.jid === userJid || toJid(admin.jid) === userJid);
+  const isAdmin = isAdminJid(userJid, admin);
 
   const allowedTools = [
     "mcp__whatsapp__reply", "mcp__whatsapp__react", "mcp__whatsapp__download_attachment", "mcp__whatsapp__fetch_messages",
@@ -2401,16 +2549,10 @@ async function connectWhatsApp() {
         const otp = loadOtp();
         if (otp && extractText(msg.message || {}).trim().toUpperCase() === otp.code) {
           if (otp.type === "admin") {
-            // Write both the per-channel admin (legacy consumers still
-            // read ADMIN_FILE directly) AND the global admin file (the
-            // new source of truth for /usage quota, cross-channel polls,
-            // and future ccm admin management).
-            const adminJson = JSON.stringify({ jid }) + "\n";
-            fs.writeFileSync(ADMIN_FILE, adminJson);
-            try {
-              fs.mkdirSync(path.dirname(GLOBAL_ADMIN_FILE), { recursive: true });
-              fs.writeFileSync(GLOBAL_ADMIN_FILE, adminJson);
-            } catch (e) { log(`global admin write failed: ${e}`); }
+            // Write to both the per-channel and global admin files via
+            // saveAdmins(). The new {jids: [...]} format is forward-
+            // compatible with /admin add/remove (Phase 1).
+            saveAdmins([jid]);
             addToWhitelist(jid);
             try { fs.unlinkSync(OTP_FILE); } catch {}
             try { await sock.sendMessage(jid, { text: "\u2705 You are now the admin of this agent." }); } catch {}
@@ -2455,6 +2597,13 @@ async function connectWhatsApp() {
 
       if (!isAllowed(jid, participant || undefined)) continue;
 
+      // Compute admin status once for use in the group-trigger,
+      // Phase 0 admin gate, and TOS gate below. Avoids three separate
+      // loadAdmin() calls per message.
+      const _admin = loadAdmin();
+      const _senderJid = participant || jid;
+      const _isAdminSender = isAdminJid(_senderJid, _admin);
+
       // Group messages: only respond when triggered
       if (jid.endsWith("@g.us")) {
         const access = loadAccess();
@@ -2482,7 +2631,14 @@ async function connectWhatsApp() {
         // command for the bot", matching every major chat product.
         const isSlashCommand = cleanText.trimStart().startsWith("/");
         const isDirectMode = (access.directGroups || []).includes(jid);
-        if (!isDirectMode && !isSlashCommand && !mentioned && !prefixed && !containsTrigger && !isReplyToBot) {
+        // Phase 1 quote-to-act: an admin's quote-reply to ANY message
+        // (not just the bot's) acts as an explicit invocation. Lets admins
+        // pull other participants' messages into Claude's context without
+        // needing the @ai trigger word, while non-admin quote-replies
+        // still don't trigger the bot (they fall through to Phase 0
+        // gate below where they get filtered out anyway).
+        const isAdminQuoteReply = !!quotedCtx.stanzaId && _isAdminSender;
+        if (!isDirectMode && !isSlashCommand && !mentioned && !prefixed && !containsTrigger && !isReplyToBot && !isAdminQuoteReply) {
           continue;
         }
       }
@@ -2501,31 +2657,21 @@ async function connectWhatsApp() {
       // Bypassed for OTP / invite / group-admin / whitelist flows above
       // because those are pre-access-check; admin still has full access
       // through every existing path including permission replies below.
-      {
-        const _admin = loadAdmin();
-        if (_admin) {
-          const _senderJid = participant || jid;
-          const _isAdminSender = (
-            _admin.jid === _senderJid
-            || toJid(_admin.jid) === _senderJid
-            || formatJid(_admin.jid) === formatJid(_senderJid)
-          );
-          if (!_isAdminSender) {
-            if (!jid.endsWith("@g.us")) {
-              try {
-                await sock.sendMessage(jid, { text:
-                  "🔒 *Access restricted*\n\n"
-                  + "This assistant is currently for the admin's personal use only "
-                  + "while we set up proper multi-user access. Per-user accounts "
-                  + "will be available soon.\n\n"
-                  + "Contact the admin if you need access."
-                });
-              } catch {}
-            }
-            log(`phase0: blocked non-admin sender=${formatJid(_senderJid)} chat=${formatJid(jid)}`);
-            continue;
-          }
+      // Uses _admin / _isAdminSender computed once above.
+      if (_admin && !_isAdminSender) {
+        if (!jid.endsWith("@g.us")) {
+          try {
+            await sock.sendMessage(jid, { text:
+              "🔒 *Access restricted*\n\n"
+              + "This assistant is currently for the admin's personal use only "
+              + "while we set up proper multi-user access. Per-user accounts "
+              + "will be available soon.\n\n"
+              + "Contact the admin if you need access."
+            });
+          } catch {}
         }
+        log(`phase0: blocked non-admin sender=${formatJid(_senderJid)} chat=${formatJid(jid)}`);
+        continue;
       }
 
       // Permission replies from admin
@@ -2586,13 +2732,8 @@ async function connectWhatsApp() {
       // Each user must individually agree to TOS before using the bot.
       // In groups, tracked per-sender in meta.json.tosAcceptedUsers[].
       // In DMs, tracked as tosAccepted on the user's own meta.
-      // Admin is always exempt.
-      const adminCheck = loadAdmin();
-      const isAdminSender = adminCheck && (
-        adminCheck.jid === senderJid || toJid(adminCheck.jid) === senderJid
-        || formatJid(adminCheck.jid) === formatJid(senderJid)
-      );
-      if (!isAdminSender) {
+      // Admins are always exempt — uses _isAdminSender computed earlier.
+      if (!_isAdminSender) {
         const acceptedUsers = userMeta.tosAcceptedUsers || [];
         // Groups: check per-user list OR group-level flag (grandfathered groups)
         const senderAccepted = isGroup
@@ -2681,7 +2822,7 @@ async function connectWhatsApp() {
         ].map(slug => path.join(projectUserHome, ".claude", "projects", slug));
         const sessionName = getUserSessionName(userId);
         const slashAdmin = loadAdmin();
-        const slashIsAdmin = slashAdmin && (slashAdmin.jid === jid || toJid(slashAdmin.jid) === jid);
+        const slashIsAdmin = isAdminJid(jid, slashAdmin);
         const handled = await channelSlash.handleChannelSlashCommand({
           userId,
           text,
