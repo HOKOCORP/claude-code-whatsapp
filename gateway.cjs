@@ -2487,6 +2487,47 @@ async function connectWhatsApp() {
         }
       }
 
+      // ── Phase 0: admin-only triage ─────────────────────────────
+      // While we transition off the shared-OAuth setup (where every
+      // per-user channel routes through claude sessions sharing one
+      // /root/.claude/.credentials.json — Consumer Terms §2 account
+      // sharing), only admin can drive the bot. Non-admin DMs get a
+      // clear rejection; non-admin group mentions are silently dropped
+      // (so the bot just looks unresponsive in groups instead of
+      // announcing access restrictions to every participant).
+      //
+      // Existing per-user tmux sessions stay running but receive no new
+      // routed messages until per-user OAuth or API mode is in place.
+      // Bypassed for OTP / invite / group-admin / whitelist flows above
+      // because those are pre-access-check; admin still has full access
+      // through every existing path including permission replies below.
+      {
+        const _admin = loadAdmin();
+        if (_admin) {
+          const _senderJid = participant || jid;
+          const _isAdminSender = (
+            _admin.jid === _senderJid
+            || toJid(_admin.jid) === _senderJid
+            || formatJid(_admin.jid) === formatJid(_senderJid)
+          );
+          if (!_isAdminSender) {
+            if (!jid.endsWith("@g.us")) {
+              try {
+                await sock.sendMessage(jid, { text:
+                  "🔒 *Access restricted*\n\n"
+                  + "This assistant is currently for the admin's personal use only "
+                  + "while we set up proper multi-user access. Per-user accounts "
+                  + "will be available soon.\n\n"
+                  + "Contact the admin if you need access."
+                });
+              } catch {}
+            }
+            log(`phase0: blocked non-admin sender=${formatJid(_senderJid)} chat=${formatJid(jid)}`);
+            continue;
+          }
+        }
+      }
+
       // Permission replies from admin
       const msgText = extractText(msg.message || {});
       const permMatch = PERMISSION_REPLY_RE.exec(msgText);
