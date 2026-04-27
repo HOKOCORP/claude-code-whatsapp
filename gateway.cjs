@@ -126,20 +126,40 @@ function unregisterFile(dir, filename) {
 // dir → auditEvent(event, extras)
 const outboxAuditors = new Map();
 
-// ── USD wallet ─────────────────────────────────────────────────────
-// Pay-as-you-go USD balance per user. New users start at $0 (blocked).
-// Admin tops up in USD via cc-usage-monitor. Each API call deducts the
-// estimated cost based on model-specific Anthropic pricing.
-// Balance can go negative if a single call overshoots.
+// ── GBP wallet ─────────────────────────────────────────────────────
+// Pay-as-you-go GBP balance per user. New users start at £0. Admin
+// tops up in GBP via /topup or by issuing /code-create redemption
+// codes. Each API call deducts cost computed from Anthropic's pricing
+// in USD, then multiplied by the user's mode markup. Internally we
+// peg 1 GBP = 1 USD (a deliberate ~28% FX margin baked in); never
+// surface USD to users.
 //
-// Config:  ~/.ccm/usage/limits.json   (warn_balance in USD)
-// Data:    ~/.ccm/usage/<userId>.json (balance in USD, history, monthly breakdown)
+// Markup by mode (applied to the underlying USD API cost):
+//   admin       0x  (admin's OAuth, unmetered)
+//   api-shared  2x  (using admin's API key — bot bills cost + 1x markup)
+//   api-byok    1x  (user pays Anthropic directly via own key — bot
+//                    charges 1x as a service fee for the infrastructure)
+//
+// Config:  ~/.ccm/usage/limits.json   (warn_balance, min_balance in GBP)
+// Data:    ~/.ccm/usage/<userId>.json (balance in GBP, history, monthly)
 
-// API pricing: dollars per million tokens (current Anthropic rates)
+// Anthropic published pricing: USD per million tokens. Update when
+// Anthropic changes rates or new models ship. The lookup key is a
+// prefix — any model id that starts with one of these keys uses that
+// row (so claude-opus-4-7 and claude-opus-4-7-20260101 both match).
 const MODEL_PRICING = {
+  "claude-opus-4-7":   { input: 15, output: 75, cache_5m: 18.75, cache_1h: 22.50, cache_read: 1.50 },
   "claude-opus-4-6":   { input: 15, output: 75, cache_5m: 18.75, cache_1h: 22.50, cache_read: 1.50 },
   "claude-sonnet-4-6": { input: 3, output: 15, cache_5m: 3.75, cache_1h: 4.50, cache_read: 0.30 },
   "claude-haiku-4-5":  { input: 0.80, output: 4, cache_5m: 1.00, cache_1h: 1.20, cache_read: 0.08 },
+};
+
+// Mode → markup multiplier on the underlying API cost. See header
+// comment above for why these values are what they are.
+const MODE_MARKUP = {
+  "admin":      0,
+  "api-shared": 2,
+  "api-byok":   1,
 };
 
 function getModelPricing(model) {
@@ -147,7 +167,14 @@ function getModelPricing(model) {
   return MODEL_PRICING["claude-sonnet-4-6"]; // default fallback
 }
 
-/** Calculate USD cost for a single API call's token usage */
+function getModeMarkup(mode) {
+  return Object.prototype.hasOwnProperty.call(MODE_MARKUP, mode) ? MODE_MARKUP[mode] : MODE_MARKUP["api-shared"];
+}
+
+/** Format a GBP amount for user-facing display. */
+function fmtGbp(n) { return `£${(n || 0).toFixed(2)}`; }
+
+/** Underlying USD cost for a single API call (no markup). */
 function calcCallCost(usage, model) {
   const p = getModelPricing(model);
   const inp = usage.input_tokens || 0;
@@ -159,8 +186,15 @@ function calcCallCost(usage, model) {
 }
 
 function loadUsageConfig() {
-  try { return JSON.parse(fs.readFileSync(USAGE_LIMITS_FILE, "utf8")); }
-  catch { return { warn_balance: 1.00 }; } // warn when balance drops below $1.00
+  try {
+    const cfg = JSON.parse(fs.readFileSync(USAGE_LIMITS_FILE, "utf8"));
+    return {
+      warn_balance: cfg.warn_balance ?? 5.00,   // warn when balance drops below £5
+      min_balance:  cfg.min_balance  ?? 10.00,  // refuse to reply when balance < £10
+    };
+  } catch {
+    return { warn_balance: 5.00, min_balance: 10.00 };
+  }
 }
 
 function getUserUsageFile(userId) {
@@ -168,16 +202,25 @@ function getUserUsageFile(userId) {
 }
 
 function loadUserUsage(userId) {
-  try { return JSON.parse(fs.readFileSync(getUserUsageFile(userId), "utf8")); }
+  try {
+    const u = JSON.parse(fs.readFileSync(getUserUsageFile(userId), "utf8"));
+    // Forward-compat default: existing user files predate the mode
+    // field. Treat them as api-shared so they get the standard 2x
+    // markup. New /admin commands can move them to api-byok later.
+    if (!u.mode) u.mode = "api-shared";
+    return u;
+  }
   catch {
     return {
       userId,
-      balance: 0,        // current USD balance (can be negative)
-      total_added: 0,    // lifetime USD added by admin
-      total_cost: 0,     // lifetime estimated API cost in USD
-      history: [],       // admin actions: [{ date, action, amount, note }]
-      months: {},        // per-month token breakdown + cost
-      offsets: {},       // incremental .jsonl scan offsets
+      mode: "api-shared",       // api-shared | api-byok | blocked | admin (admin set elsewhere)
+      balance: 0,               // current GBP balance (can be negative)
+      total_added: 0,           // lifetime GBP added (top-ups + redemptions)
+      total_cost_usd: 0,        // lifetime underlying API cost in USD (no markup)
+      total_charged_gbp: 0,     // lifetime GBP deducted from balance (cost × markup)
+      history: [],              // admin actions + redemptions: [{date, action, amount, note}]
+      months: {},               // per-month token breakdown
+      offsets: {},              // incremental .jsonl scan offsets
     };
   }
 }
@@ -298,13 +341,22 @@ function syncUserUsage(userId) {
     usage.offsets[file] = stat.size;
   }
 
-  // Deduct estimated cost from USD balance
+  // Deduct from GBP balance. The underlying USD cost from Anthropic's
+  // pricing is multiplied by the user's mode markup (2x for api-shared,
+  // 1x for api-byok). 1 GBP = 1 USD baked-in; the implicit FX margin is
+  // why we don't apply a separate currency conversion. Admin (markup
+  // 0x) is unmetered — total_cost_usd still tracks for visibility but
+  // no balance deduction.
   if (newCost > 0) {
-    usage.balance = (usage.balance || 0) - newCost;
-    usage.total_cost = (usage.total_cost || 0) + newCost;
+    const markup = getModeMarkup(usage.mode || "api-shared");
+    const userCharge = newCost * markup;
+    usage.balance = (usage.balance || 0) - userCharge;
+    usage.total_cost_usd = (usage.total_cost_usd || 0) + newCost;
+    usage.total_charged_gbp = (usage.total_charged_gbp || 0) + userCharge;
     // Round to avoid floating point drift
     usage.balance = Math.round(usage.balance * 10000) / 10000;
-    usage.total_cost = Math.round(usage.total_cost * 10000) / 10000;
+    usage.total_cost_usd = Math.round(usage.total_cost_usd * 10000) / 10000;
+    usage.total_charged_gbp = Math.round(usage.total_charged_gbp * 10000) / 10000;
   }
 
   // Keep last 3 months
@@ -316,29 +368,46 @@ function syncUserUsage(userId) {
 }
 
 /**
- * Check if a user can send messages. Balance must be > 0.
- * Admin users are always allowed (unlimited usage).
- * Returns { allowed, balance, warned, isAdmin }
+ * Check if a user can send messages. Balance must be ≥ min_balance
+ * (default £10) — bouncing them above zero gives a buffer so a single
+ * runaway response can't drop someone hard-negative. Admin users are
+ * always allowed (unmetered).
+ *
+ * Returns { allowed, balance, warned, blocked, mode, minBalance,
+ *           isAdmin, reason }
+ *   blocked: user.mode is "blocked" (admin-rejected; not a balance issue)
+ *   reason:  "below_min" | "blocked" | null
  */
 function checkUserLimit(userId) {
   const usage = syncUserUsage(userId);
   const config = loadUsageConfig();
   const balance = usage.balance || 0;
-  const warnAt = config.warn_balance || 1.00; // warn at $1.00
+  const warnAt = config.warn_balance;
+  const minBalance = config.min_balance;
+  const mode = usage.mode || "api-shared";
 
-  // Admin is unlimited — still track cost but never block.
-  // Multi-admin: any admin's userId matches.
+  // Admin is unmetered — still track cost but never block. Multi-admin
+  // aware: any admin's userId matches.
   const admin = loadAdmin();
   const isAdmin = !!admin && (admin.jids || []).some(a => sanitizeUserId(a) === userId);
   if (isAdmin) {
-    return { allowed: true, balance, warned: false, isAdmin: true };
+    return { allowed: true, balance, warned: false, blocked: false, mode: "admin", minBalance, isAdmin: true, reason: null };
   }
 
+  if (mode === "blocked") {
+    return { allowed: false, balance, warned: false, blocked: true, mode, minBalance, isAdmin: false, reason: "blocked" };
+  }
+
+  const allowed = balance >= minBalance;
   return {
-    allowed: balance > 0,
+    allowed,
     balance,
-    warned: balance > 0 && balance <= warnAt,
+    warned: allowed && balance <= warnAt,
+    blocked: false,
+    mode,
+    minBalance,
     isAdmin: false,
+    reason: allowed ? null : "below_min",
   };
 }
 
@@ -432,6 +501,102 @@ function saveAdmins(jids) {
     fs.mkdirSync(path.dirname(GLOBAL_ADMIN_FILE), { recursive: true });
     fs.writeFileSync(GLOBAL_ADMIN_FILE, txt);
   } catch {}
+}
+
+// ── Per-user Anthropic API key provisioning ────────────────────────
+// For non-admin users on api-shared mode, write admin's API key into a
+// 0400 file in their isolated home. launch.sh sources it before
+// exec'ing claude so claude authenticates via ANTHROPIC_API_KEY env
+// var (preferred over OAuth). Admin's own per-user setup is unaffected
+// — admin uses OAuth via the existing credentials.json symlink.
+//
+// Source of admin's key: process.env.ANTHROPIC_ADMIN_API_KEY. Set this
+// in /root/.env (e.g. via ccm Settings → Credentials). When unset, no
+// key file is written and shared-key users fall back to whatever
+// claude can find on disk (the OAuth symlink) — which is the §2 path
+// we're trying to retire. The mode-routing gate above will refuse to
+// process their messages until admin configures the key.
+function writePerUserApiKey(username, homeDir, mode) {
+  const keyFile = path.join(homeDir, ".anthropic-key");
+  // Modes other than api-shared shouldn't have admin's shared key sitting
+  // in their home — strip the file so it can't be read accidentally.
+  if (mode !== "api-shared") {
+    try { fs.unlinkSync(keyFile); } catch {}
+    return false;
+  }
+  const adminKey = process.env.ANTHROPIC_ADMIN_API_KEY || "";
+  if (!adminKey) {
+    try { fs.unlinkSync(keyFile); } catch {}
+    return false;
+  }
+  const body = "# Generated by ccm-whatsapp gateway. Sourced by launch.sh.\n"
+    + "# Admin's shared Anthropic API key (api-shared mode).\n"
+    + `export ANTHROPIC_API_KEY=${adminKey}\n`;
+  try {
+    fs.writeFileSync(keyFile, body);
+    execFileSync("chown", [`${username}:${username}`, keyFile], { stdio: "ignore" });
+    fs.chmodSync(keyFile, 0o400);
+    return true;
+  } catch (e) {
+    log(`api-key file write failed for ${username}: ${e}`);
+    return false;
+  }
+}
+
+// ── Top-up codes ───────────────────────────────────────────────────
+// Admin-issued redemption codes that any user can /redeem to credit
+// their GBP balance. Stored at ~/.ccm/topup-codes.json shared across
+// all channels on this box (so admin can mint a code in one channel
+// and a user redeems it in another).
+const TOPUP_CODES_FILE = path.join(os.homedir(), ".ccm", "topup-codes.json");
+// Code alphabet excludes ambiguous chars (0/O, 1/I/L) so codes are
+// safe to read out loud or copy off a screen.
+const TOPUP_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+const TOPUP_CODE_LENGTH = 10;
+
+function loadTopupCodes() {
+  try { return JSON.parse(fs.readFileSync(TOPUP_CODES_FILE, "utf8")); }
+  catch { return { codes: {} }; }
+}
+
+function saveTopupCodes(state) {
+  try {
+    fs.mkdirSync(path.dirname(TOPUP_CODES_FILE), { recursive: true });
+    fs.writeFileSync(TOPUP_CODES_FILE, JSON.stringify(state, null, 2) + "\n");
+  } catch (e) { log(`topup-codes write failed: ${e}`); }
+}
+
+function generateTopupCode() {
+  let s = "";
+  const buf = crypto.randomBytes(TOPUP_CODE_LENGTH);
+  for (let i = 0; i < TOPUP_CODE_LENGTH; i++) {
+    s += TOPUP_CODE_ALPHABET[buf[i] % TOPUP_CODE_ALPHABET.length];
+  }
+  return s;
+}
+
+// Try to redeem a top-up code. Returns:
+//   { ok: true, amount, code }  on success
+//   { ok: false, reason }       on failure (unknown | already_used)
+function redeemTopupCode(rawCode, userJid) {
+  const code = String(rawCode || "").trim().toUpperCase();
+  if (!code) return { ok: false, reason: "missing_code" };
+  const state = loadTopupCodes();
+  const entry = state.codes[code];
+  if (!entry) return { ok: false, reason: "unknown" };
+  if (entry.redeemed_at) return { ok: false, reason: "already_used" };
+  entry.redeemed_at = Date.now();
+  entry.redeemed_by = userJid;
+  saveTopupCodes(state);
+  // Credit the user's balance + log to history.
+  const userId = sanitizeUserId(userJid);
+  const u = loadUserUsage(userId);
+  u.balance = (u.balance || 0) + entry.amount_gbp;
+  u.total_added = (u.total_added || 0) + entry.amount_gbp;
+  u.history = u.history || [];
+  u.history.push({ date: todayKey(), action: "redeem", amount: entry.amount_gbp, note: `code ${code}` });
+  saveUserUsage(userId, u);
+  return { ok: true, amount: entry.amount_gbp, code };
 }
 
 function adminQuotaFilePath() { return path.join(IPC_BASE, "admin-quota.json"); }
@@ -577,10 +742,10 @@ async function handleInviteCommands({ sock, msg, jid }) {
     const link = `https://wa.me/${PHONE}?text=${encodeURIComponent(`/redeem ${invite.code}`)}`;
     // Reply IS the forwardable invite — admin long-presses + forwards as-is.
     const lines = ["👋 You've been invited to HOKO Coder — your personal coding agent on WhatsApp.", ""];
-    if (preFundUsd > 0) lines.push(`💰 Includes $${preFundUsd.toFixed(2)} of credit.`, "");
+    if (preFundUsd > 0) lines.push(`💰 Includes ${fmtGbp(preFundUsd)} of credit.`, "");
     lines.push(`Tap below to accept (single-use, expires ${expiry}):`, link);
     try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch (e) { log(`/invite reply failed: ${e}`); }
-    log(`invite created: ${invite.code}${preFundUsd > 0 ? ` ($${preFundUsd.toFixed(2)})` : ""} by ${formatJid(jid)}`);
+    log(`invite created: ${invite.code}${preFundUsd > 0 ? ` (${fmtGbp(preFundUsd)})` : ""} by ${formatJid(jid)}`);
     try { await sock.readMessages([msg.key]); } catch {}
     return true;
   }
@@ -590,14 +755,39 @@ async function handleInviteCommands({ sock, msg, jid }) {
     try { await sock.readMessages([msg.key]); } catch {}
     const result = invites.redeemInvite(STATE_DIR, redeemMatch[1], jid);
     if (!result.ok) {
+      // Fall through to top-up code redemption when the invite system
+      // doesn't recognise the code. Lets one /redeem command handle
+      // both invite codes (legacy: pull a user into the system + grant
+      // optional pre-fund) and top-up codes (just credit balance).
+      if (result.reason === "unknown") {
+        const topup = redeemTopupCode(redeemMatch[1], jid);
+        if (topup.ok) {
+          const u = loadUserUsage(sanitizeUserId(jid));
+          try {
+            await sock.sendMessage(jid, { text:
+              `✅ Redeemed code \`${topup.code}\` for *${fmtGbp(topup.amount)}*.\n\n`
+              + `New balance: *${fmtGbp(u.balance)}*.\n\n`
+              + `You can now send messages — I'll bill at 2× the underlying API cost in £.`
+            });
+          } catch {}
+          log(`topup redeemed: ${topup.code} (+${fmtGbp(topup.amount)}) by ${formatJid(jid)}`);
+          return true;
+        }
+        if (topup.reason === "already_used") {
+          try { await sock.sendMessage(jid, { text: "❌ That code has already been redeemed." }); } catch {}
+          return true;
+        }
+        // topup.reason === "unknown" → fall through to the generic
+        // "code not recognised" message below.
+      }
       const reasonText = {
         missing_code: "Code missing — usage: `/redeem CODE`.",
-        unknown: "Invite code not recognised.",
-        expired: "That invite expired. Ask the admin for a fresh one.",
-        already_used: "That invite has already been redeemed.",
-      }[result.reason] || "Invite couldn't be redeemed.";
+        unknown: "Code not recognised.",
+        expired: "That code expired. Ask the admin for a fresh one.",
+        already_used: "That code has already been redeemed.",
+      }[result.reason] || "Code couldn't be redeemed.";
       try { await sock.sendMessage(jid, { text: `❌ ${reasonText}` }); } catch {}
-      log(`invite redeem failed (${result.reason}): ${formatJid(jid)} tried ${redeemMatch[1]}`);
+      log(`redeem failed (${result.reason}): ${formatJid(jid)} tried ${redeemMatch[1]}`);
       return true;
     }
     addToWhitelist(jid);
@@ -627,12 +817,12 @@ async function handleInviteCommands({ sock, msg, jid }) {
         "I'm your personal coding agent on WhatsApp — describe what you want to build and I'll go.",
         "",
       ];
-      if (preFund > 0) lines.push(`💰 Starting balance: $${preFund.toFixed(2)}`, "");
+      if (preFund > 0) lines.push(`💰 Starting balance: ${fmtGbp(preFund)}`, "");
       if (subdomainNote) lines.push(subdomainNote.trimEnd());
       lines.push("Send `/help` to see all commands. Then send me your first message to get started.");
       await sock.sendMessage(jid, { text: lines.join("\n") });
     } catch (e) { log(`/redeem welcome failed: ${e}`); }
-    log(`invite redeemed: ${result.invite.code}${preFund > 0 ? ` (+$${preFund.toFixed(2)})` : ""} by ${formatJid(jid)}`);
+    log(`invite redeemed: ${result.invite.code}${preFund > 0 ? ` (+${fmtGbp(preFund)})` : ""} by ${formatJid(jid)}`);
     return true;
   }
 
@@ -903,10 +1093,12 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
     || /^\/admin\s+(add|remove)\s+/i.test(rawText)
     || rawText === "I CONFIRM SAME PERSON"
   );
+  const isCodeCreateCmd = /^\/code-create\s+/i.test(rawText) || lower === "/code-create";
   if (lower !== "/users"
       && !/^\/rename\s+/i.test(rawText)
       && !/^\/topup\s+/i.test(rawText)
-      && !isAdminCmd) {
+      && !isAdminCmd
+      && !isCodeCreateCmd) {
     return false;
   }
 
@@ -1051,7 +1243,7 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
     if (rows.length === 0) lines.push("No users yet — share an /invite link.");
     for (const r of rows) {
       const badge = r.isAdmin ? " 👑" : (r.isGroup ? " 👥" : "");
-      const balText = r.isAdmin ? "unlimited (admin)" : `$${r.balance.toFixed(2)}`;
+      const balText = r.isAdmin ? "unlimited (admin)" : fmtGbp(r.balance);
       lines.push(`\`${r.hash}\` · ${r.name}${badge}`);
       lines.push(`  bal ${balText} · last ${r.lastSeen}`);
     }
@@ -1099,13 +1291,60 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
     u.history = u.history || [];
     u.history.push({ date: todayKey(), action: "topup", amount, note: "admin top-up" });
     saveUserUsage(target.userId, u);
-    log(`topup +$${amount.toFixed(2)} -> ${target.username || target.userId} by ${formatJid(jid)} (new balance $${u.balance.toFixed(2)})`);
+    log(`topup +${fmtGbp(amount)} -> ${target.username || target.userId} by ${formatJid(jid)} (new balance ${fmtGbp(u.balance)})`);
     try {
       let meta = {}; try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, target.userId, "meta.json"), "utf8")); } catch {}
       const displayName = meta.name || meta.pushName || formatJid(meta.jid || target.userId);
       const kind = target.isGroup ? "group" : "user";
-      await sock.sendMessage(jid, { text: `✅ Topped up ${kind} *${displayName}* with $${amount.toFixed(2)} — new balance $${u.balance.toFixed(2)}.` });
+      await sock.sendMessage(jid, { text: `✅ Topped up ${kind} *${displayName}* with ${fmtGbp(amount)} — new balance ${fmtGbp(u.balance)}.` });
     } catch {}
+    return true;
+  }
+
+  // ── /code-create <amount-£> [count] ─────────────────────────
+  // Mints redemption codes that any user can /redeem to credit their
+  // balance. Codes are 10-char uppercase alphanumeric, ambiguous chars
+  // excluded so they're safe to read out loud or copy off a screen.
+  // Replied as monospaced lines so admin can long-press one to copy.
+  if (isCodeCreateCmd) {
+    const ccMatch = /^\/code-create\s+(\d+(?:\.\d{1,2})?)(?:\s+(\d+))?\s*$/i.exec(rawText);
+    if (!ccMatch) {
+      try { await sock.sendMessage(jid, { text:
+        "Usage: `/code-create <amount-£> [count]`\n\n"
+        + "Example: `/code-create 25 10` mints 10 codes worth £25 each.\n"
+        + "Default count: 1. Max 50 per call."
+      }); } catch {}
+      return true;
+    }
+    const amount = Number(ccMatch[1]);
+    const count = Math.min(50, Math.max(1, Number(ccMatch[2] || 1)));
+    if (!Number.isFinite(amount) || amount <= 0) {
+      try { await sock.sendMessage(jid, { text: "❌ Amount must be a positive number." }); } catch {}
+      return true;
+    }
+    const state = loadTopupCodes();
+    const minted = [];
+    for (let i = 0; i < count; i++) {
+      let code;
+      let attempts = 0;
+      do { code = generateTopupCode(); attempts++; }
+      while (state.codes[code] && attempts < 10);
+      if (state.codes[code]) continue; // give up if collision (vanishingly unlikely)
+      state.codes[code] = {
+        amount_gbp: amount,
+        created_at: Date.now(),
+        created_by: jid,
+        redeemed_at: null,
+        redeemed_by: null,
+      };
+      minted.push(code);
+    }
+    saveTopupCodes(state);
+    log(`code-create: ${minted.length}× ${fmtGbp(amount)} by ${formatJid(jid)}`);
+    const lines = [`✅ Minted ${minted.length} code(s) worth ${fmtGbp(amount)} each:`, ""];
+    for (const c of minted) lines.push("`/redeem " + c + "`");
+    lines.push("", "Forward each code to a user (long-press to copy). Each is single-use.");
+    try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
     return true;
   }
 
@@ -1917,6 +2156,53 @@ setInterval(cleanupFrozenSessions, 6 * 3600000);
 // Also run once at startup (after 30s to let things settle)
 setTimeout(cleanupFrozenSessions, 30000);
 
+// ── Idle-claude hibernation ─────────────────────────────────────
+// Per-user claude sessions cost ~300 MB RSS each. On a small VPS
+// hosting many users, idle ones add up fast. Hibernate sessions whose
+// owners haven't sent a message in HIBERNATE_IDLE_MS (default 15 min)
+// by killing the tmux session — cc-watchdog dies with it (the
+// watchdog and claude live in the same tmux pane), so claude does NOT
+// auto-restart. On the next inbound message from that user, the
+// gateway's ensureUserConfig path spawns a fresh tmux session and
+// claude --continue picks up where it left off (~3 s cold start).
+//
+// Admin sessions are skipped — admin uses the bot continuously and
+// the hibernation cost (3 s reconnect every 15 min idle) isn't worth
+// it for the small RSS gain.
+const HIBERNATE_IDLE_MS = 15 * 60 * 1000;
+const HIBERNATE_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+
+function hibernateIdleUsers() {
+  const admin = loadAdmin();
+  const adminUserIds = new Set((admin?.jids || []).map(sanitizeUserId));
+  const cutoff = Date.now() - HIBERNATE_IDLE_MS;
+  let hibernated = 0;
+  for (const [userId, lastActivity] of userActivity) {
+    if (lastActivity > cutoff) continue;       // still active
+    if (adminUserIds.has(userId)) continue;    // admin: never hibernate
+    const sessionName = getUserSessionName(userId);
+    try {
+      execFileSync("tmux", ["has-session", "-t", sessionName], { stdio: "ignore" });
+    } catch {
+      // No live tmux session — nothing to hibernate. Drop from map so
+      // we don't keep checking it forever.
+      userActivity.delete(userId);
+      continue;
+    }
+    try {
+      execFileSync("tmux", ["kill-session", "-t", sessionName], { stdio: "ignore" });
+      userActivity.delete(userId);
+      hibernated++;
+      log(`hibernate: killed idle session for ${userId} (idle ${Math.round((Date.now() - lastActivity) / 60000)} min)`);
+    } catch (e) {
+      log(`hibernate: failed to kill ${sessionName}: ${e}`);
+    }
+  }
+  if (hibernated > 0) log(`hibernate: ${hibernated} session(s) hibernated, ${userActivity.size} active`);
+}
+
+setInterval(hibernateIdleUsers, HIBERNATE_CHECK_INTERVAL_MS);
+
 // ── OAuth token watchdog ────────────────────────────────────────
 // Periodically checks token expiry, fixes broken symlinks, and alerts
 // admin before sessions start failing with 401.
@@ -2036,6 +2322,26 @@ function ensureUserConfig(userId, userJid) {
   if (projectUser) {
     try { execFileSync("chown", ["-R", `${projectUser.username}:ccm-gw`, userDir]); } catch {}
     try { execFileSync("chmod", ["770", userDir]); } catch {}
+  }
+  // Provision the per-user Anthropic API key file. Non-admin users in
+  // api-shared mode get a 0400 file containing admin's API key sourced
+  // by their launch.sh — needed because the shared OAuth symlink
+  // approach violates Consumer Terms §2 (account sharing). Admin keeps
+  // OAuth via the existing credentials.json symlink.
+  //
+  // KNOWN LIMITATION: any non-admin user with shell access via Claude
+  // Code can read this file and exfiltrate the shared API key (e.g.
+  // `Bash(echo:$ANTHROPIC_API_KEY)`). BYOK (Phase 3) is the right
+  // long-term fix — each user provides their own key, no shared
+  // secret. For Phase 2, document the risk to operators and rely on
+  // user trust + pricing markup as the primary protection.
+  if (projectUser) {
+    const _admin = loadAdmin();
+    const _isAdminUser = isAdminJid(userJid, _admin);
+    const usage = loadUserUsage(userId);
+    if (!_isAdminUser) {
+      writePerUserApiKey(projectUser.username, projectUser.homeDir, usage.mode || "api-shared");
+    }
   }
   const userWorkDir = projectUser
     ? path.join(projectUser.homeDir, "workspace")
@@ -2348,12 +2654,20 @@ function spawnUserSession(userId, userJid) {
   const groupEnvSource = groupEnvFile
     ? `if [ -r "${groupEnvFile}" ]; then set -a; . "${groupEnvFile}"; set +a; fi`
     : "";
+  // Source the per-user Anthropic API key file (Phase 2) before exec.
+  // For non-admin api-shared users this overrides the OAuth symlink
+  // claude would otherwise pick up. Admin gets no key file written, so
+  // this is a no-op for them and OAuth still wins.
+  const apiKeySource = projectUser
+    ? `[ -r "${path.join(projectUser.homeDir, ".anthropic-key")}" ] && . "${path.join(projectUser.homeDir, ".anthropic-key")}"`
+    : "";
   const launcherBody = [
     "#!/bin/bash",
     envPreamble,
     homeExport,
     portExport,
     groupEnvSource,
+    apiKeySource,
     `cd "${launchWorkDir}"`,
     `exec cc-watchdog --mcp-config "${mcpConfigPath}" --dangerously-load-development-channels server:whatsapp --permission-mode bypassPermissions --allowedTools ${allowedTools}`,
   ].filter(Boolean).join("\n") + "\n";
@@ -2643,35 +2957,49 @@ async function connectWhatsApp() {
         }
       }
 
-      // ── Phase 0: admin-only triage ─────────────────────────────
-      // While we transition off the shared-OAuth setup (where every
-      // per-user channel routes through claude sessions sharing one
-      // /root/.claude/.credentials.json — Consumer Terms §2 account
-      // sharing), only admin can drive the bot. Non-admin DMs get a
-      // clear rejection; non-admin group mentions are silently dropped
-      // (so the bot just looks unresponsive in groups instead of
-      // announcing access restrictions to every participant).
+      // ── Mode + balance gate (Phase 2) ──────────────────────────
+      // Replaces the Phase 0 admin-only blanket block with mode-aware
+      // routing:
+      //   admin              → always allow (unmetered)
+      //   mode=blocked       → reject with "contact admin" (DM only;
+      //                        silent in groups to avoid announcement
+      //                        spam to non-admin participants)
+      //   mode=api-shared/   → allow if balance ≥ min_balance (default
+      //   api-byok             £10); otherwise reply with redeem-code
+      //                        instructions
       //
-      // Existing per-user tmux sessions stay running but receive no new
-      // routed messages until per-user OAuth or API mode is in place.
       // Bypassed for OTP / invite / group-admin / whitelist flows above
-      // because those are pre-access-check; admin still has full access
+      // because those are pre-access-check; admin retains full access
       // through every existing path including permission replies below.
-      // Uses _admin / _isAdminSender computed once above.
+      // Uses _admin / _isAdminSender / _senderJid computed once above.
       if (_admin && !_isAdminSender) {
-        if (!jid.endsWith("@g.us")) {
+        // Compute the userId the same way the routing path will, so
+        // checkUserLimit hits the right ledger.
+        const _gateUserId = sanitizeUserId(jid.endsWith("@g.us") ? jid : _senderJid);
+        const _gate = checkUserLimit(_gateUserId);
+        if (!_gate.allowed) {
+          if (!jid.endsWith("@g.us")) {
+            const reply = _gate.reason === "blocked"
+              ? "🔒 *Access restricted*\n\nThis account is currently blocked. Contact the admin if you need access."
+              : `💰 *Top up to continue*\n\n`
+                + `Your balance is ${fmtGbp(_gate.balance)}. A minimum of ${fmtGbp(_gate.minBalance)} is required to send messages.\n\n`
+                + `To top up:\n`
+                + `  • Reply with \`/redeem <CODE>\` if you have a top-up code\n`
+                + `  • Or contact the admin\n\n`
+                + `Pricing is in £ — same number as the underlying API cost in USD, with a 2× markup on the shared key. Bring your own Anthropic API key for a 1× service fee instead.`;
+            try { await sock.sendMessage(jid, { text: reply }); } catch {}
+          }
+          log(`gate: blocked sender=${formatJid(_senderJid)} chat=${formatJid(jid)} reason=${_gate.reason} balance=${_gate.balance.toFixed(2)} mode=${_gate.mode}`);
+          continue;
+        }
+        if (_gate.warned) {
+          // Soft balance warning — sent inline, no block.
           try {
             await sock.sendMessage(jid, { text:
-              "🔒 *Access restricted*\n\n"
-              + "This assistant is currently for the admin's personal use only "
-              + "while we set up proper multi-user access. Per-user accounts "
-              + "will be available soon.\n\n"
-              + "Contact the admin if you need access."
+              `⚠️ Balance running low: ${fmtGbp(_gate.balance)}. Top up with \`/redeem <CODE>\` soon to avoid service interruption.`
             });
           } catch {}
         }
-        log(`phase0: blocked non-admin sender=${formatJid(_senderJid)} chat=${formatJid(jid)}`);
-        continue;
       }
 
       // Permission replies from admin
@@ -2854,8 +3182,8 @@ async function connectWhatsApp() {
         const topupAdmin = loadAdmin();
         const topupIsAdmin = topupAdmin && (topupAdmin.jid === jid || toJid(topupAdmin.jid) === jid);
         const reply = topupIsAdmin
-          ? "💰 Admin top-up usage: `/topup HASH USD` — see /users for hashes.\n\n(Bare /topup from a non-admin user shows the beta credit-request message.)"
-          : "💰 HOKO Coder is in beta.\n\nPlease contact the admin if you need more API credits.";
+          ? "💰 Admin top-up usage: `/topup HASH GBP` — see /users for hashes. Example: `/topup ab12cd 25` adds £25.\n\nFor self-service: `/code-create <amount> <count>` to mint redemption codes."
+          : "💰 To add credit, redeem a code: `/redeem <CODE>`. Contact admin for codes.";
         try { await sock.sendMessage(jid, { text: reply }); } catch {}
         continue;
       }
@@ -2865,7 +3193,6 @@ async function connectWhatsApp() {
       if (text && /^\/usage\s+history$/i.test(text.trim())) {
         const u = syncUserUsage(userId);
         const fmtN = (n) => { const a = Math.abs(n); return a >= 1e6 ? `${(n/1e6).toFixed(1)}M` : a >= 1e3 ? `${Math.round(n/1e3)}K` : String(n); };
-        const fmtUSD = (n) => n < 0 ? `-$${Math.abs(n).toFixed(2)}` : `$${n.toFixed(2)}`;
 
         const lines = [`📋 Usage History`];
 
@@ -2887,12 +3214,12 @@ async function connectWhatsApp() {
           lines.push(`Top-ups:`);
           for (const h of u.history.slice(-10)) {
             const note = h.note ? ` — ${h.note}` : "";
-            lines.push(`  ${h.date}: ${fmtUSD(h.amount)}${note}`);
+            lines.push(`  ${h.date}: ${fmtGbp(h.amount)}${note}`);
           }
         }
 
         lines.push(``);
-        lines.push(`Balance: ${fmtUSD(u.balance || 0)} | Total added: ${fmtUSD(u.total_added || 0)} | Total spent: ${fmtUSD(u.total_cost || 0)}`);
+        lines.push(`Balance: ${fmtGbp(u.balance || 0)} | Total added: ${fmtGbp(u.total_added || 0)} | Total spent: ${fmtGbp(u.total_charged_gbp || 0)}`);
 
         try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
         continue;
@@ -2900,43 +3227,32 @@ async function connectWhatsApp() {
       if (text && text.trim().toLowerCase() === "/usage") {
         const u = syncUserUsage(userId);
         const adminCheck = loadAdmin();
-        const isAdminUser = adminCheck && userId === sanitizeUserId(adminCheck.jid);
+        const isAdminUser = isAdminJid(jid, adminCheck);
         const mo = u.months?.[monthKey()] || { input_tokens: 0, output_tokens: 0, cache_5m: 0, cache_1h: 0, cache_read: 0, models: {} };
 
-        // Formatting helpers
+        // Token-count display helper. Costs use the module-level
+        // calcCallCost / fmtGbp / mode markup so this command always
+        // reflects what the user actually got billed.
         const fmtN = (n) => { const a = Math.abs(n); return a >= 1e6 ? `${(n/1e6).toFixed(1)}M` : a >= 1e3 ? `${Math.round(n/1e3)}K` : String(n); };
-        const fmtUSD = (n) => n < 0.01 ? `<$0.01` : `$${n.toFixed(2)}`;
+        const markup = getModeMarkup(u.mode || "api-shared");
 
-        // API pricing per million tokens (current Anthropic rates)
-        const PRICING = {
-          "claude-opus-4-6":   { input: 15, output: 75, cache_5m: 18.75, cache_1h: 22.50, cache_read: 1.50 },
-          "claude-sonnet-4-6": { input: 3, output: 15, cache_5m: 3.75, cache_1h: 4.50, cache_read: 0.30 },
-          "claude-haiku-4-5":  { input: 0.80, output: 4, cache_5m: 1.00, cache_1h: 1.20, cache_read: 0.08 },
-        };
-        // Match model name to pricing tier (e.g., "claude-opus-4-6[1m]" → "claude-opus-4-6")
-        const matchPricing = (model) => {
-          for (const key of Object.keys(PRICING)) { if (model.startsWith(key)) return PRICING[key]; }
-          return PRICING["claude-sonnet-4-6"]; // default
-        };
-
-        // Calculate cost per model
-        let totalCost = 0;
+        // Calculate cost per model — applies the user's mode markup so
+        // the per-model line totals to what was actually deducted.
+        let totalCharge = 0;
         const modelLines = [];
         for (const [model, mu] of Object.entries(mo.models || {})) {
-          const p = matchPricing(model);
-          const cost = (mu.input_tokens * p.input + mu.output_tokens * p.output + mu.cache_5m * p.cache_5m + mu.cache_1h * p.cache_1h + mu.cache_read * p.cache_read) / 1e6;
-          totalCost += cost;
+          const usdCost = calcCallCost(mu, model);
+          const charge = usdCost * markup;
+          totalCharge += charge;
           const shortName = model.replace("claude-", "").replace(/\[.*\]/, "");
-          modelLines.push(`  ${shortName}: in=${fmtN(mu.input_tokens)} out=${fmtN(mu.output_tokens)} 5m=${fmtN(mu.cache_5m)} 1h=${fmtN(mu.cache_1h)} read=${fmtN(mu.cache_read)} → ${fmtUSD(cost)}`);
+          modelLines.push(`  ${shortName}: in=${fmtN(mu.input_tokens)} out=${fmtN(mu.output_tokens)} 5m=${fmtN(mu.cache_5m)} 1h=${fmtN(mu.cache_1h)} read=${fmtN(mu.cache_read)} → ${fmtGbp(charge)}`);
         }
-
-        const billable = (mo.input_tokens || 0) + (mo.output_tokens || 0) + (mo.cache_5m || 0) + (mo.cache_1h || 0);
 
         const lines = [
           isAdminUser ? `📊 Usage (Admin — Unlimited)` : `📊 Usage`,
         ];
         if (!isAdminUser) {
-          lines.push(`💰 Balance: $${(u.balance || 0).toFixed(2)}${u.balance <= 0 ? " ⚠️" : ""}`);
+          lines.push(`💰 Balance: ${fmtGbp(u.balance || 0)}${u.balance <= 0 ? " ⚠️" : ""}`);
         }
         lines.push(``);
         lines.push(`This month (${monthKey()}):`);
@@ -2951,8 +3267,8 @@ async function connectWhatsApp() {
           lines.push(...modelLines);
         }
         lines.push(``);
-        lines.push(`Month cost: ${fmtUSD(totalCost)}`);
-        lines.push(`All time: ${fmtUSD(u.total_cost || 0)} spent`);
+        lines.push(`Month cost: ${fmtGbp(totalCharge)}`);
+        lines.push(`All time: ${fmtGbp(u.total_charged_gbp || 0)} spent`);
 
         if (isAdminUser) {
           try {
