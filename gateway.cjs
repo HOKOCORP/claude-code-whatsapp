@@ -600,7 +600,12 @@ function writePerUserApiKey(username, homeDir, mode, byokEnc) {
   let key = "";
   let label = "";
   if (mode === "api-shared") {
-    key = process.env.ANTHROPIC_ADMIN_API_KEY || "";
+    // Prefer ANTHROPIC_ADMIN_API_KEY if explicitly set (lets the
+    // operator distinguish the bot's shared key from any other
+    // Anthropic key in /root/.env). Fall back to ANTHROPIC_API_KEY
+    // — the existing ccm Settings entry — so a single-key setup just
+    // works without needing two ccm slots.
+    key = process.env.ANTHROPIC_ADMIN_API_KEY || process.env.ANTHROPIC_API_KEY || "";
     label = "api-shared (admin's key)";
   } else if (mode === "api-byok" && byokEnc) {
     try {
@@ -1059,9 +1064,13 @@ async function handleInviteCommands({ sock, msg, jid }) {
       try { await sock.sendMessage(jid, { text: "❌ Amount must be a positive number." }); } catch {}
       return true;
     }
-    const MAX_TOPUP = 500;
+    // High cap rather than no cap: a single £10k+ Checkout session is
+    // almost certainly a typo (or a fraud-flag signal Stripe will
+    // reject anyway). Operator can raise STRIPE_MAX_TOPUP_GBP if they
+    // genuinely need bigger single payments.
+    const MAX_TOPUP = Number(process.env.STRIPE_MAX_TOPUP_GBP) || 10000;
     if (amount > MAX_TOPUP) {
-      try { await sock.sendMessage(jid, { text: `❌ Single top-up capped at ${fmtGbp(MAX_TOPUP)}. Run multiple top-ups for more.` }); } catch {}
+      try { await sock.sendMessage(jid, { text: `❌ Single top-up capped at ${fmtGbp(MAX_TOPUP)}. Run multiple top-ups if you need more.` }); } catch {}
       return true;
     }
     const MIN_TOPUP = 1;
@@ -1103,7 +1112,8 @@ async function handleInviteCommands({ sock, msg, jid }) {
       await sock.sendMessage(jid, { text:
         `💳 *Top up ${fmtGbp(amount)}*\n\n`
         + `Tap to pay (Stripe-hosted checkout, your card details never touch this bot):\n${session.url}\n\n`
-        + `Your balance is credited automatically once payment succeeds. Session expires in 24h. Need a refund? Contact the admin within 7 days.`
+        + `Your balance is credited automatically once payment succeeds. Session expires in 24h.\n\n`
+        + `*All sales final — credits are non-refundable once purchased, whether used or unused.* Make sure the amount is right before paying.`
       });
     } catch {}
     return true;
