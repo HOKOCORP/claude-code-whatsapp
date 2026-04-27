@@ -26,6 +26,8 @@ const channelSlash = require("./lib/channel-slash.cjs");
 const invites = require("./lib/invites.cjs");
 const tmuxHelper = require("./lib/tmux.cjs");
 const outboxReconciler = require("./lib/outbox-reconciler.cjs");
+const stripeLib = require("./lib/stripe.cjs");
+const http = require("node:http");
 const { dispatchAck } = require("./lib/ack-dispatcher.cjs");
 const { createAuditLogger } = require("./lib/audit-log.cjs");
 const quotaScraper = require("./lib/quota-scraper.cjs");
@@ -629,6 +631,221 @@ function writePerUserApiKey(username, homeDir, mode, byokEnc) {
   }
 }
 
+// ── Stripe Checkout ────────────────────────────────────────────────
+// Self-service top-ups via Stripe Checkout. The bot creates a session
+// per /topup invocation, stores the session_id → user_jid mapping,
+// returns the Checkout URL. After the user pays, Stripe POSTs
+// `checkout.session.completed` to /stripe-webhook on this box; we
+// verify the signature, look up the pending mapping, and credit the
+// user's balance in £. Stripe handles all card data — we never see
+// it.
+//
+// All Stripe features are dormant until admin sets the env vars:
+//   STRIPE_SECRET_KEY        sk_live_… or sk_test_…
+//   STRIPE_WEBHOOK_SECRET    whsec_… (from the Stripe webhook config)
+//   STRIPE_RETURN_URL        wa.me/<bot-phone> (where Stripe sends
+//                            users after success/cancel; mobile-friendly)
+//   STRIPE_WEBHOOK_PORT      port for the local HTTP server (default 4242)
+//
+// nginx (or any reverse proxy) must forward /stripe-webhook on the
+// public host to this port. See docs in the deploy notification for
+// the snippet.
+const STRIPE_CHECKOUTS_FILE = path.join(os.homedir(), ".ccm", "stripe-checkouts.json");
+const STRIPE_PROCESSED_EVENTS_FILE = path.join(os.homedir(), ".ccm", "stripe-processed-events.json");
+const STRIPE_CHECKOUT_TTL_MS = 24 * 3600 * 1000; // expire pending sessions after 24h
+
+function _stripeConfigured() {
+  return !!(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_WEBHOOK_SECRET);
+}
+
+function loadStripeCheckouts() {
+  try { return JSON.parse(fs.readFileSync(STRIPE_CHECKOUTS_FILE, "utf8")); }
+  catch { return { sessions: {} }; }
+}
+
+function saveStripeCheckouts(state) {
+  try {
+    fs.mkdirSync(path.dirname(STRIPE_CHECKOUTS_FILE), { recursive: true });
+    fs.writeFileSync(STRIPE_CHECKOUTS_FILE, JSON.stringify(state, null, 2) + "\n");
+  } catch (e) { log(`stripe-checkouts write failed: ${e}`); }
+}
+
+// Idempotency: Stripe retries webhooks. Track which event IDs we've
+// already processed so a retry doesn't double-credit.
+function loadProcessedEvents() {
+  try { return JSON.parse(fs.readFileSync(STRIPE_PROCESSED_EVENTS_FILE, "utf8")); }
+  catch { return { events: {} }; }
+}
+
+function saveProcessedEvents(state) {
+  try {
+    fs.mkdirSync(path.dirname(STRIPE_PROCESSED_EVENTS_FILE), { recursive: true });
+    fs.writeFileSync(STRIPE_PROCESSED_EVENTS_FILE, JSON.stringify(state, null, 2) + "\n");
+  } catch (e) { log(`stripe-processed-events write failed: ${e}`); }
+}
+
+// Drop expired pending sessions on every load so the file doesn't
+// grow unbounded.
+function pruneExpiredCheckouts() {
+  const state = loadStripeCheckouts();
+  const cutoff = Date.now() - STRIPE_CHECKOUT_TTL_MS;
+  let pruned = 0;
+  for (const [sid, s] of Object.entries(state.sessions || {})) {
+    if (!s.completed_at && (s.created_at || 0) < cutoff) {
+      delete state.sessions[sid];
+      pruned++;
+    }
+  }
+  if (pruned > 0) {
+    saveStripeCheckouts(state);
+    log(`stripe: pruned ${pruned} expired pending checkout(s)`);
+  }
+}
+
+// Process a Stripe checkout.session.completed event. Idempotent: if
+// the event ID has already been processed, returns early. Returns
+// { credited: bool, jid, amountGbp }.
+async function handleCheckoutCompleted(event, sock) {
+  const eventId = event.id;
+  const session = event.data?.object;
+  if (!session) return { credited: false, reason: "no_session" };
+
+  // Idempotency check first.
+  const processed = loadProcessedEvents();
+  if (processed.events[eventId]) return { credited: false, reason: "already_processed" };
+
+  // Look up the pending checkout by session ID.
+  const checkouts = loadStripeCheckouts();
+  const pending = checkouts.sessions?.[session.id];
+  if (!pending) {
+    log(`stripe: webhook for unknown session ${session.id} — possibly created outside this bot`);
+    // Mark processed anyway so we don't retry forever.
+    processed.events[eventId] = { processed_at: Date.now(), reason: "unknown_session" };
+    saveProcessedEvents(processed);
+    return { credited: false, reason: "unknown_session" };
+  }
+
+  // Sanity: payment must be successful.
+  if (session.payment_status !== "paid") {
+    log(`stripe: session ${session.id} completed but payment_status=${session.payment_status} — not crediting`);
+    processed.events[eventId] = { processed_at: Date.now(), reason: "not_paid" };
+    saveProcessedEvents(processed);
+    return { credited: false, reason: "not_paid" };
+  }
+
+  const userJid = pending.jid;
+  const amountGbp = pending.amount_gbp;
+  const userId = sanitizeUserId(userJid);
+  const u = loadUserUsage(userId);
+  u.balance = (u.balance || 0) + amountGbp;
+  u.total_added = (u.total_added || 0) + amountGbp;
+  u.history = u.history || [];
+  u.history.push({ date: todayKey(), action: "stripe_topup", amount: amountGbp, note: `stripe ${session.id}` });
+  saveUserUsage(userId, u);
+
+  // Mark checkout complete (keep for /receipts) and event processed.
+  pending.completed_at = Date.now();
+  pending.payment_status = session.payment_status;
+  saveStripeCheckouts(checkouts);
+  processed.events[eventId] = { processed_at: Date.now(), session_id: session.id, jid: userJid, amount_gbp: amountGbp };
+  saveProcessedEvents(processed);
+
+  log(`stripe: credited ${formatJid(userJid)} +${fmtGbp(amountGbp)} (session ${session.id}, event ${eventId}, new balance ${fmtGbp(u.balance)})`);
+
+  // Notify the user via WhatsApp. Using sock if connected, falling
+  // back to outbox file for resilience.
+  const message = `✅ Payment received: ${fmtGbp(amountGbp)}.\n\nNew balance: *${fmtGbp(u.balance)}*. Send a message to get back to work.`;
+  let delivered = false;
+  if (sock) {
+    try {
+      await sock.sendMessage(userJid, { text: message });
+      delivered = true;
+    } catch (e) { log(`stripe: direct sendMessage failed for ${formatJid(userJid)}: ${e}`); }
+  }
+  if (!delivered) {
+    // Outbox path — gateway picks it up next reconnect.
+    try {
+      const fname = `stripe-confirm-${Date.now()}-${userId}.json`;
+      fs.writeFileSync(path.join(STATE_DIR, "outbox", fname), JSON.stringify({ jid: userJid, text: message }) + "\n");
+    } catch (e) { log(`stripe: outbox write failed: ${e}`); }
+  }
+  return { credited: true, jid: userJid, amountGbp };
+}
+
+let _stripeServer = null;
+
+function startStripeServer(getSock) {
+  if (_stripeServer) return _stripeServer;
+  if (!_stripeConfigured()) {
+    log("stripe: STRIPE_SECRET_KEY/WEBHOOK_SECRET not set — webhook server NOT started");
+    return null;
+  }
+  const port = Number(process.env.STRIPE_WEBHOOK_PORT) || 4242;
+  pruneExpiredCheckouts();
+
+  _stripeServer = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("ok");
+      return;
+    }
+    if (req.method === "POST" && req.url === "/stripe-webhook") {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", async () => {
+        const rawBody = Buffer.concat(chunks).toString("utf8");
+        const sigHeader = req.headers["stripe-signature"];
+        try {
+          stripeLib.verifyWebhookSignature({
+            rawBody,
+            signatureHeader: sigHeader,
+            webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
+          });
+        } catch (e) {
+          log(`stripe: webhook signature verification failed: ${e.message}`);
+          res.writeHead(400, { "Content-Type": "text/plain" });
+          res.end(`signature: ${e.message}`);
+          return;
+        }
+        let event;
+        try { event = JSON.parse(rawBody); }
+        catch (e) {
+          res.writeHead(400, { "Content-Type": "text/plain" });
+          res.end("invalid JSON");
+          return;
+        }
+        // ACK first (Stripe wants 2xx within seconds), then process.
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("ok");
+        try {
+          if (event.type === "checkout.session.completed") {
+            await handleCheckoutCompleted(event, getSock());
+          } else {
+            log(`stripe: ignoring event type ${event.type}`);
+          }
+        } catch (e) {
+          log(`stripe: handler failed for ${event.type} (${event.id}): ${e}`);
+        }
+      });
+      return;
+    }
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("not found");
+  });
+
+  _stripeServer.listen(port, "127.0.0.1", () => {
+    log(`stripe: webhook server listening on 127.0.0.1:${port}`);
+  });
+  _stripeServer.on("error", (e) => {
+    log(`stripe: webhook server error: ${e.message}`);
+  });
+
+  // Periodic prune
+  setInterval(pruneExpiredCheckouts, 6 * 3600000);
+
+  return _stripeServer;
+}
+
 // ── Top-up codes ───────────────────────────────────────────────────
 // Admin-issued redemption codes that any user can /redeem to credit
 // their GBP balance. Stored at ~/.ccm/topup-codes.json shared across
@@ -814,6 +1031,110 @@ function formatJid(jid) { return jid.replace(/@s\.whatsapp\.net$/, "").replace(/
 async function handleInviteCommands({ sock, msg, jid }) {
   const rawText = extractText(msg.message || {}).trim();
   const lower = rawText.toLowerCase();
+
+  // ── /topup <amount> — self-service Stripe Checkout (Phase 4) ─
+  // DM-only, available pre-gate so users with £0 balance can top up.
+  // Admin's /topup HASH AMOUNT runs in handleAdminUserCommands and is
+  // not intercepted here (the regex below requires a single numeric
+  // arg; admin's two-arg form falls through unmatched).
+  const topupSelfMatch = /^\/topup\s+(\d+(?:\.\d{1,2})?)\s*$/i.exec(rawText);
+  if (topupSelfMatch) {
+    if (jid.endsWith("@g.us")) {
+      try { await sock.sendMessage(jid, { text: "🚫 `/topup <amount>` is DM-only — payments shouldn't be group-chat work." }); } catch {}
+      return true;
+    }
+    const adminCheck = loadAdmin();
+    if (isAdminJid(jid, adminCheck)) {
+      // Admin has a different /topup (two-arg form for crediting another
+      // user) handled in handleAdminUserCommands. Surface that.
+      try { await sock.sendMessage(jid, { text: "👑 As admin, use `/topup HASH AMOUNT` to credit a user (see /users for hashes), or `/code-create <amount> <count>` to mint redemption codes." }); } catch {}
+      return true;
+    }
+    if (!_stripeConfigured()) {
+      try { await sock.sendMessage(jid, { text: "💳 Card payments aren't configured yet on this bot. Use `/redeem <CODE>` if you have a top-up code, or contact the admin." }); } catch {}
+      return true;
+    }
+    const amount = Number(topupSelfMatch[1]);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      try { await sock.sendMessage(jid, { text: "❌ Amount must be a positive number." }); } catch {}
+      return true;
+    }
+    const MAX_TOPUP = 500;
+    if (amount > MAX_TOPUP) {
+      try { await sock.sendMessage(jid, { text: `❌ Single top-up capped at ${fmtGbp(MAX_TOPUP)}. Run multiple top-ups for more.` }); } catch {}
+      return true;
+    }
+    const MIN_TOPUP = 1;
+    if (amount < MIN_TOPUP) {
+      try { await sock.sendMessage(jid, { text: `❌ Minimum top-up is ${fmtGbp(MIN_TOPUP)}.` }); } catch {}
+      return true;
+    }
+    const returnUrl = process.env.STRIPE_RETURN_URL || `https://wa.me/${PHONE}`;
+    let session;
+    try {
+      session = await stripeLib.createCheckoutSession({
+        amountPence: Math.round(amount * 100),
+        currency: "gbp",
+        productName: `HOKO Coder credit ${fmtGbp(amount)}`,
+        successUrl: returnUrl,
+        cancelUrl: returnUrl,
+        clientReference: jid,
+        metadata: { jid, amount_gbp: String(amount), source: "whatsapp-bot" },
+        secretKey: process.env.STRIPE_SECRET_KEY,
+      });
+    } catch (e) {
+      log(`stripe: createCheckoutSession failed for ${formatJid(jid)}: ${e.message}`);
+      try { await sock.sendMessage(jid, { text: `❌ Couldn't start checkout (${e.code || "stripe_error"}). Try again in a minute, or contact admin.` }); } catch {}
+      return true;
+    }
+    // Persist the pending mapping for the webhook to credit the user.
+    const checkouts = loadStripeCheckouts();
+    checkouts.sessions = checkouts.sessions || {};
+    checkouts.sessions[session.id] = {
+      jid,
+      amount_gbp: amount,
+      created_at: Date.now(),
+      url: session.url,
+      completed_at: null,
+    };
+    saveStripeCheckouts(checkouts);
+    log(`stripe: created session ${session.id} for ${formatJid(jid)} (${fmtGbp(amount)})`);
+    try {
+      await sock.sendMessage(jid, { text:
+        `💳 *Top up ${fmtGbp(amount)}*\n\n`
+        + `Tap to pay (Stripe-hosted checkout, your card details never touch this bot):\n${session.url}\n\n`
+        + `Your balance is credited automatically once payment succeeds. Session expires in 24h. Need a refund? Contact the admin within 7 days.`
+      });
+    } catch {}
+    return true;
+  }
+
+  // ── /receipts — list recent paid top-ups (any user) ──────────
+  if (lower === "/receipts") {
+    if (jid.endsWith("@g.us")) {
+      try { await sock.sendMessage(jid, { text: "🚫 `/receipts` is DM-only." }); } catch {}
+      return true;
+    }
+    const u = loadUserUsage(sanitizeUserId(jid));
+    const stripeRows = (u.history || []).filter(h => h.action === "stripe_topup").slice(-10).reverse();
+    const otherRows = (u.history || []).filter(h => h.action === "topup" || h.action === "redeem").slice(-10).reverse();
+    const lines = ["🧾 *Receipts*", ""];
+    if (stripeRows.length === 0 && otherRows.length === 0) {
+      lines.push("No top-ups yet. Use `/topup <amount>` to add credit by card, or `/redeem <CODE>` if you have a code.");
+    } else {
+      if (stripeRows.length > 0) {
+        lines.push("Card payments:");
+        for (const h of stripeRows) lines.push(`  ${h.date}: ${fmtGbp(h.amount)} — ${h.note || ""}`);
+        lines.push("");
+      }
+      if (otherRows.length > 0) {
+        lines.push("Codes / admin top-ups:");
+        for (const h of otherRows) lines.push(`  ${h.date}: ${fmtGbp(h.amount)} — ${h.note || ""}`);
+      }
+    }
+    try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
+    return true;
+  }
 
   // ── /cckey: BYOK Anthropic API key management ───────────────
   // Pre-gate so users with £0 balance can still set a key. DM-only —
@@ -3406,10 +3727,20 @@ async function connectWhatsApp() {
       // top-up is handled earlier in handleAdminUserCommands.
       if (text && text.trim().toLowerCase() === "/topup") {
         const topupAdmin = loadAdmin();
-        const topupIsAdmin = topupAdmin && (topupAdmin.jid === jid || toJid(topupAdmin.jid) === jid);
-        const reply = topupIsAdmin
-          ? "💰 Admin top-up usage: `/topup HASH GBP` — see /users for hashes. Example: `/topup ab12cd 25` adds £25.\n\nFor self-service: `/code-create <amount> <count>` to mint redemption codes."
-          : "💰 To add credit, redeem a code: `/redeem <CODE>`. Contact admin for codes.";
+        const topupIsAdmin = isAdminJid(jid, topupAdmin);
+        let reply;
+        if (topupIsAdmin) {
+          reply = "💰 Admin top-up usage: `/topup HASH GBP` — see /users for hashes. Example: `/topup ab12cd 25` adds £25.\n\n"
+            + "For self-service: `/code-create <amount> <count>` to mint redemption codes.";
+        } else if (_stripeConfigured()) {
+          reply = "💰 Top up your balance:\n\n"
+            + "  • `/topup 25` — pay £25 by card (Stripe-hosted checkout)\n"
+            + "  • `/redeem <CODE>` — redeem a top-up code\n\n"
+            + "  • `/receipts` — recent top-ups\n"
+            + "  • `/balance` (or `/usage`) — current balance";
+        } else {
+          reply = "💰 To add credit, redeem a code: `/redeem <CODE>`. Contact admin for codes.";
+        }
         try { await sock.sendMessage(jid, { text: reply }); } catch {}
         continue;
       }
@@ -4133,4 +4464,7 @@ process.on("SIGINT", () => { log("SIGINT ignored — use tmux kill-session or SI
   }
   log("starting gateway...");
   connectWhatsApp();
+  // Stripe webhook server starts in parallel — independent of WhatsApp
+  // connection. No-ops if STRIPE_* env vars aren't set.
+  startStripeServer(() => sock);
 })();
