@@ -503,6 +503,83 @@ function saveAdmins(jids) {
   } catch {}
 }
 
+// ── BYOK: encrypted-at-rest API key storage ────────────────────────
+// Users can `/cckey <APIKEY>` to switch from admin's shared key to
+// their own. Their key is encrypted with AES-256-GCM using a key
+// derived from CCM_KEY_ENCRYPT_MASTER (set in /root/.env via ccm).
+// The encrypted blob is stored in usage.api_key_enc — decrypted only
+// when writing the per-user .anthropic-key file at session-spawn
+// time, then dropped from memory.
+//
+// Ciphertext format (string): `v1:<iv-b64>:<tag-b64>:<ct-b64>`. The
+// version prefix lets us migrate the encryption scheme later without
+// guessing.
+//
+// If CCM_KEY_ENCRYPT_MASTER is unset, /cckey refuses to operate
+// rather than store keys in plaintext.
+function _byokDeriveKey() {
+  const master = process.env.CCM_KEY_ENCRYPT_MASTER || "";
+  if (!master) return null;
+  // scrypt is intentionally slow — fine here because we only run once
+  // per /cckey command + once per session spawn.
+  return crypto.scryptSync(master, "ccm-byok-v1", 32);
+}
+
+function encryptApiKey(plaintext) {
+  const key = _byokDeriveKey();
+  if (!key) throw new Error("CCM_KEY_ENCRYPT_MASTER not configured");
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const enc = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `v1:${iv.toString("base64")}:${tag.toString("base64")}:${enc.toString("base64")}`;
+}
+
+function decryptApiKey(ciphertext) {
+  const key = _byokDeriveKey();
+  if (!key) throw new Error("CCM_KEY_ENCRYPT_MASTER not configured");
+  const parts = String(ciphertext || "").split(":");
+  if (parts.length !== 4 || parts[0] !== "v1") throw new Error("unsupported ciphertext format");
+  const iv = Buffer.from(parts[1], "base64");
+  const tag = Buffer.from(parts[2], "base64");
+  const enc = Buffer.from(parts[3], "base64");
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(enc), decipher.final()]).toString("utf8");
+}
+
+// Validate an Anthropic API key with a minimal request. Returns
+// { ok: true } or { ok: false, reason, http_status }.
+async function validateAnthropicKey(apiKey) {
+  if (!apiKey || !apiKey.startsWith("sk-ant-api")) {
+    return { ok: false, reason: "format" };
+  }
+  const body = JSON.stringify({
+    model: "claude-haiku-4-5",
+    max_tokens: 1,
+    messages: [{ role: "user", content: "hi" }],
+  });
+  try {
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body,
+    });
+    if (resp.status === 200) return { ok: true };
+    const errText = await resp.text().catch(() => "");
+    if (resp.status === 401 || resp.status === 403) {
+      return { ok: false, reason: "invalid", http_status: resp.status };
+    }
+    return { ok: false, reason: "api_error", http_status: resp.status, error: errText.slice(0, 200) };
+  } catch (e) {
+    return { ok: false, reason: "network", error: String(e).slice(0, 200) };
+  }
+}
+
 // ── Per-user Anthropic API key provisioning ────────────────────────
 // For non-admin users on api-shared mode, write admin's API key into a
 // 0400 file in their isolated home. launch.sh sources it before
@@ -516,22 +593,31 @@ function saveAdmins(jids) {
 // claude can find on disk (the OAuth symlink) — which is the §2 path
 // we're trying to retire. The mode-routing gate above will refuse to
 // process their messages until admin configures the key.
-function writePerUserApiKey(username, homeDir, mode) {
+function writePerUserApiKey(username, homeDir, mode, byokEnc) {
   const keyFile = path.join(homeDir, ".anthropic-key");
-  // Modes other than api-shared shouldn't have admin's shared key sitting
-  // in their home — strip the file so it can't be read accidentally.
-  if (mode !== "api-shared") {
-    try { fs.unlinkSync(keyFile); } catch {}
-    return false;
+  let key = "";
+  let label = "";
+  if (mode === "api-shared") {
+    key = process.env.ANTHROPIC_ADMIN_API_KEY || "";
+    label = "api-shared (admin's key)";
+  } else if (mode === "api-byok" && byokEnc) {
+    try {
+      key = decryptApiKey(byokEnc);
+      label = "api-byok (user's own key)";
+    } catch (e) {
+      log(`byok decrypt failed for ${username}: ${e}`);
+    }
   }
-  const adminKey = process.env.ANTHROPIC_ADMIN_API_KEY || "";
-  if (!adminKey) {
+  if (!key) {
+    // No key available for this mode — strip any stale file. The mode
+    // gate will refuse to process the user's messages, prompting them
+    // to /cckey or wait for admin to set ANTHROPIC_ADMIN_API_KEY.
     try { fs.unlinkSync(keyFile); } catch {}
     return false;
   }
   const body = "# Generated by ccm-whatsapp gateway. Sourced by launch.sh.\n"
-    + "# Admin's shared Anthropic API key (api-shared mode).\n"
-    + `export ANTHROPIC_API_KEY=${adminKey}\n`;
+    + `# Mode: ${label}\n`
+    + `export ANTHROPIC_API_KEY=${key}\n`;
   try {
     fs.writeFileSync(keyFile, body);
     execFileSync("chown", [`${username}:${username}`, keyFile], { stdio: "ignore" });
@@ -728,6 +814,141 @@ function formatJid(jid) { return jid.replace(/@s\.whatsapp\.net$/, "").replace(/
 async function handleInviteCommands({ sock, msg, jid }) {
   const rawText = extractText(msg.message || {}).trim();
   const lower = rawText.toLowerCase();
+
+  // ── /cckey: BYOK Anthropic API key management ───────────────
+  // Pre-gate so users with £0 balance can still set a key. DM-only —
+  // the API key passes through chat history and we don't want it in
+  // a group transcript. Refused for admin (admin uses Max OAuth).
+  //
+  //   /cckey                — show status (current mode, last set)
+  //   /cckey <APIKEY>       — set BYOK key (validated, encrypted-at-rest)
+  //   /cckey remove         — drop BYOK, fall back to api-shared
+  //   /cckey test           — validate the currently-stored BYOK key
+  if (/^\/cckey(\s|$)/i.test(rawText)) {
+    if (jid.endsWith("@g.us")) {
+      try { await sock.sendMessage(jid, { text: "🚫 `/cckey` is DM-only — never paste API keys into a group chat." }); } catch {}
+      return true;
+    }
+    const adminCheck = loadAdmin();
+    if (isAdminJid(jid, adminCheck)) {
+      try { await sock.sendMessage(jid, { text: "👑 You're admin — your account uses OAuth (Max plan), no API key needed. `/cckey` is for non-admin users." }); } catch {}
+      return true;
+    }
+    if (!_byokDeriveKey()) {
+      try { await sock.sendMessage(jid, { text: "❌ BYOK is unavailable: the operator hasn't configured `CCM_KEY_ENCRYPT_MASTER` yet. Try again later or contact the admin." }); } catch {}
+      return true;
+    }
+    const userId = sanitizeUserId(jid);
+    const usage = loadUserUsage(userId);
+    const args = rawText.replace(/^\/cckey\s*/i, "").trim();
+
+    // /cckey (no args) — show status
+    if (!args) {
+      const lines = ["🔑 *BYOK status*", ""];
+      lines.push(`Mode: ${usage.mode || "api-shared"}`);
+      if (usage.api_key_enc) {
+        const setAt = usage.byok_set_at ? new Date(usage.byok_set_at).toISOString().slice(0, 10) : "(unknown)";
+        lines.push(`Key on file: yes (set ${setAt})`);
+      } else {
+        lines.push("Key on file: no");
+      }
+      lines.push("");
+      lines.push("Commands:");
+      lines.push("  `/cckey <sk-ant-api...>` — set/replace your BYOK key");
+      lines.push("  `/cckey test`            — verify the stored key still works");
+      lines.push("  `/cckey remove`          — drop BYOK, switch back to shared key");
+      lines.push("");
+      lines.push("Get a key: https://console.anthropic.com/settings/keys");
+      try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
+      return true;
+    }
+
+    // /cckey remove
+    if (/^remove$|^unset$/i.test(args)) {
+      delete usage.api_key_enc;
+      delete usage.byok_set_at;
+      usage.mode = "api-shared";
+      saveUserUsage(userId, usage);
+      // Hibernate session so the new mode picks up on next message.
+      try { execFileSync("tmux", ["kill-session", "-t", getUserSessionName(userId)], { stdio: "ignore" }); } catch {}
+      userActivity.delete(userId);
+      log(`cckey: ${formatJid(jid)} removed BYOK; back to api-shared`);
+      try { await sock.sendMessage(jid, { text: "✅ BYOK removed. You're back on the shared key (2× markup). `/cckey <APIKEY>` to set a new one." }); } catch {}
+      return true;
+    }
+
+    // /cckey test
+    if (/^test$/i.test(args)) {
+      if (!usage.api_key_enc) {
+        try { await sock.sendMessage(jid, { text: "❌ No BYOK key on file. `/cckey <sk-ant-api...>` to set one." }); } catch {}
+        return true;
+      }
+      try { await sock.sendMessage(jid, { text: "🔍 Testing your stored key…" }); } catch {}
+      let key;
+      try { key = decryptApiKey(usage.api_key_enc); }
+      catch (e) {
+        try { await sock.sendMessage(jid, { text: `❌ Couldn't decrypt your stored key (${String(e).slice(0, 60)}). Run \`/cckey <APIKEY>\` to re-set.` }); } catch {}
+        return true;
+      }
+      const result = await validateAnthropicKey(key);
+      if (result.ok) {
+        try { await sock.sendMessage(jid, { text: "✅ Key works — Anthropic accepted it." }); } catch {}
+      } else {
+        try { await sock.sendMessage(jid, { text: `❌ Key didn't work: ${result.reason}${result.http_status ? ` (HTTP ${result.http_status})` : ""}. Re-set with \`/cckey <APIKEY>\`.` }); } catch {}
+      }
+      return true;
+    }
+
+    // /cckey <apikey>
+    const newKey = args.split(/\s+/)[0];
+    if (!/^sk-ant-api[A-Za-z0-9_-]+$/.test(newKey)) {
+      try { await sock.sendMessage(jid, { text: "❌ That doesn't look like an Anthropic API key. Format: `sk-ant-api…` Get one at https://console.anthropic.com/settings/keys" }); } catch {}
+      return true;
+    }
+    // React to the user's message immediately so they know we received
+    // it. After we finish, we'll prompt them to delete-for-everyone.
+    try { await sock.sendMessage(jid, { react: { text: "🔒", key: msg.key } }); } catch {}
+    try { await sock.sendMessage(jid, { text: "🔍 Validating your key with Anthropic…" }); } catch {}
+    const validation = await validateAnthropicKey(newKey);
+    if (!validation.ok) {
+      const reasonText = {
+        format: "doesn't match the `sk-ant-api…` format",
+        invalid: `Anthropic rejected the key (HTTP ${validation.http_status || "?"})`,
+        api_error: `Anthropic returned an error (HTTP ${validation.http_status})`,
+        network: "couldn't reach Anthropic",
+      }[validation.reason] || "validation failed";
+      try { await sock.sendMessage(jid, { text: `❌ ${reasonText}. The key was *not* stored.` }); } catch {}
+      return true;
+    }
+    // Encrypt + store
+    let enc;
+    try { enc = encryptApiKey(newKey); }
+    catch (e) {
+      try { await sock.sendMessage(jid, { text: `❌ Encryption failed: ${String(e).slice(0, 80)}. Key was not stored.` }); } catch {}
+      log(`cckey encrypt failed for ${formatJid(jid)}: ${e}`);
+      return true;
+    }
+    usage.api_key_enc = enc;
+    usage.byok_set_at = Date.now();
+    usage.mode = "api-byok";
+    saveUserUsage(userId, usage);
+    // Hibernate the user's session so the new key takes effect on next
+    // message. Existing session was using the old (shared or previous
+    // BYOK) key; --continue resume on next message picks up the new
+    // .anthropic-key file.
+    try { execFileSync("tmux", ["kill-session", "-t", getUserSessionName(userId)], { stdio: "ignore" }); } catch {}
+    userActivity.delete(userId);
+    log(`cckey: ${formatJid(jid)} set new BYOK key (validated, encrypted)`);
+    try {
+      await sock.sendMessage(jid, { text:
+        "✅ *Key validated and stored* (encrypted at rest).\n\n"
+        + "You're now on *BYOK mode* — your messages bill against your own Anthropic account, with a 1× service fee from your £ balance for the bot infrastructure.\n\n"
+        + "*Important:* please *delete-for-everyone* the message you just sent containing the key — it's still in this chat history. Long-press the message → Delete → Delete for everyone.\n\n"
+        + "Send `/cckey` anytime to check status, `/cckey test` to revalidate, `/cckey remove` to switch back to the shared key."
+      });
+    } catch {}
+    return true;
+  }
 
   const inviteMatch = /^\/invite(?:\s+(\d+(?:\.\d{1,2})?))?\s*$/i.exec(rawText);
   if (inviteMatch) {
@@ -2340,7 +2561,12 @@ function ensureUserConfig(userId, userJid) {
     const _isAdminUser = isAdminJid(userJid, _admin);
     const usage = loadUserUsage(userId);
     if (!_isAdminUser) {
-      writePerUserApiKey(projectUser.username, projectUser.homeDir, usage.mode || "api-shared");
+      writePerUserApiKey(
+        projectUser.username,
+        projectUser.homeDir,
+        usage.mode || "api-shared",
+        usage.api_key_enc || null,
+      );
     }
   }
   const userWorkDir = projectUser
