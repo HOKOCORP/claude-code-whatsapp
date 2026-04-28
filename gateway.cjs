@@ -4515,6 +4515,27 @@ function detectRateLimitModal(paneText) {
   return { resetTime };
 }
 
+// Detect Claude Code's inline rate-limit banner (different from the
+// interactive modal — this is the variant claude prints inline after
+// a tool call when usage is exhausted but no upgrade prompt opens).
+// Signature: "out of extra usage · resets ..." in the active viewport.
+// Phase 7's `●` / "API Error:" anchor rejects this because the banner
+// is rendered with the `⎿` tree prefix; the wording is claude-specific
+// enough that false-positive risk from documentation/code matching is
+// vanishingly small.
+//
+// Returns { resetTime } or null.
+function detectRateLimitBanner(paneText) {
+  const allLines = paneText.split("\n");
+  const recentLines = allLines.slice(-VIEWPORT_LINES_FOR_DETECTION);
+  const recent = recentLines.join("\n");
+  if (!/out of extra usage\s*[·.\-]\s*resets/i.test(recent)) return null;
+  let resetTime = "soon";
+  const m = recent.match(/resets\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm))\s*\(?\s*UTC/i);
+  if (m) resetTime = `${m[1]} UTC`;
+  return { resetTime };
+}
+
 // Send Enter to a tmux session as a low-level helper. Wrapped in a
 // promise so callers can await it.
 function sendTmuxEnter(uid) {
@@ -4536,7 +4557,7 @@ async function tickStallWatchdog(uid, chatJid) {
       captureUserPane(uid),
     ]);
 
-    // Case 0: rate-limit modal blocking claude on a UI prompt that
+    // Case 0a: rate-limit modal blocking claude on a UI prompt that
     // can't be answered from WhatsApp. Auto-select option 1 ("wait
     // for reset") + notify the user. This catches the dead-end where
     // claude is alive but every WhatsApp message goes into the void
@@ -4560,6 +4581,33 @@ async function tickStallWatchdog(uid, chatJid) {
         log(`rate-limit-modal: auto-dismissed for ${uid} (resets ${modalMatch.resetTime})`);
       } else {
         log(`rate-limit-modal: already dismissed for ${uid}, skipping`);
+      }
+      stallWatchdogs.delete(uid);
+      return;
+    }
+
+    // Case 0b: inline rate-limit banner (the non-modal variant —
+    // claude prints "You're out of extra usage · resets HH:MM (UTC)"
+    // inline after a failed call and idles at the prompt). No Enter
+    // to press; the user just needs to know what happened and when
+    // to retry.
+    const bannerMatch = detectRateLimitBanner(currentPane);
+    if (bannerMatch) {
+      const usage = loadUserUsage(uid);
+      if (usage.last_stuck_signature !== "rate_limit_banner") {
+        emitStallFallback(uid, chatJid, [
+          `⚠️ *Anthropic rate limit hit.*`,
+          ``,
+          `Quota resets at *${bannerMatch.resetTime}*. Send a message after that and we'll continue.`,
+          ``,
+          `Need to keep working before then? \`/cckey <APIKEY>\` for BYOK, or \`/effort medium\` / \`/model 1\` (Sonnet) to stretch remaining quota.`,
+        ].join("\n"));
+        usage.last_stuck_signature = "rate_limit_banner";
+        usage.last_stuck_at = Date.now();
+        saveUserUsage(uid, usage);
+        log(`rate-limit-banner: notified ${uid} (resets ${bannerMatch.resetTime})`);
+      } else {
+        log(`rate-limit-banner: already notified for ${uid}, skipping`);
       }
       stallWatchdogs.delete(uid);
       return;
