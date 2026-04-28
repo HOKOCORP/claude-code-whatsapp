@@ -4353,17 +4353,77 @@ const outboxReconcilers = new Map(); // dir -> reconciler tick fn
 const STALL_WATCHDOG_MS = 3 * 60 * 1000;
 const STALL_MAX_REARMS = 4; // 5 windows × 3 min = 15 min of patience
 const stallWatchdogs = new Map(); // uid -> { timer, chatJid, paneSnapshot, rearmCount }
+// Each pattern: { id, re, label, hint }.
+// `id` is a stable signature key — used to suppress repeat notifications
+// for the same stuck condition. `hint` is the actionable next step
+// surfaced to the user; "" omits the hint line.
+//
+// Order matters: more specific patterns first. The first match wins.
 const STALL_ERROR_PATTERNS = [
-  { re: /API Error:\s*5\d\d\s+([^\n]+)/i,                     label: "Upstream API error" },
-  { re: /Internal Server Error/i,                              label: "Upstream server error" },
-  { re: /(?:Request|Connection) failed:\s*([^\n]+)/i,          label: "Upstream request failed" },
-  { re: /Credit balance (?:is\s*)?too low/i,                   label: "Upstream credit exhausted" },
-  { re: /rate[\s-]?limit(?:ed)?/i,                             label: "Upstream rate limited" },
-  { re: /authentication[_\s-]?error/i,                         label: "Upstream auth error" },
+  {
+    id: "image_dimension",
+    re: /image .*(?:exceeds|over).*(?:dimension|size|2000\s*px)/i,
+    label: "An image in the conversation is too big for the model",
+    hint: "Reply `/compact` to summarize and continue, or `/clear` to start fresh.",
+  },
+  {
+    id: "context_too_long",
+    re: /context (?:length|window) (?:exceeded|exceeds|is too long)|prompt is too long|maximum context/i,
+    label: "The conversation has grown too long",
+    hint: "Reply `/compact` to summarize and continue, or `/clear` to start fresh.",
+  },
+  {
+    id: "credit_exhausted",
+    re: /Credit balance (?:is\s*)?too low/i,
+    label: "Anthropic credit on this account is exhausted",
+    hint: "If you're on BYOK, top up your Anthropic account. Otherwise contact the admin.",
+  },
+  {
+    id: "auth_error",
+    re: /authentication[_\s-]?error|invalid[_\s-]?api[_\s-]?key|invalid_authentication|please run \/login/i,
+    label: "Session lost authentication",
+    hint: "Try `/cckey test` if you're on BYOK, or contact the admin.",
+  },
+  {
+    id: "rate_limit",
+    re: /rate[\s-]?limit(?:ed)?|usage limit|5[\s-]?hour limit|weekly.*limit/i,
+    label: "Anthropic rate limit hit",
+    hint: "Try again in a few minutes (or up to 5h on a long session).",
+  },
+  {
+    id: "upstream_5xx",
+    re: /API Error:\s*5\d\d\s+([^\n]+)/i,
+    label: "Upstream API error",
+    hint: "Try again in a moment. Contact admin if it persists.",
+  },
+  {
+    id: "upstream_500",
+    re: /Internal Server Error/i,
+    label: "Upstream server error",
+    hint: "Try again in a moment.",
+  },
+  {
+    id: "request_failed",
+    re: /(?:Request|Connection) failed:\s*([^\n]+)/i,
+    label: "Upstream request failed",
+    hint: "Try again in a moment.",
+  },
 ];
 
 function armStallWatchdog(uid, chatJid) {
   disarmStallWatchdog(uid);
+  // Fresh user activity → clear any sticky stuck-error signature so
+  // future errors of the same kind get re-flagged. Without this, after
+  // a user successfully /compacted past a problem and hit the same
+  // category of error months later, they'd get no warning.
+  try {
+    const usage = loadUserUsage(uid);
+    if (usage.last_stuck_signature) {
+      delete usage.last_stuck_signature;
+      delete usage.last_stuck_at;
+      saveUserUsage(uid, usage);
+    }
+  } catch {}
   // Snapshot the pane NOW so the fire-path can diff against it and tell
   // "quiet stall" from "actively producing output." paneSnapshotPromise
   // resolves before the timer fires because 3min >> tmux capture latency.
@@ -4388,12 +4448,18 @@ async function captureUserPane(uid) {
   });
 }
 
+// Returns null if no match, or {id, message} where message is the
+// pre-formatted user-facing text including hint.
 function detectStallError(paneText) {
   for (const p of STALL_ERROR_PATTERNS) {
     const m = paneText.match(p.re);
-    if (m) return p.label + (m[1] ? `: ${m[1].trim()}` : "");
+    if (!m) continue;
+    const detail = m[1] ? `: ${m[1].trim()}` : "";
+    const lines = [`⚠️ ${p.label}${detail}.`];
+    if (p.hint) lines.push("", p.hint);
+    return { id: p.id, message: lines.join("\n") };
   }
-  return "";
+  return null;
 }
 
 async function tickStallWatchdog(uid, chatJid) {
@@ -4404,12 +4470,24 @@ async function tickStallWatchdog(uid, chatJid) {
       w.paneSnapshotPromise,
       captureUserPane(uid),
     ]);
-    const errorDetail = detectStallError(currentPane);
+    const errorMatch = detectStallError(currentPane);
     const paneChanged = priorPane !== currentPane;
 
-    // Case 1: recognisable error text → fire immediately, no re-arm.
-    if (errorDetail) {
-      emitStallFallback(uid, chatJid, `⚠️ ${errorDetail}. Please try again in a moment.`);
+    // Case 1: recognisable error text. Suppress duplicates per user
+    // via usage.last_stuck_signature — without this, every retry
+    // (gateway re-arms and re-fires) would emit the same error
+    // message to the user repeatedly. Cleared in armStallWatchdog
+    // when the user posts a new message that isn't blocked.
+    if (errorMatch) {
+      const usage = loadUserUsage(uid);
+      if (usage.last_stuck_signature !== errorMatch.id) {
+        emitStallFallback(uid, chatJid, errorMatch.message);
+        usage.last_stuck_signature = errorMatch.id;
+        usage.last_stuck_at = Date.now();
+        saveUserUsage(uid, usage);
+      } else {
+        log(`stall watchdog: suppressed repeat ${errorMatch.id} for ${uid}`);
+      }
       stallWatchdogs.delete(uid);
       return;
     }
