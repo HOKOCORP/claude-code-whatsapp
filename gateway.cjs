@@ -4488,6 +4488,45 @@ function detectStallError(paneText) {
   return null;
 }
 
+// Detect Claude Code's interactive `/rate-limit-options` modal in the
+// pane. Signature: option-1 text + the "Enter to confirm" footer. Both
+// must appear (option-1 alone could appear in scrollback after a prior
+// dismissal; the "Enter to confirm" footer indicates a *live* modal).
+//
+// Returns { resetTime } if modal is present, else null. resetTime is
+// the human-readable string from the "out of extra usage · resets X"
+// line, or "soon" if not parseable.
+function detectRateLimitModal(paneText) {
+  const allLines = paneText.split("\n");
+  const recentLines = allLines.slice(-VIEWPORT_LINES_FOR_DETECTION);
+  const recent = recentLines.join("\n");
+  // Both signals required. The option-1 text is the modal-specific
+  // marker; "Enter to confirm" indicates the dialog is currently
+  // accepting input (vs. having been answered or scrolled out).
+  if (!/Stop and wait for limit to reset/i.test(recent)) return null;
+  if (!/Enter to confirm/i.test(recent)) return null;
+  // Parse the reset time from the "resets HH:MMam/pm UTC" line, which
+  // is rendered above the modal. Look in the wider pane (not just
+  // viewport) since the message may have scrolled up slightly above
+  // the modal box.
+  let resetTime = "soon";
+  const m = paneText.match(/resets\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm))\s*\(?\s*UTC/i);
+  if (m) resetTime = `${m[1]} UTC`;
+  return { resetTime };
+}
+
+// Send Enter to a tmux session as a low-level helper. Wrapped in a
+// promise so callers can await it.
+function sendTmuxEnter(uid) {
+  const session = getUserSessionName(uid);
+  return new Promise((resolve) => {
+    execFile("tmux", ["send-keys", "-t", `${session}.0`, "Enter"], (err) => {
+      if (err) log(`tmux send-keys Enter failed for ${uid}: ${err.message}`);
+      resolve();
+    });
+  });
+}
+
 async function tickStallWatchdog(uid, chatJid) {
   const w = stallWatchdogs.get(uid);
   if (!w) return; // disarmed between setTimeout callback and now
@@ -4496,6 +4535,36 @@ async function tickStallWatchdog(uid, chatJid) {
       w.paneSnapshotPromise,
       captureUserPane(uid),
     ]);
+
+    // Case 0: rate-limit modal blocking claude on a UI prompt that
+    // can't be answered from WhatsApp. Auto-select option 1 ("wait
+    // for reset") + notify the user. This catches the dead-end where
+    // claude is alive but every WhatsApp message goes into the void
+    // because the tmux pane is on an Enter-to-confirm dialog. Sticky
+    // signature so we don't re-press Enter on every re-arm pass.
+    const modalMatch = detectRateLimitModal(currentPane);
+    if (modalMatch) {
+      const usage = loadUserUsage(uid);
+      if (usage.last_stuck_signature !== "rate_limit_modal") {
+        await sendTmuxEnter(uid);
+        emitStallFallback(uid, chatJid, [
+          `⚠️ *Anthropic rate limit hit.*`,
+          ``,
+          `I auto-selected "wait for reset" — the limit resets at *${modalMatch.resetTime}*. Send a message after that and we'll continue from where we left off.`,
+          ``,
+          `If you need to keep working before then: BYOK with \`/cckey <APIKEY>\` to use your own Anthropic credit, or contact admin.`,
+        ].join("\n"));
+        usage.last_stuck_signature = "rate_limit_modal";
+        usage.last_stuck_at = Date.now();
+        saveUserUsage(uid, usage);
+        log(`rate-limit-modal: auto-dismissed for ${uid} (resets ${modalMatch.resetTime})`);
+      } else {
+        log(`rate-limit-modal: already dismissed for ${uid}, skipping`);
+      }
+      stallWatchdogs.delete(uid);
+      return;
+    }
+
     const errorMatch = detectStallError(currentPane);
     const paneChanged = priorPane !== currentPane;
 
