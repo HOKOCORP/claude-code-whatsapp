@@ -4451,19 +4451,29 @@ async function captureUserPane(uid) {
 // Returns null if no match, or {id, message} where message is the
 // pre-formatted user-facing text including hint.
 //
-// IMPORTANT: only considers lines that look like claude's *own* error
-// output — not arbitrary text the assistant happened to read. Without
-// this anchor, code/docs containing words like "rate-limited" or
-// "API Error" inside a function the assistant is editing would trigger
-// false-positive warnings to the user. Claude marks its own status
-// lines with a leading `●`; standard upstream errors come through as
-// `API Error: NNN ...`. Anchor to those.
+// IMPORTANT: applies two filters to avoid false positives:
+//
+// 1. Only considers lines that look like claude's *own* error output
+//    — leading `●` or containing `API Error:`. Without this anchor,
+//    code/docs containing words like "rate-limited" or "401" inside a
+//    function the assistant is editing would trigger warnings.
+//
+// 2. Only considers lines in the active viewport (last 25 lines of
+//    the pane capture). Without this, old errors that have already
+//    been resolved (e.g. by a successful /compact or /clear) still
+//    live in tmux scrollback for hundreds of lines and would re-fire
+//    the same warning indefinitely. The active viewport is what the
+//    user is actually looking at; an error that has scrolled off is
+//    no longer the live state.
+//
+// 25 lines is roughly a phone-screen-worth of pane — small enough
+// that resolved-and-scrolled-out errors are excluded, large enough
+// to capture a fresh error and the prompt that follows it.
+const VIEWPORT_LINES_FOR_DETECTION = 25;
 function detectStallError(paneText) {
-  // Build a filtered text containing only the lines that look like
-  // claude's error output. Any line starting (after optional space)
-  // with `●` or containing `API Error:` qualifies.
-  const errorLines = paneText
-    .split("\n")
+  const allLines = paneText.split("\n");
+  const recentLines = allLines.slice(-VIEWPORT_LINES_FOR_DETECTION);
+  const errorLines = recentLines
     .filter(line => /^\s*●/.test(line) || /API Error:/i.test(line))
     .join("\n");
   if (!errorLines) return null;
