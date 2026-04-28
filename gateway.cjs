@@ -2975,6 +2975,35 @@ function hibernateIdleUsers() {
 
 setInterval(hibernateIdleUsers, HIBERNATE_CHECK_INTERVAL_MS);
 
+// Seed userActivity at boot from any existing per-user tmux session.
+// Without this, sessions that pre-date the gateway restart are never
+// considered for hibernation: hibernateIdleUsers iterates only the
+// userActivity Map, which the gateway populates exclusively on inbound
+// messages. A box that's been running a while with no new traffic
+// from a particular user accumulates tmux sessions whose claude
+// processes hold ~300 MB RSS each. Treating them as "active right
+// now" gives them the standard 15-min grace window before the next
+// hibernation check reaps them.
+function seedUserActivityFromTmux() {
+  let seeded = 0;
+  let out = "";
+  try {
+    out = execFileSync("tmux", ["list-sessions", "-F", "#{session_name}"], { encoding: "utf8" });
+  } catch { return; }
+  const prefix = `cc-ch-wa-${PHONE}-u-`;
+  const now = Date.now();
+  for (const name of out.split("\n")) {
+    if (!name.startsWith(prefix)) continue;
+    const userId = name.slice(prefix.length);
+    if (!userActivity.has(userId)) {
+      userActivity.set(userId, now);
+      seeded++;
+    }
+  }
+  if (seeded > 0) log(`hibernate: seeded ${seeded} pre-existing session(s) into activity map`);
+}
+seedUserActivityFromTmux();
+
 // ── OAuth token watchdog ────────────────────────────────────────
 // Periodically checks token expiry, fixes broken symlinks, and alerts
 // admin before sessions start failing with 401.
