@@ -615,6 +615,37 @@ async function validateAnthropicKey(apiKey) {
   }
 }
 
+// ── Per-user model selection ────────────────────────────────────────
+// Users can pick which Claude model their session uses. The preference
+// lives at /home/<user>/.claude-model — launch.sh reads it and adds
+// `--model <id>` to the cc-watchdog command line. Default (no file
+// present) is whatever Claude Code picks automatically.
+//
+// Numbered options for the picker UX. Order matters — these are the
+// numbers users type. Don't reorder without bumping a migration.
+const MODEL_OPTIONS = [
+  { id: "claude-haiku-4-5",  label: "Haiku 4.5",  blurb: "Fastest, lowest cost. Good for short / simple tasks." },
+  { id: "claude-sonnet-4-6", label: "Sonnet 4.6", blurb: "Balanced. Default for most coding work." },
+  { id: "claude-opus-4-7",   label: "Opus 4.7",   blurb: "Most capable, most expensive. Reserve for hard problems." },
+];
+
+function writePerUserModel(username, homeDir, modelId) {
+  const modelFile = path.join(homeDir, ".claude-model");
+  if (!modelId) {
+    try { fs.unlinkSync(modelFile); } catch {}
+    return false;
+  }
+  try {
+    fs.writeFileSync(modelFile, modelId + "\n");
+    execFileSync("chown", [`${username}:${username}`, modelFile], { stdio: "ignore" });
+    fs.chmodSync(modelFile, 0o400);
+    return true;
+  } catch (e) {
+    log(`model file write failed for ${username}: ${e}`);
+    return false;
+  }
+}
+
 // ── Per-user Anthropic API key provisioning ────────────────────────
 // For non-admin users on api-shared mode, write admin's API key into a
 // 0400 file in their isolated home. launch.sh sources it before
@@ -1069,6 +1100,98 @@ function formatJid(jid) { return jid.replace(/@s\.whatsapp\.net$/, "").replace(/
 async function handleInviteCommands({ sock, msg, jid }) {
   const rawText = extractText(msg.message || {}).trim();
   const lower = rawText.toLowerCase();
+
+  // ── Pending /model selection: digit reply within 5 min ──────
+  // Must run BEFORE /about etc so a user typing "1" gets routed as a
+  // selection (not as a normal message). Ignored when there's no
+  // pending selection — falls through to other handlers / the model.
+  if (!jid.endsWith("@g.us") && /^[1-9]$/.test(rawText)) {
+    const _modelUserId = sanitizeUserId(jid);
+    const _modelUsage = loadUserUsage(_modelUserId);
+    const _pending = _modelUsage.pending_model_selection;
+    if (_pending && (Date.now() - (_pending.at || 0)) < 5 * 60 * 1000) {
+      const _idx = parseInt(rawText, 10) - 1;
+      const _opt = MODEL_OPTIONS[_idx];
+      if (_opt) {
+        _modelUsage.preferred_model = _opt.id;
+        delete _modelUsage.pending_model_selection;
+        saveUserUsage(_modelUserId, _modelUsage);
+        // Write the per-user model file + restart so the next message
+        // uses the new model.
+        if (ISOLATION) {
+          const username = isolationGetUsername(_modelUserId);
+          const homeDir = `/home/${username}`;
+          writePerUserModel(username, homeDir, _opt.id);
+        }
+        try { execFileSync("tmux", ["kill-session", "-t", getUserSessionName(_modelUserId)], { stdio: "ignore" }); } catch {}
+        userActivity.delete(_modelUserId);
+        log(`model: ${formatJid(jid)} selected ${_opt.id} via picker`);
+        try { await sock.sendMessage(jid, { text: `✅ Model set to *${_opt.label}*. Send a message to start using it.` }); } catch {}
+        return true;
+      }
+    }
+    // No pending selection or invalid index — fall through. The user
+    // may have intended a normal message ("1. build me X").
+  }
+
+  // ── /model — pick which Claude model to use (DM-only) ───────
+  if (lower === "/model" || /^\/model(\s|$)/i.test(rawText)) {
+    if (jid.endsWith("@g.us")) {
+      try { await sock.sendMessage(jid, { text: "🚫 `/model` is DM-only — set your model in a direct chat." }); } catch {}
+      return true;
+    }
+    const userId = sanitizeUserId(jid);
+    const usage = loadUserUsage(userId);
+
+    // /model <id-or-number> — direct apply, skip the picker
+    const directMatch = /^\/model\s+(\S+)\s*$/i.exec(rawText);
+    if (directMatch) {
+      let opt;
+      const raw = directMatch[1];
+      if (/^[1-9]$/.test(raw)) {
+        opt = MODEL_OPTIONS[parseInt(raw, 10) - 1];
+      } else {
+        opt = MODEL_OPTIONS.find(o => o.id === raw || o.id.startsWith(raw));
+      }
+      if (!opt) {
+        try {
+          await sock.sendMessage(jid, { text:
+            `❌ Unknown model. Use \`/model\` (no args) to see the picker, or pick by number / id from the list.`
+          });
+        } catch {}
+        return true;
+      }
+      usage.preferred_model = opt.id;
+      delete usage.pending_model_selection;
+      saveUserUsage(userId, usage);
+      if (ISOLATION) {
+        const username = isolationGetUsername(userId);
+        const homeDir = `/home/${username}`;
+        writePerUserModel(username, homeDir, opt.id);
+      }
+      try { execFileSync("tmux", ["kill-session", "-t", getUserSessionName(userId)], { stdio: "ignore" }); } catch {}
+      userActivity.delete(userId);
+      log(`model: ${formatJid(jid)} selected ${opt.id} via direct command`);
+      try { await sock.sendMessage(jid, { text: `✅ Model set to *${opt.label}*. Send a message to start using it.` }); } catch {}
+      return true;
+    }
+
+    // Bare /model — show numbered picker, set pending state
+    usage.pending_model_selection = { at: Date.now() };
+    saveUserUsage(userId, usage);
+    const lines = ["🤖 *Choose a model*", ""];
+    for (let i = 0; i < MODEL_OPTIONS.length; i++) {
+      const o = MODEL_OPTIONS[i];
+      lines.push(`*${i + 1}. ${o.label}* — ${o.blurb}`);
+    }
+    lines.push("");
+    lines.push("Reply with *1*, *2*, or *3* to select. Expires in 5 min.");
+    const current = MODEL_OPTIONS.find(o => o.id === usage.preferred_model);
+    lines.push("");
+    lines.push(`Current: ${current ? current.label : "_(default — Claude Code picks)_"}`);
+    try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
+    return true;
+  }
 
   // ── /about — AI disclosure, refund policy, legal links (Phase 5) ─
   // Required by Anthropic's Usage Policy: "All consumer-facing
@@ -2996,6 +3119,9 @@ function ensureUserConfig(userId, userJid) {
         usage.api_key_enc || null,
       );
     }
+    // Model preference applies to admin too — admin can /model to test
+    // different models even though they're unmetered.
+    writePerUserModel(projectUser.username, projectUser.homeDir, usage.preferred_model || "");
   }
   const userWorkDir = projectUser
     ? path.join(projectUser.homeDir, "workspace")
@@ -3315,6 +3441,13 @@ function spawnUserSession(userId, userJid) {
   const apiKeySource = projectUser
     ? `[ -r "${path.join(projectUser.homeDir, ".anthropic-key")}" ] && . "${path.join(projectUser.homeDir, ".anthropic-key")}"`
     : "";
+  // Read the per-user preferred model (Phase 6) and pass --model to
+  // cc-watchdog. Empty string when no preference, so the line below
+  // remains a single shell word and doesn't break the exec.
+  const modelFile = projectUser ? path.join(projectUser.homeDir, ".claude-model") : "";
+  const modelFlag = modelFile
+    ? `MODEL_FLAG=""; if [ -r "${modelFile}" ]; then _M=$(head -1 "${modelFile}" 2>/dev/null | tr -d '[:space:]'); [ -n "$_M" ] && MODEL_FLAG="--model $_M"; fi`
+    : "MODEL_FLAG=\"\"";
   const launcherBody = [
     "#!/bin/bash",
     envPreamble,
@@ -3322,8 +3455,9 @@ function spawnUserSession(userId, userJid) {
     portExport,
     groupEnvSource,
     apiKeySource,
+    modelFlag,
     `cd "${launchWorkDir}"`,
-    `exec cc-watchdog --mcp-config "${mcpConfigPath}" --dangerously-load-development-channels server:whatsapp --permission-mode bypassPermissions --allowedTools ${allowedTools}`,
+    `exec cc-watchdog --mcp-config "${mcpConfigPath}" --dangerously-load-development-channels server:whatsapp --permission-mode bypassPermissions $MODEL_FLAG --allowedTools ${allowedTools}`,
   ].filter(Boolean).join("\n") + "\n";
 
   fs.writeFileSync(launcher, launcherBody);
