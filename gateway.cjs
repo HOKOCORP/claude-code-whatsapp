@@ -4579,18 +4579,22 @@ function sendTmuxText(uid, text) {
 // claude is idle (pane unchanged) before nudging — a mid-thinking
 // claude might still be on its way to calling the tool.
 function detectChannelAmnesia(paneText) {
+  // Walk ALL lines in the captured pane — claude replies can fill
+  // 50–150 lines (file reads, task list, code blocks), so a fixed
+  // tail-slice would push older `← whatsapp` markers out of the
+  // detection window. The order-comparison logic doesn't care about
+  // recency: if `Called whatsapp` appears AFTER `← whatsapp` anywhere
+  // in the pane history, claude has answered. If the most recent
+  // `← whatsapp` is later than the most recent `Called whatsapp`,
+  // there's an unanswered message regardless of how far back.
   const lines = paneText.split("\n");
-  // Look at last 80 lines; older inbound/calls are stale anyway.
-  const recent = lines.slice(-80);
   let lastInboundIdx = -1;
   let lastCalledIdx = -1;
-  for (let i = 0; i < recent.length; i++) {
-    if (/^\s*←\s*whatsapp\s*·/.test(recent[i])) lastInboundIdx = i;
-    if (/Called\s+(?:mcp__)?whatsapp/i.test(recent[i])) lastCalledIdx = i;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\s*←\s*whatsapp\s*·/.test(lines[i])) lastInboundIdx = i;
+    if (/Called\s+(?:mcp__)?whatsapp/i.test(lines[i])) lastCalledIdx = i;
   }
   if (lastInboundIdx === -1) return false;
-  // Strictly greater: an inbound on the same line as a Called marker
-  // would never happen, but be safe.
   return lastInboundIdx > lastCalledIdx;
 }
 
