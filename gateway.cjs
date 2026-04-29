@@ -4548,6 +4548,52 @@ function sendTmuxEnter(uid) {
   });
 }
 
+// Type a literal string into a tmux session followed by Enter.
+// Used for auto-nudging claude when it's slipping into channel-amnesia
+// (received WhatsApp message but didn't call mcp__whatsapp__reply).
+function sendTmuxText(uid, text) {
+  const session = getUserSessionName(uid);
+  return new Promise((resolve) => {
+    execFile("tmux", ["send-keys", "-t", `${session}.0`, text], (err) => {
+      if (err) {
+        log(`tmux send-keys text failed for ${uid}: ${err.message}`);
+        resolve();
+        return;
+      }
+      execFile("tmux", ["send-keys", "-t", `${session}.0`, "Enter"], () => resolve());
+    });
+  });
+}
+
+// Detect "channel-mode amnesia": claude received a WhatsApp message
+// but never called mcp__whatsapp__reply for it. Common after /compact
+// strips the system-prompt reminder about how to operate in this
+// channel — claude writes its answer to terminal stdout (visible only
+// in the tmux pane) without pushing to the user.
+//
+// Heuristic: walk the last N pane lines, find the latest inbound
+// marker (`← whatsapp ·`) and the latest tool-call marker
+// (`Called whatsapp` or `Called mcp__whatsapp__reply`). If the
+// inbound is more recent than the tool call, claude has unanswered
+// input. Returns true / false. Caller is expected to also confirm
+// claude is idle (pane unchanged) before nudging — a mid-thinking
+// claude might still be on its way to calling the tool.
+function detectChannelAmnesia(paneText) {
+  const lines = paneText.split("\n");
+  // Look at last 80 lines; older inbound/calls are stale anyway.
+  const recent = lines.slice(-80);
+  let lastInboundIdx = -1;
+  let lastCalledIdx = -1;
+  for (let i = 0; i < recent.length; i++) {
+    if (/^\s*←\s*whatsapp\s*·/.test(recent[i])) lastInboundIdx = i;
+    if (/Called\s+(?:mcp__)?whatsapp/i.test(recent[i])) lastCalledIdx = i;
+  }
+  if (lastInboundIdx === -1) return false;
+  // Strictly greater: an inbound on the same line as a Called marker
+  // would never happen, but be safe.
+  return lastInboundIdx > lastCalledIdx;
+}
+
 async function tickStallWatchdog(uid, chatJid) {
   const w = stallWatchdogs.get(uid);
   if (!w) return; // disarmed between setTimeout callback and now
@@ -4647,8 +4693,43 @@ async function tickStallWatchdog(uid, chatJid) {
       });
       return;
     }
-    // Case 3: pane unchanged (genuinely stuck) OR rearm budget exhausted
-    // → send the generic fallback.
+    // Case 3a: channel-mode amnesia — claude has unanswered inbound
+    // and is sitting idle. Nudge claude to actually call the WhatsApp
+    // reply tool. Don't disarm the watchdog: re-arm so the next tick
+    // can verify the nudge worked (claude calls the tool, we see
+    // `Called whatsapp` after the inbound) or fall through to the
+    // generic fallback if it didn't.
+    //
+    // Sticky `amnesia_nudged` signature so we don't keep nudging in
+    // a loop if claude really has decided not to reply. Cleared on
+    // next inbound message in armStallWatchdog.
+    if (detectChannelAmnesia(currentPane)) {
+      const usage = loadUserUsage(uid);
+      if (usage.last_stuck_signature !== "amnesia_nudged") {
+        await sendTmuxText(
+          uid,
+          "Reply to the most recent WhatsApp message above using the mcp__whatsapp__reply tool. Your previous reply only landed in terminal output, not on the user's phone.",
+        );
+        usage.last_stuck_signature = "amnesia_nudged";
+        usage.last_stuck_at = Date.now();
+        saveUserUsage(uid, usage);
+        log(`channel-amnesia: auto-nudged ${uid}`);
+        // Re-arm so next tick verifies. Use one rearm slot.
+        const nextPaneSnapshotPromise = captureUserPane(uid);
+        const nextTimer = setTimeout(() => tickStallWatchdog(uid, chatJid), STALL_WATCHDOG_MS);
+        stallWatchdogs.set(uid, {
+          timer: nextTimer,
+          chatJid,
+          paneSnapshotPromise: nextPaneSnapshotPromise,
+          rearmCount: STALL_MAX_REARMS, // one final pass
+        });
+        return;
+      }
+      log(`channel-amnesia: already nudged ${uid}, falling through to stall fallback`);
+    }
+
+    // Case 3b: pane unchanged, no amnesia (or already nudged) →
+    // generic fallback.
     emitStallFallback(uid, chatJid, `⚠️ No response yet — something may be stuck. Please try rephrasing or retry.`);
     stallWatchdogs.delete(uid);
   } catch (e) {
