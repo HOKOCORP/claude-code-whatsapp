@@ -4592,7 +4592,14 @@ function detectChannelAmnesia(paneText) {
   let lastCalledIdx = -1;
   for (let i = 0; i < lines.length; i++) {
     if (/^\s*←\s*whatsapp\s*·/.test(lines[i])) lastInboundIdx = i;
-    if (/Called\s+(?:mcp__)?whatsapp/i.test(lines[i])) lastCalledIdx = i;
+    // Claude's tool-call summary line. Multiple formats observed:
+    //   "  Called whatsapp (ctrl+o to expand)"
+    //   "  Called whatsapp 3 times (ctrl+o to expand)"
+    //   "  Called Gmail, whatsapp 2 times (ctrl+o to expand)"  ← previously missed
+    //   "  Called mcp__whatsapp__reply"
+    // Match any line that starts with `Called ` and contains
+    // `whatsapp` somewhere — covers all observed shapes.
+    if (/^\s*Called\s+.*whatsapp/i.test(lines[i])) lastCalledIdx = i;
   }
   if (lastInboundIdx === -1) return false;
   return lastInboundIdx > lastCalledIdx;
