@@ -3769,7 +3769,27 @@ async function connectWhatsApp() {
         // still don't trigger the bot (they fall through to Phase 0
         // gate below where they get filtered out anyway).
         const isAdminQuoteReply = !!quotedCtx.stanzaId && _isAdminSender;
-        if (!isDirectMode && !isSlashCommand && !mentioned && !prefixed && !containsTrigger && !isReplyToBot && !isAdminQuoteReply) {
+        // TOS-acceptance bypass: when a non-admin user has been sent a
+        // TOS prompt (recorded in groupMeta._tosSentTo[]) and replies
+        // with "agree" / "i agree", let it through even without the
+        // usual triggers. The TOS prompt told them "Reply *agree* to
+        // continue" — most users interpret that as "send a message
+        // back" rather than "use WhatsApp's quote-reply feature", so
+        // the message lands without any trigger and gets dropped here
+        // before the TOS gate can record acceptance. Without this
+        // bypass, users hit a permanent "I agreed but the bot is
+        // ignoring me" dead-end.
+        const groupMetaForTos = (() => {
+          try { return JSON.parse(fs.readFileSync(path.join(getUserDir(sanitizeUserId(jid)), "meta.json"), "utf8")); }
+          catch { return null; }
+        })();
+        const _senderJidForTos = participant || jid;
+        const tosSentToThisSender = groupMetaForTos && (groupMetaForTos._tosSentTo || []).some(
+          j => j === _senderJidForTos || formatJid(j) === formatJid(_senderJidForTos)
+        );
+        const isTosAgree = /^(i\s+)?agree\.?$/i.test(cleanText.trim());
+        const isTosAcceptance = tosSentToThisSender && isTosAgree;
+        if (!isDirectMode && !isSlashCommand && !mentioned && !prefixed && !containsTrigger && !isReplyToBot && !isAdminQuoteReply && !isTosAcceptance) {
           continue;
         }
       }
