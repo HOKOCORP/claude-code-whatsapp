@@ -2949,6 +2949,7 @@ function hibernateIdleUsers() {
   const adminUserIds = new Set((admin?.jids || []).map(sanitizeUserId));
   const cutoff = Date.now() - HIBERNATE_IDLE_MS;
   let hibernated = 0;
+  let nudged = 0;
   for (const [userId, lastActivity] of userActivity) {
     if (lastActivity > cutoff) continue;       // still active
     if (adminUserIds.has(userId)) continue;    // admin: never hibernate
@@ -2961,6 +2962,55 @@ function hibernateIdleUsers() {
       userActivity.delete(userId);
       continue;
     }
+
+    // Phase 10: amnesia check before kill. Closes the race where a
+    // session whose claude wrote a reply to terminal-only (didn't
+    // call mcp__whatsapp__reply) gets hibernated before Phase 9's
+    // watchdog tick reaches the amnesia case. Without this, the
+    // unanswered state is preserved in claude's --continue history
+    // (because compaction/resume keeps it) but no watchdog ever
+    // fires Phase 9 again to recover.
+    //
+    // First detection: send a nudge via tmux send-keys + defer
+    // hibernation by resetting userActivity to now (15-min grace).
+    // Sticky `last_stuck_signature = "amnesia_pre_hibernate_nudged"`
+    // so we don't nudge in a loop. On the next 5-min check:
+    //   - if amnesia is gone: clear sticky + proceed normally (next
+    //     idle window may hibernate cleanly)
+    //   - if amnesia persists: nudge didn't unstick claude, give up
+    //     and hibernate
+    try {
+      const paneText = execFileSync("tmux", ["capture-pane", "-t", `${sessionName}.0`, "-p", "-S", "-200"], { encoding: "utf8" });
+      const usage = loadUserUsage(userId);
+      if (detectChannelAmnesia(paneText)) {
+        if (usage.last_stuck_signature !== "amnesia_pre_hibernate_nudged") {
+          // First detection — nudge + defer
+          execFileSync("tmux", ["send-keys", "-t", `${sessionName}.0`,
+            "Reply to the most recent WhatsApp message above using the mcp__whatsapp__reply tool. Your previous reply only landed in terminal output, not on the user's phone."], { stdio: "ignore" });
+          execFileSync("tmux", ["send-keys", "-t", `${sessionName}.0`, "Enter"], { stdio: "ignore" });
+          usage.last_stuck_signature = "amnesia_pre_hibernate_nudged";
+          usage.last_stuck_at = Date.now();
+          saveUserUsage(userId, usage);
+          userActivity.set(userId, Date.now());  // 15-min grace
+          nudged++;
+          log(`hibernate-amnesia: nudged ${userId}, deferring hibernation`);
+          continue;
+        }
+        // Second pass with sticky still set → nudge didn't work →
+        // fall through and hibernate.
+        log(`hibernate-amnesia: nudge didn't unstick ${userId}, hibernating anyway`);
+      } else if (usage.last_stuck_signature === "amnesia_pre_hibernate_nudged") {
+        // Amnesia gone after a previous nudge — clear sticky.
+        delete usage.last_stuck_signature;
+        delete usage.last_stuck_at;
+        saveUserUsage(userId, usage);
+      }
+    } catch (e) {
+      log(`hibernate-amnesia: pane check failed for ${userId}: ${e.message}`);
+      // Fall through to hibernate — don't let a check error keep a
+      // dead session alive forever.
+    }
+
     try {
       execFileSync("tmux", ["kill-session", "-t", sessionName], { stdio: "ignore" });
       userActivity.delete(userId);
@@ -2970,7 +3020,9 @@ function hibernateIdleUsers() {
       log(`hibernate: failed to kill ${sessionName}: ${e}`);
     }
   }
-  if (hibernated > 0) log(`hibernate: ${hibernated} session(s) hibernated, ${userActivity.size} active`);
+  if (hibernated > 0 || nudged > 0) {
+    log(`hibernate: ${hibernated} hibernated, ${nudged} pre-hibernate-nudged, ${userActivity.size} active`);
+  }
 }
 
 setInterval(hibernateIdleUsers, HIBERNATE_CHECK_INTERVAL_MS);
