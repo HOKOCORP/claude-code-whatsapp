@@ -921,6 +921,24 @@ function startStripeServer(getSock) {
 // all channels on this box (so admin can mint a code in one channel
 // and a user redeems it in another).
 const TOPUP_CODES_FILE = path.join(os.homedir(), ".ccm", "topup-codes.json");
+
+// ── Pending /topup wizard state (Phase 11) ─────────────────────────
+// Per-admin step-state for the bare-/topup wizard. Keyed by admin
+// JID. Persisted so a gateway restart mid-flow doesn't lose the
+// admin's selection. Auto-expires after PENDING_TOPUP_TTL_MS.
+const PENDING_TOPUP_FILE = path.join(os.homedir(), ".ccm", "topup-pending.json");
+const PENDING_TOPUP_TTL_MS = 5 * 60 * 1000;
+
+function loadPendingTopup() {
+  try { return JSON.parse(fs.readFileSync(PENDING_TOPUP_FILE, "utf8")); }
+  catch { return {}; }
+}
+function savePendingTopup(state) {
+  try {
+    fs.mkdirSync(path.dirname(PENDING_TOPUP_FILE), { recursive: true });
+    fs.writeFileSync(PENDING_TOPUP_FILE, JSON.stringify(state, null, 2) + "\n");
+  } catch (e) { log(`pending-topup write failed: ${e}`); }
+}
 // Code alphabet excludes ambiguous chars (0/O, 1/I/L) so codes are
 // safe to read out loud or copy off a screen.
 const TOPUP_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -1866,11 +1884,26 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
     || rawText === "I CONFIRM SAME PERSON"
   );
   const isCodeCreateCmd = /^\/code-create\s+/i.test(rawText) || lower === "/code-create";
+  // Phase 11: bare /topup starts the wizard. /cancel and digit replies
+  // are routed if-and-only-if this admin has a pending wizard. Without
+  // pending state, "/cancel" / "1" / "2" fall through to the rest of
+  // the dispatch chain (e.g. claude) so we don't shadow other handlers.
+  const _pendingTopupAll = loadPendingTopup();
+  const _pendingTopup = _pendingTopupAll[jid];
+  const _pendingFresh = _pendingTopup && (Date.now() - (_pendingTopup.started_at || 0)) < PENDING_TOPUP_TTL_MS;
+  const isTopupBareStart = lower === "/topup";
+  const isTopupWizardReply = _pendingFresh && (
+    /^[1-9][0-9]*$/.test(rawText)            // digit selection
+    || /^\d+(?:\.\d{1,2})?$/.test(rawText)   // amount step
+    || lower === "/cancel"
+  );
   if (lower !== "/users"
       && !/^\/rename\s+/i.test(rawText)
       && !/^\/topup\s+/i.test(rawText)
       && !isAdminCmd
-      && !isCodeCreateCmd) {
+      && !isCodeCreateCmd
+      && !isTopupBareStart
+      && !isTopupWizardReply) {
     return false;
   }
 
@@ -2070,6 +2103,148 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
       const kind = target.isGroup ? "group" : "user";
       await sock.sendMessage(jid, { text: `✅ Topped up ${kind} *${displayName}* with ${fmtGbp(amount)} — new balance ${fmtGbp(u.balance)}.` });
     } catch {}
+    return true;
+  }
+
+  // ── Bare /topup → step-based wizard (Phase 11) ───────────────────
+  // Three steps, each persisted to ~/.ccm/topup-pending.json so a
+  // gateway restart mid-flow doesn't drop progress:
+  //   1. select_kind:    pick "1" (DM users) or "2" (groups)
+  //   2. select_target:  pick by number from a labelled list
+  //   3. enter_amount:   reply with the £ amount → execute topup
+  // /cancel exits at any step. State expires after 5 min; an expired
+  // entry is silently replaced when the admin sends a new wizard
+  // command.
+  if (lower === "/topup" || _pendingFresh) {
+    try { await sock.readMessages([msg.key]); } catch {}
+
+    // /cancel always wipes pending state.
+    if (lower === "/cancel") {
+      delete _pendingTopupAll[jid];
+      savePendingTopup(_pendingTopupAll);
+      try { await sock.sendMessage(jid, { text: "❌ Top-up wizard cancelled." }); } catch {}
+      return true;
+    }
+
+    // Step 0: bare /topup → start fresh wizard at step 1.
+    if (lower === "/topup") {
+      _pendingTopupAll[jid] = { step: "select_kind", started_at: Date.now() };
+      savePendingTopup(_pendingTopupAll);
+      try {
+        await sock.sendMessage(jid, { text:
+          "💰 *Top up wizard*\n\n"
+          + "Top up which kind?\n\n"
+          + "  *1.* DM user\n"
+          + "  *2.* Group\n\n"
+          + "Reply *1* or *2*. Send */cancel* to abort. Expires in 5 min."
+        });
+      } catch {}
+      return true;
+    }
+
+    // From here on we're handling a digit/amount reply; _pendingFresh
+    // is true (see the dispatch gate above).
+    const pending = _pendingTopup;
+
+    if (pending.step === "select_kind") {
+      if (rawText !== "1" && rawText !== "2") {
+        try { await sock.sendMessage(jid, { text: "⚠️ Reply *1* (DM users) or *2* (groups). Or */cancel*." }); } catch {}
+        return true;
+      }
+      const wantGroups = rawText === "2";
+      // Build candidate list — same shape as /users but filtered.
+      let entries; try { entries = fs.readdirSync(USERS_DIR); } catch { entries = []; }
+      const ownNumber = String(PHONE || "");
+      const adminJidsForFilter = (adminCheck && adminCheck.jids) || [];
+      const candidates = [];
+      for (const uid of entries) {
+        if (ownNumber && uid === ownNumber) continue;
+        let meta = {};
+        try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8")); } catch { continue; }
+        if (!!meta.isGroup !== wantGroups) continue;
+        // Hide admin's own DM row — admin is unmetered, topping them up is meaningless.
+        if (!wantGroups && adminJidsForFilter.length > 0 && isAdminJid(meta.jid, adminCheck)) continue;
+        const u = loadUserUsage(uid);
+        candidates.push({
+          userId: uid,
+          hash: displayHashFor(uid, meta),
+          name: meta.name || meta.pushName || formatJid(meta.jid || uid),
+          balance: u.balance || 0,
+        });
+      }
+      candidates.sort((a, b) => a.name.localeCompare(b.name));
+
+      if (candidates.length === 0) {
+        delete _pendingTopupAll[jid];
+        savePendingTopup(_pendingTopupAll);
+        try { await sock.sendMessage(jid, { text: `ℹ️ No ${wantGroups ? "groups" : "DM users"} to top up yet.` }); } catch {}
+        return true;
+      }
+
+      pending.step = "select_target";
+      pending.kind = wantGroups ? "group" : "user";
+      pending.candidates = candidates;
+      _pendingTopupAll[jid] = pending;
+      savePendingTopup(_pendingTopupAll);
+
+      const lines = [`💰 *Pick a ${pending.kind} to top up*`, ""];
+      candidates.forEach((c, i) => {
+        lines.push(`*${i + 1}.* ${c.name}`);
+        lines.push(`   \`${c.hash}\` · bal ${fmtGbp(c.balance)}`);
+      });
+      lines.push("", `Reply with the number, or */cancel*.`);
+      try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
+      return true;
+    }
+
+    if (pending.step === "select_target") {
+      const idx = parseInt(rawText, 10) - 1;
+      if (!Number.isInteger(idx) || idx < 0 || idx >= (pending.candidates || []).length) {
+        try { await sock.sendMessage(jid, { text: `⚠️ Invalid number. Pick from the list (1–${(pending.candidates || []).length}), or */cancel*.` }); } catch {}
+        return true;
+      }
+      pending.step = "enter_amount";
+      pending.target = pending.candidates[idx];
+      _pendingTopupAll[jid] = pending;
+      savePendingTopup(_pendingTopupAll);
+
+      const t = pending.target;
+      try {
+        await sock.sendMessage(jid, { text:
+          `💰 Top up *${t.name}* (\`${t.hash}\`)?\n\n`
+          + `Current balance: ${fmtGbp(t.balance)}\n\n`
+          + `Reply with the £ amount (e.g. *100* or *25.50*), or */cancel*.`
+        });
+      } catch {}
+      return true;
+    }
+
+    if (pending.step === "enter_amount") {
+      const amount = Number(rawText);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        try { await sock.sendMessage(jid, { text: "⚠️ Amount must be a positive number. Reply with a £ amount, or */cancel*." }); } catch {}
+        return true;
+      }
+      const t = pending.target;
+      const u = loadUserUsage(t.userId);
+      u.balance = (u.balance || 0) + amount;
+      u.total_added = (u.total_added || 0) + amount;
+      u.history = u.history || [];
+      u.history.push({ date: todayKey(), action: "topup", amount, note: "admin top-up (wizard)" });
+      saveUserUsage(t.userId, u);
+      delete _pendingTopupAll[jid];
+      savePendingTopup(_pendingTopupAll);
+      log(`topup +${fmtGbp(amount)} -> ${t.userId} (${t.name}) by ${formatJid(jid)} via wizard (new balance ${fmtGbp(u.balance)})`);
+      try {
+        await sock.sendMessage(jid, { text: `✅ Topped up ${pending.kind} *${t.name}* with ${fmtGbp(amount)} — new balance ${fmtGbp(u.balance)}.` });
+      } catch {}
+      return true;
+    }
+
+    // Defensive: corrupted state — clear and tell the admin.
+    delete _pendingTopupAll[jid];
+    savePendingTopup(_pendingTopupAll);
+    try { await sock.sendMessage(jid, { text: "⚠️ Wizard state corrupted; reset. Run /topup to start over." }); } catch {}
     return true;
   }
 
