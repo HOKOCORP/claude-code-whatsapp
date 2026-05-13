@@ -4077,22 +4077,42 @@ async function connectWhatsApp() {
         const groupText = extractText(msg.message || {});
         const cleanText = groupText.replace(/[\u2066\u2067\u2068\u2069\u200E\u200F\u200B\u200C\u200D\uFEFF]/g, "");
         const trigger = (access.groupTrigger || "@ai").toLowerCase();
-        const botLidNum = (sock?.user?.lid || "").split(":")[0];
-        const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.some(
-          (m) => m.includes(PHONE) || (sock?.user?.id && m.includes(sock.user.id.split(":")[0])) || (botLidNum && m.includes(botLidNum))
-        );
-        const prefixed = cleanText.toLowerCase().startsWith(trigger);
-        const containsTrigger = cleanText.toLowerCase().includes(trigger);
-        // Check if replying to a message from the bot
+        // Strict JID match: compare userpart-to-userpart, never substring.
+        // Without this, a user whose phone number happens to contain the
+        // bot's number as a substring (e.g. bot=85258080138, user=...
+        // 8525808013812345...) gets misidentified as the bot, so a normal
+        // user-to-user quote-reply gets treated as a reply-to-bot or as a
+        // mention.
+        const botPhoneUserPart = String(PHONE || "");
+        const botIdUserPart = (sock?.user?.id || "").split("@")[0].split(":")[0];
+        const botLidUserPart = (sock?.user?.lid || "").split("@")[0].split(":")[0];
+        const isBotJid = (j) => {
+          if (!j) return false;
+          const u = String(j).split("@")[0].split(":")[0];
+          if (!u) return false;
+          return u === botPhoneUserPart
+              || (botIdUserPart && u === botIdUserPart)
+              || (botLidUserPart && u === botLidUserPart);
+        };
+        // Trigger match needs a word boundary; bare `.includes("@ai")`
+        // matched inside larger tokens like "@aiviation" or "@airport",
+        // firing the bot for messages that didn't address it.
+        const escTrigger = trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const triggerRe = new RegExp(`(^|[^\\w@])${escTrigger}(?![\\w@])`, "i");
+        const containsTrigger = triggerRe.test(cleanText);
+        const prefixed = new RegExp(`^${escTrigger}(?![\\w@])`, "i").test(cleanText.trim());
+        // Mentions: strict bot-JID match in mentionedJid. When the
+        // message is also a quote-reply, require the visible text to
+        // contain the trigger — WhatsApp can propagate the quoted
+        // message's mentionedJid into the new reply's contextInfo
+        // (mention-chain inheritance), which would false-positive
+        // `mentioned` for users who simply quote-replied to a message
+        // that originally addressed the bot.
         const quotedCtx = msg.message?.extendedTextMessage?.contextInfo || {};
-        const quotedParticipant = quotedCtx.participant || "";
-        const botId = sock?.user?.id || "";
-        const botLid = sock?.user?.lid || "";
-        const isReplyToBot = !!quotedCtx.stanzaId && (
-          quotedParticipant.includes(PHONE) ||
-          (botId && quotedParticipant.includes(botId.split(":")[0])) ||
-          (botLid && quotedParticipant.includes(botLid.split(":")[0]))
-        );
+        const mentionedRaw = (quotedCtx.mentionedJid || []).some(isBotJid);
+        const mentioned = mentionedRaw && (!quotedCtx.stanzaId || containsTrigger);
+        // Check if replying to a message from the bot
+        const isReplyToBot = !!quotedCtx.stanzaId && isBotJid(quotedCtx.participant);
         // Slash commands ("/help", "/usage", …) are self-declaring — no
         // @ai mention needed. The `/` prefix already says "this is a
         // command for the bot", matching every major chat product.
