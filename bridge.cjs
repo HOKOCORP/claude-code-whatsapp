@@ -31,6 +31,39 @@ for (const d of [INBOX_DIR, OUTBOX_DIR, PERM_DIR, DOWNLOADS_DIR]) fs.mkdirSync(d
 
 const log = (msg) => process.stderr.write(`wa-bridge[${path.basename(USER_DIR)}]: ${msg}\n`);
 
+// One-shot recovery on bridge startup: drain inbox/failed/ → inbox/ for
+// recent items. The reconciler quarantines a message when the gateway
+// spawns its tmux session but the MCP notification drops it (e.g. the
+// gateway hits a WhatsApp 440 conflict mid-spawn, restarts before
+// claude is ready). Each fresh bridge picks up its own backlog so
+// admin messages aren't silently lost. Items older than
+// FAILED_REPLAY_MAX_AGE_MS stay quarantined — clearly stale, no point
+// firing them at claude.
+const FAILED_REPLAY_MAX_AGE_MS = parseInt(process.env.FAILED_REPLAY_MAX_AGE_MS || "", 10) || (24 * 60 * 60 * 1000);
+function drainFailedInbox() {
+  const failedDir = path.join(INBOX_DIR, "failed");
+  let files;
+  try { files = fs.readdirSync(failedDir).filter((f) => f.endsWith(".json")); } catch { return; }
+  if (files.length === 0) return;
+  const cutoff = Date.now() - FAILED_REPLAY_MAX_AGE_MS;
+  let revived = 0;
+  let stale = 0;
+  for (const f of files) {
+    const src = path.join(failedDir, f);
+    let mtime;
+    try { mtime = fs.statSync(src).mtimeMs; } catch { continue; }
+    if (mtime < cutoff) { stale++; continue; }
+    try {
+      fs.renameSync(src, path.join(INBOX_DIR, f));
+      revived++;
+    } catch (e) {
+      log(`drain: rename failed for ${f}: ${e.message}`);
+    }
+  }
+  if (revived > 0) log(`drain: revived ${revived} message(s) from failed/ (${stale} too old, kept quarantined)`);
+}
+drainFailedInbox();
+
 let jsonlPath = null;
 let jsonlPathResolvedAt = 0;
 const jsonlCache = {};
