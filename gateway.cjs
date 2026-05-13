@@ -4098,13 +4098,16 @@ async function connectWhatsApp() {
         // command for the bot", matching every major chat product.
         const isSlashCommand = cleanText.trimStart().startsWith("/");
         const isDirectMode = (access.directGroups || []).includes(jid);
-        // Phase 1 quote-to-act: an admin's quote-reply to ANY message
-        // (not just the bot's) acts as an explicit invocation. Lets admins
-        // pull other participants' messages into Claude's context without
-        // needing the @ai trigger word, while non-admin quote-replies
-        // still don't trigger the bot (they fall through to Phase 0
-        // gate below where they get filtered out anyway).
-        const isAdminQuoteReply = !!quotedCtx.stanzaId && _isAdminSender;
+        // Phase 1 quote-to-act used to let an admin's quote-reply to ANY
+        // message (not just the bot's) act as an explicit invocation.
+        // That made admin chitchat with other group members noisy: a
+        // plain quote-reply between two humans would spawn a claude
+        // session even with /direct off. Reverted to: an admin's
+        // quote-reply only counts when the quoted message is from the
+        // bot (handled by isReplyToBot below). Admin can still bring
+        // context in via @ai mention, /direct on, slash command, or
+        // quote-replying to a bot message.
+        const isAdminQuoteReply = false;
         // TOS-acceptance bypass: when a non-admin user has been sent a
         // TOS prompt (recorded in groupMeta._tosSentTo[]) and replies
         // with "agree" / "i agree", let it through even without the
