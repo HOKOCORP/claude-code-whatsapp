@@ -1897,13 +1897,17 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
     || /^\d+(?:\.\d{1,2})?$/.test(rawText)   // amount step
     || lower === "/cancel"
   );
+  const isNosleepCmd = lower === "/nosleep" || /^\/nosleep\s+/i.test(rawText);
+  const isSleepCmd = lower === "/sleep" || /^\/sleep\s+/i.test(rawText);
   if (lower !== "/users"
       && !/^\/rename\s+/i.test(rawText)
       && !/^\/topup\s+/i.test(rawText)
       && !isAdminCmd
       && !isCodeCreateCmd
       && !isTopupBareStart
-      && !isTopupWizardReply) {
+      && !isTopupWizardReply
+      && !isNosleepCmd
+      && !isSleepCmd) {
     return false;
   }
 
@@ -2103,6 +2107,95 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
       const kind = target.isGroup ? "group" : "user";
       await sock.sendMessage(jid, { text: `✅ Topped up ${kind} *${displayName}* with ${fmtGbp(amount)} — new balance ${fmtGbp(u.balance)}.` });
     } catch {}
+    return true;
+  }
+
+  // ── /nosleep [HASH] · /sleep HASH — pin/unpin chats from hibernation
+  // /nosleep with no arg lists currently-pinned chats. /nosleep HASH
+  // sets `hibernate_exempt = true` in that chat's usage file so
+  // hibernateIdleUsers skips it indefinitely (warm session, no
+  // cold-start). /sleep HASH unpins AND immediately kills the tmux
+  // session (manual hibernate, useful when admin wants to force-free
+  // RAM right now).
+  if (isNosleepCmd) {
+    try { await sock.readMessages([msg.key]); } catch {}
+    const argMatch = /^\/nosleep\s+(\S+)\s*$/i.exec(rawText);
+    if (!argMatch) {
+      // List currently-pinned chats
+      let entries = [];
+      try { entries = fs.readdirSync(USERS_DIR); } catch {}
+      const pinned = [];
+      for (const uid of entries) {
+        const u = loadUserUsage(uid);
+        if (!u.hibernate_exempt) continue;
+        let meta = {};
+        try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8")); } catch { continue; }
+        const hash = displayHashFor(uid, meta);
+        const name = meta.name || meta.pushName || formatJid(meta.jid || uid);
+        pinned.push(`\`${hash}\` · ${name}${meta.isGroup ? " 👥" : ""}`);
+      }
+      const lines = [`💤 *Hibernation-exempt chats* (${pinned.length})`, ""];
+      if (pinned.length === 0) {
+        lines.push("None pinned. Use `/nosleep <hash>` to keep a chat warm.");
+      } else {
+        lines.push(...pinned);
+      }
+      lines.push("", "Pin: `/nosleep <hash>`", "Unpin + force-hibernate: `/sleep <hash>`");
+      try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
+      return true;
+    }
+    const target = findUserByHashPrefix(argMatch[1]);
+    if (!target) {
+      try { await sock.sendMessage(jid, { text: `❌ No unique user matched \`${argMatch[1]}\`. Use 4+ chars from /users.` }); } catch {}
+      return true;
+    }
+    const u = loadUserUsage(target.userId);
+    if (u.hibernate_exempt) {
+      try { await sock.sendMessage(jid, { text: `ℹ️ \`${argMatch[1]}\` is already pinned.` }); } catch {}
+      return true;
+    }
+    u.hibernate_exempt = true;
+    saveUserUsage(target.userId, u);
+    let meta = {}; try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, target.userId, "meta.json"), "utf8")); } catch {}
+    const displayName = meta.name || meta.pushName || formatJid(meta.jid || target.userId);
+    log(`nosleep: pinned ${target.username || target.userId} (${displayName}) by ${formatJid(jid)}`);
+    try { await sock.sendMessage(jid, { text: `📌 Pinned *${displayName}* — its claude session will stay warm (no auto-hibernate).` }); } catch {}
+    return true;
+  }
+
+  if (isSleepCmd) {
+    try { await sock.readMessages([msg.key]); } catch {}
+    const argMatch = /^\/sleep\s+(\S+)\s*$/i.exec(rawText);
+    if (!argMatch) {
+      try { await sock.sendMessage(jid, { text: "Usage: `/sleep <hash>` — unpins + force-hibernates the chat. See `/nosleep` for the pinned list." }); } catch {}
+      return true;
+    }
+    const target = findUserByHashPrefix(argMatch[1]);
+    if (!target) {
+      try { await sock.sendMessage(jid, { text: `❌ No unique user matched \`${argMatch[1]}\`. Use 4+ chars from /users.` }); } catch {}
+      return true;
+    }
+    const u = loadUserUsage(target.userId);
+    const wasPinned = !!u.hibernate_exempt;
+    if (wasPinned) {
+      delete u.hibernate_exempt;
+      saveUserUsage(target.userId, u);
+    }
+    let meta = {}; try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, target.userId, "meta.json"), "utf8")); } catch {}
+    const displayName = meta.name || meta.pushName || formatJid(meta.jid || target.userId);
+    const sessionName = getUserSessionName(target.userId);
+    let killed = false;
+    try {
+      execFileSync("tmux", ["has-session", "-t", sessionName], { stdio: "ignore" });
+      execFileSync("tmux", ["kill-session", "-t", sessionName], { stdio: "ignore" });
+      userActivity.delete(target.userId);
+      killed = true;
+    } catch {}
+    log(`sleep: ${wasPinned ? "unpinned + " : ""}force-hibernated ${target.username || target.userId} (${displayName}) by ${formatJid(jid)}${killed ? "" : " (no live session)"}`);
+    const parts = [];
+    if (wasPinned) parts.push("📌→💤 unpinned");
+    parts.push(killed ? "🧊 hibernated" : "🧊 already cold");
+    try { await sock.sendMessage(jid, { text: `${parts.join(" · ")} *${displayName}*. Next message will spawn a fresh session via \`claude --continue\`.` }); } catch {}
     return true;
   }
 
@@ -3128,6 +3221,11 @@ function hibernateIdleUsers() {
   for (const [userId, lastActivity] of userActivity) {
     if (lastActivity > cutoff) continue;       // still active
     if (adminUserIds.has(userId)) continue;    // admin: never hibernate
+    // /nosleep pin: admin has explicitly asked to keep this chat
+    // warm. Skip even when idle, no time limit. /sleep clears it.
+    try {
+      if (loadUserUsage(userId).hibernate_exempt) continue;
+    } catch {}
     const sessionName = getUserSessionName(userId);
     try {
       execFileSync("tmux", ["has-session", "-t", sessionName], { stdio: "ignore" });
@@ -3215,17 +3313,28 @@ function seedUserActivityFromTmux() {
   let seeded = 0;
   let out = "";
   try {
-    out = execFileSync("tmux", ["list-sessions", "-F", "#{session_name}"], { encoding: "utf8" });
+    // Pull tmux's own session_activity (epoch seconds of last keypress
+    // or pane output) so the idle clock survives gateway restarts. A
+    // gateway that crashes every 20 min — e.g. WhatsApp 440 churn —
+    // would otherwise reset every session's idle timer to "now" each
+    // time, and 15-min hibernation would never trigger.
+    out = execFileSync("tmux", ["list-sessions", "-F", "#{session_name} #{session_activity}"], { encoding: "utf8" });
   } catch { return; }
   const prefix = `cc-ch-wa-${PHONE}-u-`;
   const now = Date.now();
-  for (const name of out.split("\n")) {
-    if (!name.startsWith(prefix)) continue;
+  for (const line of out.split("\n")) {
+    if (!line.startsWith(prefix)) continue;
+    const [name, activityStr] = line.split(" ");
     const userId = name.slice(prefix.length);
-    if (!userActivity.has(userId)) {
-      userActivity.set(userId, now);
-      seeded++;
-    }
+    if (userActivity.has(userId)) continue;
+    // tmux reports session_activity in epoch seconds. Fall back to now
+    // if the field is missing (older tmux) or unparseable.
+    const activitySec = parseInt(activityStr, 10);
+    const lastActivity = Number.isFinite(activitySec) && activitySec > 0
+      ? activitySec * 1000
+      : now;
+    userActivity.set(userId, lastActivity);
+    seeded++;
   }
   if (seeded > 0) log(`hibernate: seeded ${seeded} pre-existing session(s) into activity map`);
 }
