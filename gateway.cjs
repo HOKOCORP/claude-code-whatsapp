@@ -4227,6 +4227,76 @@ function enqueueSaveCreds() {
 
 // ── WhatsApp Connection ─────────────────────────────────────────────
 
+// ── Self-send dedup (so we can lift the blanket fromMe filter) ────
+// Every message the gateway sends via sock.sendMessage echoes back
+// to us as `messages.upsert` with `fromMe = true`. Historically we
+// dropped every fromMe message (gateway.cjs:4322), which prevented
+// any reply loop but ALSO blocked a real use case: admin typing in a
+// group from the bot's own WhatsApp account on their phone — those
+// messages also arrive as fromMe and got silently dropped. Now we
+// dedup by msg.key.id instead: anything we sent goes into
+// `selfSentIds`, and the inbound handler drops echo events whose id
+// is in that set. fromMe messages whose id ISN'T in the set must be
+// human-typed from another linked device, so we let them flow.
+//
+// `wrapSendMessage` (further below, after sock creation) hooks every
+// sock.sendMessage call site — 146 of them — by overriding the
+// method once. No risk of a forgotten call site since all paths
+// route through the wrapper. Persisted to disk so a gateway restart
+// doesn't lose recent IDs (the 440-conflict churn would otherwise
+// leave a window where the bot processes its own messages as
+// "human-typed" until the cache rebuilds).
+const SELF_SENT_CAP = 500;
+const SELF_SENT_FILE = path.join(os.homedir(), ".ccm", "sent-ids.json");
+const selfSentIds = new Set();
+const selfSentQueue = [];
+let _selfSentDirty = false;
+function loadSelfSentIds() {
+  try {
+    const arr = JSON.parse(fs.readFileSync(SELF_SENT_FILE, "utf8"));
+    if (Array.isArray(arr)) {
+      for (const id of arr.slice(-SELF_SENT_CAP)) {
+        if (!selfSentIds.has(id)) { selfSentIds.add(id); selfSentQueue.push(id); }
+      }
+    }
+  } catch {}
+}
+function persistSelfSentIds() {
+  if (!_selfSentDirty) return;
+  _selfSentDirty = false;
+  try {
+    fs.mkdirSync(path.dirname(SELF_SENT_FILE), { recursive: true });
+    const tmp = `${SELF_SENT_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(selfSentQueue));
+    fs.renameSync(tmp, SELF_SENT_FILE);
+  } catch (e) { log(`sent-ids persist failed: ${e}`); }
+}
+function addSelfSentId(id) {
+  if (!id || selfSentIds.has(id)) return;
+  selfSentIds.add(id);
+  selfSentQueue.push(id);
+  while (selfSentQueue.length > SELF_SENT_CAP) {
+    const old = selfSentQueue.shift();
+    selfSentIds.delete(old);
+  }
+  _selfSentDirty = true;
+}
+loadSelfSentIds();
+// Persist on a slow interval to amortise disk writes — 1 s is fine
+// since the worst-case race window (Baileys resolving sendMessage
+// before emitting the echo upsert) is well under 1 s in practice,
+// and the dedup hit happens in memory before the persist anyway.
+setInterval(persistSelfSentIds, 1000);
+
+function wrapSendMessage(socket) {
+  const orig = socket.sendMessage.bind(socket);
+  socket.sendMessage = async (...args) => {
+    const msg = await orig(...args);
+    addSelfSentId(msg && msg.key && msg.key.id);
+    return msg;
+  };
+}
+
 let sock = null; let connectionReady = false; let retryCount = 0; let connectedAt = 0; let lastInboundAt = 0; let watchdogTimer = null; let wasPairing = false;
 function computeDelay(n) { const b = Math.min(RECONNECT.initialMs * Math.pow(RECONNECT.factor, n), RECONNECT.maxMs); return Math.max(250, Math.round(b + b * RECONNECT.jitter * (Math.random() * 2 - 1))); }
 function cleanupSocket() { if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; } if (sock) { try { sock.ev.removeAllListeners(); } catch {} try { sock.end(undefined); } catch {} sock = null; } connectionReady = false; }
@@ -4237,6 +4307,7 @@ async function connectWhatsApp() {
   saveCreds = authState.saveCreds;
   const { version } = await fetchLatestBaileysVersion();
   sock = makeWASocket({ auth: { creds: authState.state.creds, keys: makeCacheableSignalKeyStore(authState.state.keys, logger) }, version, logger, printQRInTerminal: false, browser: ["Mac OS", "Safari", "1.0.0"], syncFullHistory: false, markOnlineOnConnect: true, getMessage: async (key) => { const c = rawMessages.get(key.id); return c?.message || { conversation: "" }; } });
+  wrapSendMessage(sock);
 
   sock.ev.on("creds.update", enqueueSaveCreds);
   sock.ev.on("connection.update", (update) => {
@@ -4319,7 +4390,29 @@ async function connectWhatsApp() {
     for (const msg of messages) {
       const rjid = msg.key?.remoteJid || "";
       // Debug: if (rjid.endsWith("@g.us")) log(`group: ${rjid} text="${extractText(msg.message||{}).slice(0,30)}"`);
-      if (!msg.message || msg.key.fromMe) continue;
+      if (!msg.message) continue;
+      // `_isAdminTypingAsBot` is the dedup outcome for fromMe messages.
+      // Three cases:
+      //   1. Echo of our own gateway send → drop (id in selfSentIds).
+      //   2. fromMe in a DM (bot account messaging a contact directly)
+      //      → drop. Could be the gateway's own reply that missed the
+      //      dedup window, OR admin DMing a user from the bot's phone;
+      //      either way the bot shouldn't act on it.
+      //   3. fromMe in a GROUP, id not in dedup → admin typing inside
+      //      a group from a phone/web logged into the bot's account.
+      //      Treat as admin so TOS/wallet gates pass; still subject to
+      //      the trigger filter (@ai, /direct, slash command). Flag set
+      //      here and consumed at the _isAdminSender computation below.
+      let _isAdminTypingAsBot = false;
+      if (msg.key.fromMe) {
+        if (msg.key.id && selfSentIds.has(msg.key.id)) continue;
+        if (!rjid.endsWith("@g.us")) {
+          log(`fromMe-drop: non-group id=${msg.key.id} chat=${rjid}`);
+          continue;
+        }
+        _isAdminTypingAsBot = true;
+        log(`fromMe-thru: group id=${msg.key.id} chat=${rjid} — admin typing from bot account`);
+      }
       // Handle poll votes — match to pending permission polls
       if (msg.message.pollUpdateMessage) {
         const pollKey = msg.message.pollUpdateMessage.pollCreationMessageKey;
@@ -4426,9 +4519,13 @@ async function connectWhatsApp() {
       // Compute admin status once for use in the group-trigger,
       // Phase 0 admin gate, and TOS gate below. Avoids three separate
       // loadAdmin() calls per message.
+      // `_isAdminTypingAsBot` (set above for fromMe-in-group messages
+      // that survived dedup) forces admin-sender status — admin typing
+      // from the bot's own WhatsApp account on a phone bypasses TOS
+      // and wallet gates exactly like an admin DM would.
       const _admin = loadAdmin();
       const _senderJid = participant || jid;
-      const _isAdminSender = isAdminJid(_senderJid, _admin);
+      const _isAdminSender = _isAdminTypingAsBot || isAdminJid(_senderJid, _admin);
 
       // Group messages: only respond when triggered
       if (jid.endsWith("@g.us")) {
