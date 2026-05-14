@@ -1899,6 +1899,9 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
   );
   const isNosleepCmd = lower === "/nosleep" || /^\/nosleep\s+/i.test(rawText);
   const isSleepCmd = lower === "/sleep" || /^\/sleep\s+/i.test(rawText);
+  const isDisableCmd = /^\/disable\s+/i.test(rawText);
+  const isEnableCmd = /^\/enable\s+/i.test(rawText);
+  const isDisabledListCmd = lower === "/disabled";
   if (lower !== "/users"
       && !/^\/rename\s+/i.test(rawText)
       && !/^\/topup\s+/i.test(rawText)
@@ -1907,7 +1910,10 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
       && !isTopupBareStart
       && !isTopupWizardReply
       && !isNosleepCmd
-      && !isSleepCmd) {
+      && !isSleepCmd
+      && !isDisableCmd
+      && !isEnableCmd
+      && !isDisabledListCmd) {
     return false;
   }
 
@@ -2196,6 +2202,96 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
     if (wasPinned) parts.push("📌→💤 unpinned");
     parts.push(killed ? "🧊 hibernated" : "🧊 already cold");
     try { await sock.sendMessage(jid, { text: `${parts.join(" · ")} *${displayName}*. Next message will spawn a fresh session via \`claude --continue\`.` }); } catch {}
+    return true;
+  }
+
+  // ── /disable HASH · /enable HASH · /disabled — manual access control
+  // /disable HASH sets usage.disabled = true. Disabled users get a
+  // one-throttled-reply-per-day "your access is disabled" notice in
+  // DM and silent drop in groups. /enable HASH clears the flag. Bare
+  // /disabled lists currently-disabled users. Admin cannot disable
+  // themselves or any other admin.
+  if (isDisableCmd || isEnableCmd) {
+    try { await sock.readMessages([msg.key]); } catch {}
+    const verb = isDisableCmd ? "disable" : "enable";
+    const argMatch = new RegExp(`^/${verb}\\s+(\\S+)\\s*$`, "i").exec(rawText);
+    if (!argMatch) {
+      try { await sock.sendMessage(jid, { text: `Usage: \`/${verb} <hash>\` — see \`/users\` for hashes, \`/disabled\` for the current block list.` }); } catch {}
+      return true;
+    }
+    const target = findUserByHashPrefix(argMatch[1]);
+    if (!target) {
+      try { await sock.sendMessage(jid, { text: `❌ No unique user matched \`${argMatch[1]}\`. Use 4+ chars from /users.` }); } catch {}
+      return true;
+    }
+    // Refuse to disable an admin — would lock admin out and is
+    // never the right call.
+    let meta = {}; try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, target.userId, "meta.json"), "utf8")); } catch {}
+    const targetJidForAdminCheck = meta.jid || (target.isGroup ? `${target.userId}@g.us` : `${target.userId}@lid`);
+    if (!target.isGroup && isAdminJid(targetJidForAdminCheck, adminCheck)) {
+      try { await sock.sendMessage(jid, { text: `🚫 Cannot ${verb} an admin. Use \`/admin remove\` first if you want to demote.` }); } catch {}
+      return true;
+    }
+    const u = loadUserUsage(target.userId);
+    const displayName = meta.name || meta.pushName || formatJid(meta.jid || target.userId);
+    if (isDisableCmd) {
+      if (u.disabled) {
+        try { await sock.sendMessage(jid, { text: `ℹ️ *${displayName}* is already disabled.` }); } catch {}
+        return true;
+      }
+      u.disabled = true;
+      u.disabled_at = new Date().toISOString();
+      delete u.last_disabled_notice_at;  // re-arm one-per-day notice
+      saveUserUsage(target.userId, u);
+      // Also force-hibernate any live session so they don't keep
+      // racking up tokens between when admin disabled them and when
+      // their next message arrives.
+      const sessionName = getUserSessionName(target.userId);
+      try {
+        execFileSync("tmux", ["has-session", "-t", sessionName], { stdio: "ignore" });
+        execFileSync("tmux", ["kill-session", "-t", sessionName], { stdio: "ignore" });
+        userActivity.delete(target.userId);
+      } catch {}
+      log(`disable: ${target.username || target.userId} (${displayName}) by ${formatJid(jid)}`);
+      try { await sock.sendMessage(jid, { text: `🛑 Disabled *${displayName}*. They'll get one "access disabled" notice next time they message.` }); } catch {}
+    } else {
+      if (!u.disabled) {
+        try { await sock.sendMessage(jid, { text: `ℹ️ *${displayName}* is not disabled.` }); } catch {}
+        return true;
+      }
+      delete u.disabled;
+      delete u.disabled_at;
+      delete u.last_disabled_notice_at;
+      saveUserUsage(target.userId, u);
+      log(`enable: ${target.username || target.userId} (${displayName}) by ${formatJid(jid)}`);
+      try { await sock.sendMessage(jid, { text: `✅ Re-enabled *${displayName}*. They can DM the bot again.` }); } catch {}
+    }
+    return true;
+  }
+
+  if (isDisabledListCmd) {
+    try { await sock.readMessages([msg.key]); } catch {}
+    let entries = [];
+    try { entries = fs.readdirSync(USERS_DIR); } catch {}
+    const rows = [];
+    for (const uid of entries) {
+      const u = loadUserUsage(uid);
+      if (!u.disabled) continue;
+      let meta = {};
+      try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8")); } catch { continue; }
+      const hash = displayHashFor(uid, meta);
+      const name = meta.name || meta.pushName || formatJid(meta.jid || uid);
+      const when = (u.disabled_at || "").slice(0, 10);
+      rows.push(`\`${hash}\` · ${name}${meta.isGroup ? " 👥" : ""}${when ? `  (since ${when})` : ""}`);
+    }
+    const lines = [`🛑 *Disabled* (${rows.length})`, ""];
+    if (rows.length === 0) {
+      lines.push("None. Use `/disable <hash>` to block a user.");
+    } else {
+      lines.push(...rows);
+    }
+    lines.push("", "Re-enable: `/enable <hash>`");
+    try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
     return true;
   }
 
@@ -4169,6 +4265,31 @@ async function connectWhatsApp() {
       // through every existing path including permission replies below.
       // Uses _admin / _isAdminSender / _senderJid computed once above.
       if (_admin && !_isAdminSender) {
+        // Manual /disable from admin takes priority over balance/mode
+        // gating. Lookup is by SENDER's user dir (not chat's), so that
+        // disabling a user blocks them in DMs AND in any group where
+        // they participate. Admin can never be disabled (the /disable
+        // command refuses), so this branch is safe.
+        const _senderUserId = sanitizeUserId(_senderJid);
+        const _senderUsage = loadUserUsage(_senderUserId);
+        if (_senderUsage.disabled) {
+          if (!jid.endsWith("@g.us")) {
+            // Throttle the "you've been disabled" notice to once per
+            // day per user — otherwise an angry user spam-DMing the
+            // bot would get a flood of identical replies.
+            const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+            const lastNotice = Date.parse(_senderUsage.last_disabled_notice_at || "") || 0;
+            if (Date.now() - lastNotice > ONE_DAY_MS) {
+              try { await sock.sendMessage(jid, { text:
+                "🛑 *Access disabled*\n\nYour bot access has been disabled by the admin. Contact them if you think this is a mistake."
+              }); } catch {}
+              _senderUsage.last_disabled_notice_at = new Date().toISOString();
+              saveUserUsage(_senderUserId, _senderUsage);
+            }
+          }
+          log(`gate: disabled sender=${formatJid(_senderJid)} chat=${formatJid(jid)}`);
+          continue;
+        }
         // Compute the userId the same way the routing path will, so
         // checkUserLimit hits the right ledger.
         const _gateUserId = sanitizeUserId(jid.endsWith("@g.us") ? jid : _senderJid);
