@@ -90,6 +90,76 @@ function loadJsonlTail() {
 // Track last message for permission context
 let lastMessage = { text: "", number: "" };
 
+// ── MCP reply guard (cross-chat leak prevention) ──────────────────
+// When a primary group is bridged to one or more secondary groups
+// via /connect-group, multiple chats route into THIS bridge. Claude
+// must reply each message in its originating chat — but if the model
+// fumbles, the bridge corrects the chat_id. State:
+//
+//   - knownChatIds: set of chat_ids this bridge has ever seen inbound.
+//     Reply tool rejects (or auto-corrects) any chat_id not in this set.
+//   - pendingByChat: timestamped record of inbound messages awaiting
+//     a reply, keyed by chat_id. Bridge auto-corrects to the freshest
+//     entry when Claude omits or misspecifies chat_id.
+//   - recentByChat: per-chat history for fetch_messages scoping
+//     (chat A's fetch_messages must not return chat B's history).
+const knownChatIds = new Set();
+const pendingByChat = new Map();   // chat_id → ts of most-recent inbound
+const PENDING_REPLY_TTL_MS = 60_000;
+const recentByChat = new Map();    // chat_id → [{id, from, text, ts, hasMedia}]
+const MAX_RECENT_PER_CHAT = 50;
+
+function recordInbound(chatId, text, msgId) {
+  knownChatIds.add(chatId);
+  pendingByChat.set(chatId, Date.now());
+  if (!recentByChat.has(chatId)) recentByChat.set(chatId, []);
+  const arr = recentByChat.get(chatId);
+  arr.push({ id: msgId, from: "user", text: text || "", ts: Date.now(), hasMedia: false });
+  if (arr.length > MAX_RECENT_PER_CHAT) arr.shift();
+}
+
+function recordOutbound(chatId, text, hasMedia) {
+  if (!recentByChat.has(chatId)) recentByChat.set(chatId, []);
+  const arr = recentByChat.get(chatId);
+  arr.push({ id: `out-${Date.now()}`, from: "bot", text: text || "", ts: Date.now(), hasMedia: !!hasMedia });
+  if (arr.length > MAX_RECENT_PER_CHAT) arr.shift();
+  // Don't pop pendingByChat on first outbound — Claude often replies
+  // in multiple chunks. Entry naturally ages out via PENDING_REPLY_TTL_MS.
+}
+
+// Most-recent inbound chat_id within TTL. Used as the default when
+// Claude omits chat_id or gives a bogus one. Returns null if no
+// recent inbound — the tool call should error out cleanly in that
+// case rather than guess.
+function freshestPendingChatId() {
+  const cutoff = Date.now() - PENDING_REPLY_TTL_MS;
+  let bestChat = null;
+  let bestTs = 0;
+  for (const [chat, ts] of pendingByChat) {
+    if (ts < cutoff) continue;
+    if (ts > bestTs) { bestTs = ts; bestChat = chat; }
+  }
+  return bestChat;
+}
+
+// Verify Claude's chat_id against the known set; correct silently
+// (with a log line) if outside. Returns the corrected chat_id or
+// null if no fallback is available.
+function guardChatId(toolName, requested) {
+  if (requested && knownChatIds.has(requested)) return requested;
+  const fallback = freshestPendingChatId();
+  if (!fallback) {
+    log(`mcp-guard: ${toolName} called with unknown chat_id=${JSON.stringify(requested)} and no recent inbound to fall back to — rejecting`);
+    return null;
+  }
+  if (requested && requested !== fallback) {
+    log(`mcp-guard: ${toolName} chat_id mismatch — claude said ${requested}, redirecting to ${fallback} (most recent inbound)`);
+  } else if (!requested) {
+    log(`mcp-guard: ${toolName} missing chat_id — substituting ${fallback}`);
+  }
+  return fallback;
+}
+
 // ── MCP Server ──────────────────────────────────────────────────────
 
 const mcp = new Server(
@@ -118,7 +188,10 @@ const reconcilerTick = inboxReconciler.createReconciler({
   loadJsonl: loadJsonlTail,
   sendNotification: ({ content, meta }) => {
     lastMessage = { text: content || "", number: meta?.user || "" };
-    if (meta?.chat_id) writeOutbox({ action: "typing_start", chat_id: meta.chat_id });
+    if (meta?.chat_id) {
+      recordInbound(meta.chat_id, content, meta.message_id);
+      writeOutbox({ action: "typing_start", chat_id: meta.chat_id });
+    }
     mcp.notification({ method: "notifications/claude/channel", params: { content, meta } })
       .catch((err) => log(`deliver failed: ${err}`));
   },
@@ -208,18 +281,15 @@ mcp.setNotificationHandler(
 
 // ── Tools ───────────────────────────────────────────────────────────
 
-const recentMessages = [];
-const MAX_RECENT = 100;
-
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "reply",
-      description: "Reply on WhatsApp. Pass chat_id from the inbound message.",
+      description: "Reply on WhatsApp. Pass chat_id from the inbound message you're answering — the bridge enforces that replies go to the chat that prompted them; cross-chat reply is rejected.",
       inputSchema: {
         type: "object",
         properties: {
-          chat_id: { type: "string", description: "WhatsApp JID" },
+          chat_id: { type: "string", description: "WhatsApp JID — must match an inbound chat_id you've received from in this session." },
           text: { type: "string" },
           reply_to: { type: "string", description: "Message ID to quote-reply to." },
           files: { type: "array", items: { type: "string" }, description: "Absolute file paths to attach." },
@@ -247,10 +317,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "fetch_messages",
-      description: "Fetch recent messages from this WhatsApp chat (session cache only).",
+      description: "Fetch recent messages from a specific WhatsApp chat (session cache only). Returns messages SCOPED to chat_id — never leaks history across chats. If chat_id is omitted, defaults to the chat of the most recent inbound message.",
       inputSchema: {
         type: "object",
-        properties: { limit: { type: "number" } },
+        properties: {
+          chat_id: { type: "string", description: "WhatsApp JID to fetch history for. Defaults to the most recent inbound chat." },
+          limit: { type: "number" },
+        },
       },
     },
   ],
@@ -261,32 +334,35 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   try {
     switch (req.params.name) {
       case "reply": {
-        // Stop typing
-        writeOutbox({ action: "typing_stop", chat_id: args.chat_id });
-        // Send reply via gateway
+        const chatId = guardChatId("reply", args.chat_id);
+        if (!chatId) {
+          return { content: [{ type: "text", text: "reply rejected: no recent inbound chat to reply to, and provided chat_id is unknown to this session" }], isError: true };
+        }
+        writeOutbox({ action: "typing_stop", chat_id: chatId });
         writeOutbox({
           action: "reply",
-          chat_id: args.chat_id,
+          chat_id: chatId,
           text: args.text,
           files: args.files || [],
           reply_to: args.reply_to,
         });
-        // Track for fetch_messages
-        recentMessages.push({
-          id: `out-${Date.now()}`, from: "bot", text: args.text,
-          ts: Date.now(), hasMedia: (args.files || []).length > 0,
-        });
-        if (recentMessages.length > MAX_RECENT) recentMessages.shift();
-        return { content: [{ type: "text", text: "sent" }] };
+        recordOutbound(chatId, args.text, (args.files || []).length > 0);
+        return { content: [{ type: "text", text: `sent to ${chatId}` }] };
       }
       case "react": {
-        writeOutbox({ action: "react", chat_id: args.chat_id, message_id: args.message_id, emoji: args.emoji });
+        const chatId = guardChatId("react", args.chat_id);
+        if (!chatId) {
+          return { content: [{ type: "text", text: "react rejected: unknown chat_id" }], isError: true };
+        }
+        writeOutbox({ action: "react", chat_id: chatId, message_id: args.message_id, emoji: args.emoji });
         return { content: [{ type: "text", text: "reacted" }] };
       }
       case "download_attachment": {
-        // Request download from gateway
-        writeOutbox({ action: "download", chat_id: args.chat_id, message_id: args.message_id });
-        // Poll for the downloaded file
+        const chatId = guardChatId("download_attachment", args.chat_id);
+        if (!chatId) {
+          return { content: [{ type: "text", text: "download rejected: unknown chat_id" }], isError: true };
+        }
+        writeOutbox({ action: "download", chat_id: chatId, message_id: args.message_id });
         const deadline = Date.now() + 30000;
         while (Date.now() < deadline) {
           try {
@@ -301,11 +377,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return { content: [{ type: "text", text: "download timed out — media may have expired" }], isError: true };
       }
       case "fetch_messages": {
-        const limit = Math.min(args.limit || 20, MAX_RECENT);
-        const slice = recentMessages.slice(-limit);
-        if (slice.length === 0) return { content: [{ type: "text", text: "(no messages in session cache)" }] };
+        // Scope to a single chat — secondary's history MUST NOT leak
+        // into primary's responses (or vice versa). Defaults to the
+        // most-recent inbound chat when chat_id is omitted.
+        const requested = args.chat_id || freshestPendingChatId();
+        if (!requested) {
+          return { content: [{ type: "text", text: "(no chats with recent activity in this session)" }] };
+        }
+        if (!knownChatIds.has(requested)) {
+          log(`mcp-guard: fetch_messages rejected — chat_id=${requested} not seen in this session`);
+          return { content: [{ type: "text", text: `(no history for chat_id ${requested} — only chats that have messaged the bot in this session are available)` }] };
+        }
+        const limit = Math.min(args.limit || 20, MAX_RECENT_PER_CHAT);
+        const arr = recentByChat.get(requested) || [];
+        const slice = arr.slice(-limit);
+        if (slice.length === 0) {
+          return { content: [{ type: "text", text: `(no messages cached for ${requested})` }] };
+        }
         const out = slice.map((m) => `[${new Date(m.ts).toISOString()}] ${m.from}: ${m.text}`).join("\n");
-        return { content: [{ type: "text", text: out }] };
+        log(`mcp-guard: fetch_messages scoped to chat_id=${requested}, returned ${slice.length} msgs`);
+        return { content: [{ type: "text", text: `messages from ${requested}:\n${out}` }] };
       }
       default:
         return { content: [{ type: "text", text: `unknown tool: ${req.params.name}` }], isError: true };
