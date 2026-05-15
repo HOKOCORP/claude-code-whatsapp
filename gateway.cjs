@@ -2126,6 +2126,7 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
   const isDisableCmd = /^\/disable\s+/i.test(rawText);
   const isEnableCmd = /^\/enable\s+/i.test(rawText);
   const isDisabledListCmd = lower === "/disabled";
+  const isRamCapCmd = lower === "/ramcap" || /^\/ramcap\s+/i.test(rawText);
   // /connect-group bridges a secondary (this group) into a primary's
   // claude session. /disconnect-group undoes it. /connections lists
   // all current bridges. Wizard digit-replies routed iff this admin
@@ -2152,6 +2153,7 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
       && !isDisableCmd
       && !isEnableCmd
       && !isDisabledListCmd
+      && !isRamCapCmd
       && !isConnectBareStart
       && !isConnectArgCmd
       && !isConnectWizardReply
@@ -2637,6 +2639,83 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
     }
     lines.push("", "Re-enable: `/enable <hash>`");
     try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
+    return true;
+  }
+
+  // ── /ramcap HASH AMOUNT · /ramcap — per-chat memory cap ──────────
+  // Cap each isolation user's RAM via a transient cgroup (systemd-run
+  // --scope wrapping the spawn). AMOUNT accepts "512M", "2G",
+  // "unlimited", "default". Live-adjusts running sessions via
+  // systemctl set-property; takes effect on next spawn otherwise.
+  if (isRamCapCmd) {
+    try { await sock.readMessages([msg.key]); } catch {}
+    const argMatch = /^\/ramcap\s+(\S+)(?:\s+(\S+(?:\s+\S+)?))?\s*$/i.exec(rawText);
+    if (!argMatch) {
+      // List current caps + box default
+      let entries = [];
+      try { entries = fs.readdirSync(USERS_DIR); } catch {}
+      const rows = [];
+      for (const uid of entries) {
+        const u = loadUserUsage(uid);
+        if (u.memory_max_mb === undefined || u.memory_max_mb === null) continue;
+        let m = {};
+        try { m = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8")); } catch { continue; }
+        const hash = displayHashFor(uid, m);
+        const name = m.name || m.pushName || formatJid(m.jid || uid);
+        rows.push(`\`${hash}\` · ${name}${m.isGroup ? " 👥" : ""}  →  ${formatMemoryCap(u)}`);
+      }
+      const lines = [`💾 *Memory caps*`, ``];
+      lines.push(`Box default: ${DEFAULT_MEMORY_MAX_MB}M (env \`CCM_DEFAULT_MEMORY_MAX_MB\`)`);
+      lines.push(``);
+      if (rows.length === 0) {
+        lines.push("_No per-user overrides — all chats use the box default._");
+      } else {
+        lines.push(`*Overrides:* (${rows.length})`);
+        lines.push(...rows);
+      }
+      lines.push(``, `Set: \`/ramcap <hash> <amount>\``, `Amount: \`512M\`, \`2G\`, \`unlimited\`, or \`default\``);
+      try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
+      return true;
+    }
+    const target = findUserByHashPrefix(argMatch[1]);
+    if (!target) {
+      try { await sock.sendMessage(jid, { text: `❌ No unique user matched \`${argMatch[1]}\`. Use 4+ chars from /users.` }); } catch {}
+      return true;
+    }
+    const amountStr = argMatch[2];
+    if (!amountStr) {
+      // /ramcap HASH (no amount) — show current cap for that user
+      const u = loadUserUsage(target.userId);
+      let m = {}; try { m = JSON.parse(fs.readFileSync(path.join(USERS_DIR, target.userId, "meta.json"), "utf8")); } catch {}
+      const name = m.name || m.pushName || formatJid(m.jid || target.userId);
+      try { await sock.sendMessage(jid, { text: `💾 *${name}* current cap: *${formatMemoryCap(u)}*` }); } catch {}
+      return true;
+    }
+    const parsed = parseMemoryAmount(amountStr);
+    if (parsed === null) {
+      try { await sock.sendMessage(jid, { text: `❌ Bad amount \`${amountStr}\`. Use \`512M\`, \`2G\`, \`unlimited\`, or \`default\` (minimum 64M).` }); } catch {}
+      return true;
+    }
+    const u = loadUserUsage(target.userId);
+    let m = {}; try { m = JSON.parse(fs.readFileSync(path.join(USERS_DIR, target.userId, "meta.json"), "utf8")); } catch {}
+    const name = m.name || m.pushName || formatJid(m.jid || target.userId);
+    if (parsed === "default") {
+      delete u.memory_max_mb;
+    } else if (parsed === "unlimited") {
+      u.memory_max_mb = "unlimited";
+    } else {
+      u.memory_max_mb = parsed;
+    }
+    saveUserUsage(target.userId, u);
+    // Live-apply via systemctl set-property if a session is running.
+    // Admin sessions are always unlimited (effectiveMemoryCapMB knows),
+    // but /ramcap on admin's wallet still stores the value harmlessly.
+    const _liveAdmin = loadAdmin();
+    const _isUserAdmin = isAdminJid(m.jid, _liveAdmin);
+    const applied = applyMemoryCap(target.userId, _isUserAdmin);
+    log(`ramcap: ${target.username || target.userId} (${name}) → ${formatMemoryCap(u)} by ${formatJid(jid)}${applied ? " [live]" : ""}`);
+    const tail = applied ? "applied to running session ✓" : "_(no live session — takes effect on next spawn)_";
+    try { await sock.sendMessage(jid, { text: `💾 *${name}* cap set to *${formatMemoryCap(u)}* — ${tail}` }); } catch {}
     return true;
   }
 
@@ -4188,6 +4267,72 @@ function ensureUserConfig(userId, userJid) {
   return { userDir, userWorkDir };
 }
 
+// ── Per-user memory cap (cgroup via systemd-run --scope) ──────────
+// On a small VPS, one user's `go build` can OOM-kill another user's
+// claude session. Wrap each isolation-user spawn in a transient
+// systemd scope so the kernel cgroup enforces a per-user RAM ceiling.
+// Cap is per-chat: stored as `memory_max_mb` on the user's usage.json
+// (null = use box default). Admin sessions get `unlimited`.
+//
+// Adjust live with `systemctl set-property cc-mem-<userId>.scope
+// MemoryMax=<n>` — no spawn restart needed.
+const DEFAULT_MEMORY_MAX_MB = parseInt(process.env.CCM_DEFAULT_MEMORY_MAX_MB || "", 10) || 1024;
+let _systemdRunOk = null;
+function _hasSystemdRun() {
+  if (_systemdRunOk !== null) return _systemdRunOk;
+  try { execFileSync("systemd-run", ["--help"], { stdio: "ignore" }); _systemdRunOk = true; }
+  catch { _systemdRunOk = false; }
+  return _systemdRunOk;
+}
+function memoryScopeName(userId) { return `cc-mem-${userId}.scope`; }
+function effectiveMemoryCapMB(userId, isAdmin) {
+  if (isAdmin) return null;  // unlimited
+  let usage;
+  try { usage = loadUserUsage(userId); } catch { usage = {}; }
+  const v = usage.memory_max_mb;
+  if (v === "unlimited" || v === Infinity) return null;
+  if (typeof v === "number" && v > 0) return v;
+  return DEFAULT_MEMORY_MAX_MB;
+}
+function applyMemoryCap(userId, isAdmin) {
+  // Live-adjust a running scope. Best-effort: ignored if the scope
+  // doesn't exist (session not running) or systemctl is unavailable.
+  const cap = effectiveMemoryCapMB(userId, isAdmin);
+  const scope = memoryScopeName(userId);
+  const maxValue = cap === null ? "infinity" : `${cap}M`;
+  const highValue = cap === null ? "infinity" : `${Math.max(64, Math.floor(cap * 0.75))}M`;
+  try {
+    execFileSync("systemctl", ["set-property", "--runtime", scope, `MemoryMax=${maxValue}`, `MemoryHigh=${highValue}`], { stdio: "ignore" });
+    log(`memcap: applied to live ${scope}: max=${maxValue} high=${highValue}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function parseMemoryAmount(s) {
+  // Returns: null = invalid; "unlimited" = remove cap; "default" = clear override; or number (MB).
+  if (!s) return null;
+  const lower = String(s).trim().toLowerCase();
+  if (lower === "unlimited" || lower === "infinity" || lower === "none") return "unlimited";
+  if (lower === "default" || lower === "reset" || lower === "clear") return "default";
+  const m = /^(\d+(?:\.\d+)?)\s*([gmk])?b?$/i.exec(lower);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const unit = (m[2] || "m").toLowerCase();
+  const mb = unit === "g" ? n * 1024 : unit === "k" ? n / 1024 : n;
+  if (mb < 64) return null;  // refuse silly-low caps that'd OOM claude itself
+  return Math.round(mb);
+}
+function formatMemoryCap(usage) {
+  const v = usage?.memory_max_mb;
+  if (v === "unlimited") return "unlimited";
+  if (typeof v === "number" && v > 0) {
+    return v >= 1024 ? `${(v / 1024).toFixed(v % 1024 === 0 ? 0 : 1)}G` : `${v}M`;
+  }
+  return `default (${DEFAULT_MEMORY_MAX_MB}M)`;
+}
+
 function spawnUserSession(userId, userJid) {
   const { userDir, userWorkDir } = ensureUserConfig(userId, userJid);
   const sessionName = getUserSessionName(userId);
@@ -4341,10 +4486,32 @@ function spawnUserSession(userId, userJid) {
     try { execFileSync("chown", [`${projectUser.username}:${projectUser.username}`, launcher]); } catch {}
   }
 
-  // In isolation mode: tmux session is owned by admin, command inside runs as project user via sudo
+  // In isolation mode: tmux session is owned by admin, command inside
+  // runs as project user via systemd-run --scope (gives us a transient
+  // cgroup so the per-user memory cap is enforced by the kernel). Falls
+  // back to plain `sudo -u` if systemd-run is unavailable on this box.
+  const cap = effectiveMemoryCapMB(userId, isAdmin);
+  const scope = memoryScopeName(userId);
+  const memMax = cap === null ? "infinity" : `${cap}M`;
+  const memHigh = cap === null ? "infinity" : `${Math.max(64, Math.floor(cap * 0.75))}M`;
+  const useSystemdRun = !!projectUser && _hasSystemdRun();
   const tmuxArgs = projectUser
-    ? ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50", "sudo", "-u", projectUser.username, "bash", launcher]
+    ? (useSystemdRun
+        ? [
+            "new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50",
+            "systemd-run", "--scope", "--collect", "--quiet",
+            `--uid=${projectUser.username}`, `--gid=${projectUser.username}`,
+            `--unit=${scope}`,
+            `--property=MemoryMax=${memMax}`,
+            `--property=MemoryHigh=${memHigh}`,
+            `--property=Delegate=yes`,
+            "bash", launcher,
+          ]
+        : ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50", "sudo", "-u", projectUser.username, "bash", launcher])
     : ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50", launcher];
+  if (projectUser) {
+    log(`memcap: spawning ${scope} MemoryMax=${memMax} MemoryHigh=${memHigh}${useSystemdRun ? "" : " (systemd-run unavailable — no cap enforced)"}`);
+  }
 
   execFile("tmux", tmuxArgs, (err) => {
     if (err) { log(`spawn failed for ${userId}: ${err}`); return; }
@@ -4686,7 +4853,12 @@ async function connectWhatsApp() {
         if (groupAdminHandled) continue;
       }
 
-      if (!isAllowed(jid, participant || undefined)) continue;
+      // Whitelist gate. Bypassed for fromMe self-chat / fromMe-in-group:
+      // admin typing from a logged-in device of the bot's account is
+      // implicitly authorised — they OWN the account, no point making
+      // them whitelist themselves. Without this bypass /help, /users,
+      // and any plain message in self-chat got silently dropped here.
+      if (!_isAdminTypingAsBot && !isAllowed(jid, participant || undefined)) continue;
 
       // Compute admin status once for use in the group-trigger,
       // Phase 0 admin gate, and TOS gate below. Avoids three separate
@@ -5050,7 +5222,11 @@ async function connectWhatsApp() {
         ].map(slug => path.join(projectUserHome, ".claude", "projects", slug));
         const sessionName = getUserSessionName(userId);
         const slashAdmin = loadAdmin();
-        const slashIsAdmin = isAdminJid(jid, slashAdmin);
+        // fromMe in DM/group has been pre-validated as admin-as-bot by
+        // the upstream filter (selfSentIds dedup + self-chat / group
+        // detection). Treat it as admin so /help, /usage, etc. render
+        // the admin variant instead of the non-admin variant.
+        const slashIsAdmin = !!msg.key?.fromMe || isAdminJid(jid, slashAdmin);
         const handled = await channelSlash.handleChannelSlashCommand({
           userId,
           text,
