@@ -1694,7 +1694,14 @@ async function handleGroupAdminCommands({ sock, msg, jid, participant }) {
 
   const senderJid = participant || "";
   const adminCheck = loadAdmin();
-  if (!isAdminJid(senderJid, adminCheck)) {
+  // fromMe in a group = admin typing from a device logged into the
+  // bot's own WhatsApp account. Treat as admin (same path used by
+  // handleGroupConnectCommands and the trigger filter). Without this
+  // /enable-group, /direct on, /trigger from the bot's own phone get
+  // silently dropped by the admin gate even though admin owns the
+  // account.
+  const isAdminTypingAsBot = !!msg.key?.fromMe;
+  if (!isAdminTypingAsBot && !isAdminJid(senderJid, adminCheck)) {
     // Silent: don't leak the command surface to non-admin group members.
     return false;
   }
@@ -4605,11 +4612,66 @@ loadSelfSentIds();
 // and the dedup hit happens in memory before the persist anyway.
 setInterval(persistSelfSentIds, 1000);
 
+// Text-based fallback dedup. selfSentIds catches our echoes via
+// msg.key.id, which Baileys assigns synchronously — but there's a
+// sub-100ms race where the echo's messages.upsert event could fire
+// before our wrapper's await resolves and registers the id. For
+// fromMe echoes in DMs/self-chat we don't have msg.key.participant
+// to fall back on (device-match only works in groups), so we keep
+// a small map of recently-sent (chat_id, text) tuples and reject
+// any inbound fromMe whose text matches within TTL.
+//
+// Cap is tight (200 entries, 10s TTL) so this is a few KB of memory
+// at most. The 10s window comfortably covers any plausible Baileys
+// internal queueing without catching admin's intentional later typing
+// of the same word.
+const SELF_SENT_TEXT_TTL_MS = 10_000;
+const SELF_SENT_TEXT_CAP = 200;
+const selfSentTexts = new Map();   // "chatId::text" → ts
+const selfSentTextQueue = [];      // FIFO eviction
+function _selfSentTextKey(chatId, text) { return `${chatId}::${text}`; }
+function addSelfSentText(chatId, text) {
+  if (!chatId || !text) return;
+  const k = _selfSentTextKey(chatId, text);
+  selfSentTexts.set(k, Date.now());
+  selfSentTextQueue.push(k);
+  while (selfSentTextQueue.length > SELF_SENT_TEXT_CAP) {
+    const old = selfSentTextQueue.shift();
+    selfSentTexts.delete(old);
+  }
+}
+function isSelfSentText(chatId, text) {
+  if (!chatId || !text) return false;
+  const ts = selfSentTexts.get(_selfSentTextKey(chatId, text));
+  if (!ts) return false;
+  if (Date.now() - ts > SELF_SENT_TEXT_TTL_MS) return false;
+  return true;
+}
+// Extract the text portion from a Baileys sendMessage content arg so
+// we can record it for the text-based dedup. Covers text/caption only;
+// pure media sends without a caption have no text to match against
+// (and the id-based dedup handles those alone).
+function _sendContentText(content) {
+  if (!content || typeof content !== "object") return "";
+  return content.text || content.caption || "";
+}
+
+// Bot's exact device JIDs (with the `:<device>` suffix). Captured on
+// every connection.open so reconnects refresh them. Used to identify
+// our own echoes precisely in fromMe-in-group cases: if msg.key
+// .participant === botSelfJidFull, the message originated from THIS
+// gateway, not from admin's phone on the same account.
+let botSelfJidFull = null;
+let botSelfLidFull = null;
+
 function wrapSendMessage(socket) {
   const orig = socket.sendMessage.bind(socket);
   socket.sendMessage = async (...args) => {
     const msg = await orig(...args);
     addSelfSentId(msg && msg.key && msg.key.id);
+    // Also record text so a missed-id race still gets caught by the
+    // text-based fallback below.
+    addSelfSentText(args[0], _sendContentText(args[1]));
     return msg;
   };
 }
@@ -4641,6 +4703,13 @@ async function connectWhatsApp() {
     }
     if (connection === "open") {
       connectionReady = true; connectedAt = Date.now(); retryCount = 0;
+      // Capture this gateway's exact device JIDs (with the `:<device>`
+      // suffix) so the fromMe handler can tell our own echoes from
+      // admin's other devices on the same account. Refreshed on every
+      // open, so reconnects with a re-paired device still work.
+      botSelfJidFull = sock?.user?.id || null;
+      botSelfLidFull = sock?.user?.lid || null;
+      log(`self device: id=${botSelfJidFull} lid=${botSelfLidFull}`);
       // Verify registration status
       try {
         const creds = JSON.parse(fs.readFileSync(path.join(AUTH_DIR, "creds.json"), "utf8"));
@@ -4722,28 +4791,77 @@ async function connectWhatsApp() {
       //      here and consumed at the _isAdminSender computation below.
       let _isAdminTypingAsBot = false;
       if (msg.key.fromMe) {
+        // ── Defense layer 1: id-based dedup ─────────────────────────
+        // Echoes of our own gateway send. msg.key.id is captured by
+        // wrapSendMessage when sock.sendMessage's promise resolves.
         if (msg.key.id && selfSentIds.has(msg.key.id)) continue;
-        // Self-chat: admin DMs the bot's own WhatsApp account from
-        // another device (the "Message yourself" feature, or DM-to-self
-        // from a linked desktop/web client). The chat_id can appear in
-        // either form depending on which client opened the chat:
-        //   - phone-number form: <PHONE>@s.whatsapp.net
-        //   - LID privacy form:  <bot-lid>@lid (whatever WhatsApp
-        //     assigned this account at pairing; visible as sock.user.lid)
-        // Treat exactly like fromMe-in-group: admin bypasses TOS and
-        // wallet, no trigger needed (DMs never need a trigger).
-        const _rjidUser = formatJid(rjid);
-        const _botLidUserPart = (sock?.user?.lid || "").split("@")[0].split(":")[0];
-        const isSelfChat = !rjid.endsWith("@g.us") && (
-          (!!PHONE && _rjidUser === String(PHONE))
-          || (!!_botLidUserPart && _rjidUser === _botLidUserPart)
-        );
-        if (!rjid.endsWith("@g.us") && !isSelfChat) {
-          log(`fromMe-drop: non-group non-self id=${msg.key.id} chat=${rjid}`);
-          continue;
+
+        const isGrpEcho = rjid.endsWith("@g.us");
+
+        // ── Defense layer 2: device-precise check for groups ────────
+        // In groups, msg.key.participant is the SENDING DEVICE's JID
+        // (with the :<device> suffix). If it exactly matches our
+        // captured device JID, this is OUR echo — the race fired but
+        // we still catch it. If it matches the bot's account but a
+        // DIFFERENT device, it's admin's phone/web on the same
+        // account. Otherwise something's strange — drop defensively.
+        if (isGrpEcho) {
+          const participant = msg.key.participant || "";
+          if (participant && (participant === botSelfJidFull || participant === botSelfLidFull)) {
+            log(`fromMe-drop: own-device echo (id race) id=${msg.key.id} chat=${rjid} participant=${participant}`);
+            continue;
+          }
+          if (participant) {
+            const pUser = participant.split("@")[0].split(":")[0];
+            const botPhoneUser = String(PHONE || "");
+            const botLidUser = (botSelfLidFull || "").split("@")[0].split(":")[0];
+            const isBotAccount = pUser === botPhoneUser || (botLidUser && pUser === botLidUser);
+            if (!isBotAccount) {
+              log(`fromMe-drop: unexpected non-bot participant id=${msg.key.id} chat=${rjid} participant=${participant}`);
+              continue;
+            }
+            // Bot account, but a different device → admin's other device.
+            _isAdminTypingAsBot = true;
+            log(`fromMe-thru: group id=${msg.key.id} chat=${rjid} from=${participant} — admin typing from bot account`);
+          } else {
+            // No participant in a group fromMe is unusual; fall
+            // through to text-fallback before deciding.
+            const incomingText = extractText(msg.message || {});
+            if (isSelfSentText(rjid, incomingText)) {
+              log(`fromMe-drop: text-race in group (no participant) id=${msg.key.id} chat=${rjid}`);
+              continue;
+            }
+            _isAdminTypingAsBot = true;
+            log(`fromMe-thru: group id=${msg.key.id} chat=${rjid} (no participant) — admin typing from bot account`);
+          }
+        } else {
+          // ── Self-chat / DM handling ───────────────────────────────
+          // Self-chat = DM whose chat_id is the bot's own JID in
+          // either phone or LID form.
+          const _rjidUser = formatJid(rjid);
+          const _botLidUserPart = (botSelfLidFull || "").split("@")[0].split(":")[0];
+          const isSelfChat = (!!PHONE && _rjidUser === String(PHONE))
+                          || (!!_botLidUserPart && _rjidUser === _botLidUserPart);
+          if (!isSelfChat) {
+            // Admin DMing some other user from bot's phone — not
+            // something the bot should act on.
+            log(`fromMe-drop: non-group non-self id=${msg.key.id} chat=${rjid}`);
+            continue;
+          }
+          // ── Defense layer 3: text-based dedup ────────────────────
+          // For DM/self-chat there's no participant to compare. If
+          // the text matches one we just sent to this chat within
+          // SELF_SENT_TEXT_TTL_MS, it's almost certainly our echo
+          // (the race fired). Otherwise admin is typing in their
+          // self-chat — flow through.
+          const incomingText = extractText(msg.message || {});
+          if (isSelfSentText(rjid, incomingText)) {
+            log(`fromMe-drop: text-race in self-chat id=${msg.key.id} chat=${rjid} text=${JSON.stringify(incomingText.slice(0, 40))}`);
+            continue;
+          }
+          _isAdminTypingAsBot = true;
+          log(`fromMe-thru: self-chat id=${msg.key.id} chat=${rjid} — admin typing from bot account`);
         }
-        _isAdminTypingAsBot = true;
-        log(`fromMe-thru: ${isSelfChat ? "self-chat" : "group"} id=${msg.key.id} chat=${rjid} — admin typing from bot account`);
       }
       // Handle poll votes — match to pending permission polls
       if (msg.message.pollUpdateMessage) {
@@ -5401,20 +5519,27 @@ async function connectWhatsApp() {
       const final = path.join(userDir, "inbox", `${Date.now()}-${msgId}.json`);
       fs.writeFileSync(tmp, JSON.stringify(inboxMsg)); fs.renameSync(tmp, final);
 
-      // Check token balance before dispatching
-      const usageCheck = checkUserLimit(userId);
-      if (!usageCheck.allowed) {
-        log(`user ${userId} blocked — balance: $${usageCheck.balance.toFixed(2)}`);
-        try { fs.unlinkSync(final); } catch {}
-        const balStr = usageCheck.balance < 0
-          ? `Negative balance: $${usageCheck.balance.toFixed(2)} (overshoot from last call).`
-          : "No credit. Ask admin to top up your wallet.";
-        try { await sock.sendMessage(jid, { text: balStr }); } catch (e) { log(`failed to send limit msg: ${e}`); }
-        continue;
-      }
-      if (usageCheck.warned) {
-        log(`user ${userId} low balance: $${usageCheck.balance.toFixed(2)}`);
-        try { await sock.sendMessage(jid, { text: `[Low balance: $${usageCheck.balance.toFixed(2)} remaining]` }); } catch {}
+      // Check token balance before dispatching. Admin (real admin OR
+      // fromMe-in-group/self-chat) bypasses entirely — the Phase 2 gate
+      // upstream already covered admin, but this legacy `checkUserLimit`
+      // path didn't, so /enable-group typed from the bot's own phone
+      // was getting "No credit" responses. fromMe is admin-by-account
+      // ownership; real admin keeps unlimited as before.
+      if (!_isAdminSender) {
+        const usageCheck = checkUserLimit(userId);
+        if (!usageCheck.allowed) {
+          log(`user ${userId} blocked — balance: $${usageCheck.balance.toFixed(2)}`);
+          try { fs.unlinkSync(final); } catch {}
+          const balStr = usageCheck.balance < 0
+            ? `Negative balance: $${usageCheck.balance.toFixed(2)} (overshoot from last call).`
+            : "No credit. Ask admin to top up your wallet.";
+          try { await sock.sendMessage(jid, { text: balStr }); } catch (e) { log(`failed to send limit msg: ${e}`); }
+          continue;
+        }
+        if (usageCheck.warned) {
+          log(`user ${userId} low balance: $${usageCheck.balance.toFixed(2)}`);
+          try { await sock.sendMessage(jid, { text: `[Low balance: $${usageCheck.balance.toFixed(2)} remaining]` }); } catch {}
+        }
       }
 
       // Capacity check: if all Claude accounts exhausted, reply directly via outbox
