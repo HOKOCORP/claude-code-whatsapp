@@ -258,11 +258,14 @@ mcp.setNotificationHandler(
     // user_jid drives where the gateway sends the approval poll. Use
     // the originating chat (lastMessage.chat_id) so a tool call
     // triggered from a bridged secondary asks for approval *in that
-    // secondary*, not in the primary. Falls back to USER_JID only on
-    // cold-start before any inbound has arrived (defensive — a
-    // permission_request without prior inbound shouldn't normally
-    // happen, but if it does, the session owner is the safest target).
-    const originChatId = lastMessage.chat_id || USER_JID;
+    // secondary*, not in the primary. Leave empty if no inbound has
+    // been seen yet (cold-start race: claude --continue retries an
+    // in-flight tool call before the inbox poller delivers the
+    // triggering message). Empty user_jid makes the gateway fall back
+    // to admin.jid (safer than USER_JID, which on bridged sessions is
+    // the primary group — leaking the secondary's pending action to
+    // the primary's participants is exactly the bug we're fixing).
+    const originChatId = lastMessage.chat_id || "";
     fs.writeFileSync(reqFile, JSON.stringify({
       request_id: params.request_id,
       tool_name: params.tool_name,
