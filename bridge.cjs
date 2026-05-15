@@ -87,8 +87,16 @@ function loadJsonlTail() {
   return jsonlScan.readJsonlTail(p, JSONL_TAIL_BYTES, jsonlCache);
 }
 
-// Track last message for permission context
-let lastMessage = { text: "", number: "" };
+// Track last message for permission context. chat_id is critical for
+// bridged secondary groups: USER_JID is bound to the session owner
+// (= primary group's JID for bridged sessions), so a permission poll
+// keyed off USER_JID would land in the primary even when the message
+// originated in a secondary — leaking the secondary's pending action
+// to the primary's participants. lastMessage.chat_id reflects where
+// the inbound actually came from, so the poll can be routed back
+// there. For DMs and standalone groups chat_id == USER_JID so the
+// behavior is unchanged.
+let lastMessage = { text: "", number: "", chat_id: "" };
 
 // ── MCP reply guard (cross-chat leak prevention) ──────────────────
 // When a primary group is bridged to one or more secondary groups
@@ -187,7 +195,7 @@ const reconcilerTick = inboxReconciler.createReconciler({
   userDir: USER_DIR,
   loadJsonl: loadJsonlTail,
   sendNotification: ({ content, meta }) => {
-    lastMessage = { text: content || "", number: meta?.user || "" };
+    lastMessage = { text: content || "", number: meta?.user || "", chat_id: meta?.chat_id || "" };
     if (meta?.chat_id) {
       recordInbound(meta.chat_id, content, meta.message_id);
       writeOutbox({ action: "typing_start", chat_id: meta.chat_id });
@@ -247,6 +255,14 @@ mcp.setNotificationHandler(
     if (Date.now() - lastDenyAt < DENY_COOLDOWN_MS) return;
 
     const reqFile = path.join(PERM_DIR, `request-${params.request_id}.json`);
+    // user_jid drives where the gateway sends the approval poll. Use
+    // the originating chat (lastMessage.chat_id) so a tool call
+    // triggered from a bridged secondary asks for approval *in that
+    // secondary*, not in the primary. Falls back to USER_JID only on
+    // cold-start before any inbound has arrived (defensive — a
+    // permission_request without prior inbound shouldn't normally
+    // happen, but if it does, the session owner is the safest target).
+    const originChatId = lastMessage.chat_id || USER_JID;
     fs.writeFileSync(reqFile, JSON.stringify({
       request_id: params.request_id,
       tool_name: params.tool_name,
@@ -254,7 +270,7 @@ mcp.setNotificationHandler(
       input_preview: params.input_preview,
       user_number: lastMessage.number,
       user_message: lastMessage.text,
-      user_jid: USER_JID,
+      user_jid: originChatId,
     }));
 
     // Poll for response from gateway — no timeout, admin can approve anytime
