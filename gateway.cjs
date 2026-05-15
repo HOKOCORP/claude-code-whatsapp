@@ -2134,6 +2134,7 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
   const isEnableCmd = /^\/enable\s+/i.test(rawText);
   const isDisabledListCmd = lower === "/disabled";
   const isRamCapCmd = lower === "/ramcap" || /^\/ramcap\s+/i.test(rawText);
+  const isSysinfoCmd = lower === "/sysinfo";
   // /connect-group bridges a secondary (this group) into a primary's
   // claude session. /disconnect-group undoes it. /connections lists
   // all current bridges. Wizard digit-replies routed iff this admin
@@ -2161,6 +2162,7 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
       && !isEnableCmd
       && !isDisabledListCmd
       && !isRamCapCmd
+      && !isSysinfoCmd
       && !isConnectBareStart
       && !isConnectArgCmd
       && !isConnectWizardReply
@@ -2723,6 +2725,92 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
     log(`ramcap: ${target.username || target.userId} (${name}) → ${formatMemoryCap(u)} by ${formatJid(jid)}${applied ? " [live]" : ""}`);
     const tail = applied ? "applied to running session ✓" : "_(no live session — takes effect on next spawn)_";
     try { await sock.sendMessage(jid, { text: `💾 *${name}* cap set to *${formatMemoryCap(u)}* — ${tail}` }); } catch {}
+    return true;
+  }
+
+  // ── /sysinfo — host-level resource snapshot (admin DM) ───────────
+  // RAM, swap, disk, active cc-mem scopes, gateway uptime. Helps
+  // admin spot when the box is under pressure without sshing.
+  if (isSysinfoCmd) {
+    try { await sock.readMessages([msg.key]); } catch {}
+    const lines = [`🖥️ *Host status*`, ``];
+
+    // RAM + swap from /proc/meminfo (kB).
+    try {
+      const mi = fs.readFileSync("/proc/meminfo", "utf8");
+      const pick = (k) => { const m = new RegExp(`^${k}:\\s+(\\d+)`, "m").exec(mi); return m ? parseInt(m[1], 10) : 0; };
+      const total = pick("MemTotal"), free = pick("MemFree"), avail = pick("MemAvailable");
+      const buf = pick("Buffers") + pick("Cached") + pick("SReclaimable") - pick("Shmem");
+      const used = total - free - buf;
+      const swTotal = pick("SwapTotal"), swFree = pick("SwapFree");
+      const swUsed = swTotal - swFree;
+      const fmtKB = (kb) => kb >= 1048576 ? `${(kb/1048576).toFixed(2)}G` : `${(kb/1024).toFixed(0)}M`;
+      const pct = (n, d) => d > 0 ? Math.round(100 * n / d) : 0;
+      lines.push(`*RAM*  ${fmtKB(used)}/${fmtKB(total)} (${pct(used, total)}%) used · ${fmtKB(avail)} available`);
+      lines.push(`*Swap* ${fmtKB(swUsed)}/${fmtKB(swTotal)} (${pct(swUsed, swTotal)}%)`);
+    } catch (e) {
+      lines.push(`_RAM/swap unavailable: ${e.message}_`);
+    }
+
+    // Disk: root filesystem via `df -P /`. -P forces single-line POSIX
+    // output so we don't have to worry about long device names wrapping.
+    try {
+      const dfOut = execFileSync("df", ["-P", "/"], { encoding: "utf8" }).trim().split("\n");
+      const cols = dfOut[dfOut.length - 1].split(/\s+/);
+      // cols: [filesystem, 1k-blocks, used, available, capacity, mount]
+      const usedK = parseInt(cols[2], 10);
+      const availK = parseInt(cols[3], 10);
+      const totalK = usedK + availK;
+      const fmtKB = (kb) => kb >= 1048576 ? `${(kb/1048576).toFixed(1)}G` : `${(kb/1024).toFixed(0)}M`;
+      lines.push(`*Disk* ${fmtKB(usedK)}/${fmtKB(totalK)} (${cols[4]}) used · ${fmtKB(availK)} free`);
+    } catch (e) {
+      lines.push(`_Disk unavailable: ${e.message}_`);
+    }
+
+    // Active cc-mem cgroup scopes + their current memory usage, so
+    // admin can spot a runaway chat without ssh-ing in.
+    try {
+      const scopesOut = execFileSync("systemctl", ["list-units", "cc-mem-*.scope", "--no-legend", "--state=running"], { encoding: "utf8" }).trim();
+      const scopeLines = scopesOut ? scopesOut.split("\n").filter(l => l.includes(".scope")) : [];
+      lines.push(``, `*Active sessions* (${scopeLines.length} cgroups)`);
+      if (scopeLines.length === 0) {
+        lines.push(`  _none — no chats currently spawned_`);
+      } else {
+        // Sort by memory usage desc; show top 8.
+        const rows = [];
+        for (const ln of scopeLines) {
+          const m = /(cc-mem-[\w]+\.scope)/.exec(ln);
+          if (!m) continue;
+          const scope = m[1];
+          const userId = scope.replace(/^cc-mem-/, "").replace(/\.scope$/, "");
+          let memCur = 0, memMax = "?";
+          try {
+            const sh = execFileSync("systemctl", ["show", scope, "-p", "MemoryCurrent", "-p", "MemoryMax"], { encoding: "utf8" });
+            const mc = /MemoryCurrent=(\d+)/.exec(sh); memCur = mc ? parseInt(mc[1], 10) : 0;
+            const mx = /MemoryMax=(\d+|infinity)/.exec(sh); memMax = mx ? mx[1] : "?";
+          } catch {}
+          // Friendly name from user dir
+          let name = userId;
+          try {
+            const meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, userId, "meta.json"), "utf8"));
+            name = meta.name || meta.pushName || userId;
+          } catch {}
+          rows.push({ name, userId, memCur, memMax });
+        }
+        rows.sort((a, b) => b.memCur - a.memCur);
+        const fmtBytes = (b) => b >= 1073741824 ? `${(b/1073741824).toFixed(2)}G` : `${(b/1048576).toFixed(0)}M`;
+        const fmtMax = (m) => m === "infinity" ? "∞" : fmtBytes(parseInt(m, 10));
+        for (const r of rows.slice(0, 8)) {
+          lines.push(`  ${fmtBytes(r.memCur)}/${fmtMax(r.memMax)} · ${r.name}`);
+        }
+        if (rows.length > 8) lines.push(`  _…and ${rows.length - 8} more_`);
+      }
+    } catch (e) {
+      lines.push(``, `_Scope listing unavailable: ${e.message}_`);
+    }
+
+    lines.push(``, `_Refreshed: ${new Date().toISOString().slice(0, 19)}Z_`);
+    try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
     return true;
   }
 
@@ -4292,6 +4380,22 @@ function _hasSystemdRun() {
   return _systemdRunOk;
 }
 function memoryScopeName(userId) { return `cc-mem-${userId}.scope`; }
+// Returns true if a transient scope with this name is currently active.
+// Used to detect orphaned scopes — e.g. the user's claude session
+// died but their long-lived backend (started by claude via Bash) is
+// still running and holding the scope alive. systemd-run --unit
+// refuses to reuse an existing scope name, so we have to skip the
+// systemd-run wrapper for this spawn or every retry fails silently
+// (tmux new-session returns 0 because tmux *spawned* the command;
+// the inner systemd-run died immediately, taking the session with it,
+// but the gateway logs "spawned" anyway and never retries).
+function _scopeIsActive(scopeName) {
+  try {
+    const r = execFileSync("systemctl", ["is-active", scopeName],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    return r === "active" || r === "activating";
+  } catch { return false; }
+}
 function effectiveMemoryCapMB(userId, isAdmin) {
   if (isAdmin) return null;  // unlimited
   let usage;
@@ -4493,26 +4597,43 @@ function spawnUserSession(userId, userJid) {
     try { execFileSync("chown", [`${projectUser.username}:${projectUser.username}`, launcher]); } catch {}
   }
 
-  // In isolation mode: tmux session is owned by admin, command inside
-  // runs as project user via systemd-run --scope (gives us a transient
-  // cgroup so the per-user memory cap is enforced by the kernel). Falls
-  // back to plain `sudo -u` if systemd-run is unavailable on this box.
+  // In isolation mode: tmux session is owned by admin. The command
+  // inside is double-wrapped:
+  //   systemd-run --scope … sudo -u <user> bash launcher
+  //
+  // - systemd-run --scope provides the transient cgroup, which is
+  //   what enforces MemoryMax / MemoryHigh per chat.
+  // - sudo -u handles the actual user-switch. We deliberately don't
+  //   use `systemd-run --uid` for this: it sets UID/GID but skips
+  //   initgroups(), so the spawned process has NO supplementary
+  //   groups, which means it loses ccm-auth membership and can't
+  //   read /root/.claude/.credentials.json. Claude then comes up
+  //   "Not logged in" and channels stay unavailable.
+  // - sudo runs as root inside the scope, then properly initgroups
+  //   the target user before exec'ing bash. End result: same cgroup
+  //   limits, same group memberships as a plain `sudo -u` spawn.
+  //
+  // Falls back to plain `sudo -u` if systemd-run is unavailable on
+  // this box (so memory caps are no-ops on non-systemd hosts).
   const cap = effectiveMemoryCapMB(userId, isAdmin);
   const scope = memoryScopeName(userId);
   const memMax = cap === null ? "infinity" : `${cap}M`;
   const memHigh = cap === null ? "infinity" : `${Math.max(64, Math.floor(cap * 0.75))}M`;
-  const useSystemdRun = !!projectUser && _hasSystemdRun();
+  const scopeAlreadyActive = !!projectUser && _scopeIsActive(scope);
+  const useSystemdRun = !!projectUser && _hasSystemdRun() && !scopeAlreadyActive;
+  if (scopeAlreadyActive) {
+    log(`memcap: ${scope} already active (orphaned by a still-running user process?) — spawning without memcap wrapper for this session`);
+  }
   const tmuxArgs = projectUser
     ? (useSystemdRun
         ? [
             "new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50",
             "systemd-run", "--scope", "--collect", "--quiet",
-            `--uid=${projectUser.username}`, `--gid=${projectUser.username}`,
             `--unit=${scope}`,
             `--property=MemoryMax=${memMax}`,
             `--property=MemoryHigh=${memHigh}`,
             `--property=Delegate=yes`,
-            "bash", launcher,
+            "sudo", "-u", projectUser.username, "bash", launcher,
           ]
         : ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50", "sudo", "-u", projectUser.username, "bash", launcher])
     : ["new-session", "-d", "-s", sessionName, "-x", "200", "-y", "50", launcher];
