@@ -2028,6 +2028,74 @@ async function connectGroupWizard({ sock, msg, jid, adminJid, rawText, lower, pe
   return true;
 }
 
+// Group-context dispatcher for connect-group commands ONLY. The full
+// admin command surface (handleAdminUserCommands) is called only for
+// DMs to avoid leaking sensitive output (/users, /topup, /code-create
+// etc.) to non-admin participants in a group. But /connect-group is
+// MEANT to be typed inside the secondary group, so we wire a slim
+// route here for just that command family. Senders are checked
+// against admin.jids using the actual participant, not the group jid.
+async function handleGroupConnectCommands({ sock, msg, jid, participant }) {
+  if (!jid.endsWith("@g.us")) return false;
+  const rawText = extractText(msg.message || {}).trim();
+  const lower = rawText.toLowerCase();
+  const isConnectBare = lower === "/connect-group";
+  const isConnectArg = /^\/connect-group\s+\S+\s*$/i.test(rawText);
+  const isDisconnect = lower === "/disconnect-group";
+  // Check pending-wizard state before dismissing digit replies as
+  // unrelated — otherwise admin's "1" / "/cancel" inside a connect
+  // wizard wouldn't be routed back to the dispatcher.
+  const senderJid = participant || jid;
+  const pendingAll = loadPendingConnect();
+  const pendingKey = `${jid}::${formatJid(senderJid)}`;
+  const pending = pendingAll[pendingKey];
+  const pendingFresh = pending && (Date.now() - (pending.started_at || 0)) < PENDING_CONNECT_TTL_MS;
+  const isWizardReply = pendingFresh && (/^[1-9][0-9]*$/.test(rawText) || lower === "/cancel");
+  if (!isConnectBare && !isConnectArg && !isDisconnect && !isWizardReply) return false;
+
+  const adminCheck = loadAdmin();
+  // Admin via either: (a) participant JID is in admin.jids, OR
+  // (b) the message is fromMe in a group — admin typing from a
+  // device logged into the bot's own WhatsApp account (treated as
+  // admin per the bot-account-typing path; see selfSentIds dedup).
+  const isAdminTypingAsBot = !!msg.key.fromMe;
+  if (!isAdminTypingAsBot && !isAdminJid(senderJid, adminCheck)) {
+    // Silent: don't tell non-admin participants this command exists.
+    return false;
+  }
+  try { await sock.readMessages([msg.key]); } catch {}
+
+  if (isConnectArg) {
+    const hash = rawText.split(/\s+/)[1];
+    return connectGroupTo({ sock, msg, jid, adminJid: senderJid, primaryHash: hash });
+  }
+  if (isConnectBare || isWizardReply) {
+    return connectGroupWizard({
+      sock, msg, jid, adminJid: senderJid,
+      rawText, lower,
+      pendingAll, pendingKey, pending,
+    });
+  }
+  if (isDisconnect) {
+    const access = loadAccess();
+    const links = access.groupLinks || {};
+    const target = links[jid];
+    if (!target) {
+      try { await sock.sendMessage(jid, { text: "ℹ️ This group is not linked to any primary. Nothing to disconnect." }); } catch {}
+      return true;
+    }
+    let pMeta = {}; try { pMeta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, sanitizeUserId(target), "meta.json"), "utf8")); } catch {}
+    const pName = pMeta.name || formatJid(target);
+    delete links[jid];
+    access.groupLinks = links;
+    fs.writeFileSync(ACCESS_FILE, JSON.stringify(access, null, 2) + "\n");
+    log(`unlink: ${formatJid(jid)} from primary ${formatJid(target)} by ${formatJid(senderJid)}`);
+    try { await sock.sendMessage(jid, { text: `🔌 Unlinked this group from *${pName}*. Messages here will no longer route to that session.` }); } catch {}
+    return true;
+  }
+  return false;
+}
+
 async function handleAdminUserCommands({ sock, msg, jid }) {
   const rawText = extractText(msg.message || {}).trim();
   const lower = rawText.toLowerCase();
@@ -2093,7 +2161,14 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
   }
 
   const adminCheck = loadAdmin();
-  if (!isAdminJid(jid, adminCheck)) {
+  // Admin-as-bot-account: when the message is fromMe in a self-chat
+  // (admin DMing the bot's own account from another device), the
+  // sender IS by definition admin — only logged-in devices of the
+  // bot's account can produce fromMe. We don't need to look the
+  // chat JID up in admin.jids (it'd be the bot's own JID, never an
+  // admin entry). The upstream fromMe filter already dropped any
+  // fromMe message that wasn't self-chat or in-group.
+  if (!msg.key?.fromMe && !isAdminJid(jid, adminCheck)) {
     try { await sock.sendMessage(jid, { text: "🚫 That command is admin-only." }); } catch {}
     return true;
   }
@@ -2207,56 +2282,131 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
     const adminJids = (adminCheck && adminCheck.jids) || [];
     const _usersAccess = loadAccess();
     const _groupLinks = _usersAccess.groupLinks || {};
-    // The bot's own phone shows up as a "user" if anything ever DMed it
-    // from itself — filter it out, it's never a real user.
+    // Invert: primaryJid → [secondaryJid, ...] so each primary can
+    // show its bridges in one nested view.
+    const _primaryToSecondaries = new Map();
+    for (const [sJid, pJid] of Object.entries(_groupLinks)) {
+      if (!_primaryToSecondaries.has(pJid)) _primaryToSecondaries.set(pJid, []);
+      _primaryToSecondaries.get(pJid).push(sJid);
+    }
+    // The bot's own phone shows up as a "user" if anything ever DMed
+    // it from itself — filter it out unless self-chat is in use (then
+    // it's still admin-controlled, just not a "user" in the usual
+    // sense). The filter matches the gateway's existing convention.
     const ownNumber = String(PHONE || "");
-    const rows = [];
+    const dmUsers = [];
+    const standaloneGroups = [];   // groups that aren't bridged into anything
+    const primaryGroups = [];      // groups that have ≥1 secondary linked in
+    const secondaryGroups = [];    // groups that route into another primary
     for (const uid of entries) {
       if (ownNumber && uid === ownNumber) continue;
       let meta = {};
       try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8")); } catch { continue; }
       const isGroup = !!meta.isGroup;
-      // Groups have their own wallet keyed by the group JID — show them
-      // so admin can /topup them. In isolation mode, groups get their own
-      // Linux account and subdomain, same as individual users.
+      const myJid = meta.jid || (isGroup ? `${uid}@g.us` : uid);
       const hash = displayHashFor(uid, meta);
-      const name = meta.name || meta.pushName || formatJid(meta.jid || uid);
+      const name = meta.name || meta.pushName || formatJid(myJid);
       const isAdminRow = !isGroup && adminJids.length > 0 && isAdminJid(meta.jid, adminCheck);
       const u = loadUserUsage(uid);
       const lastSeen = meta.lastSeen ? meta.lastSeen.slice(0, 10) : "—";
-      // Bridged-secondary annotation: this group routes into another
-      // group's session and doesn't have its own wallet. Look up the
-      // primary's display name (best-effort) for the label.
-      let linkedPrimary = null;
-      if (isGroup) {
-        const myJid = meta.jid || `${uid}@g.us`;
+      const balance = u.balance || 0;
+      const disabled = !!u.disabled;
+      const row = { uid, hash, name, isAdmin: isAdminRow, balance, lastSeen, disabled };
+      if (!isGroup) {
+        dmUsers.push(row);
+        continue;
+      }
+      // Group routing decision: secondary (in groupLinks as key) or
+      // primary-with-secondaries (in groupLinks as a value) or plain.
+      if (_groupLinks[myJid]) {
+        // It's a secondary — annotate with primary name
         const primaryJid = _groupLinks[myJid];
-        if (primaryJid) {
-          let pMeta = {}; try { pMeta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, sanitizeUserId(primaryJid), "meta.json"), "utf8")); } catch {}
-          linkedPrimary = pMeta.name || formatJid(primaryJid);
+        let pMeta = {}; try { pMeta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, sanitizeUserId(primaryJid), "meta.json"), "utf8")); } catch {}
+        row.primaryName = pMeta.name || formatJid(primaryJid);
+        secondaryGroups.push(row);
+      } else if (_primaryToSecondaries.has(myJid)) {
+        // It's a primary that has secondaries linked to it
+        const secs = _primaryToSecondaries.get(myJid);
+        row.secondaryNames = secs.map((sJid) => {
+          let sMeta = {}; try { sMeta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, sanitizeUserId(sJid), "meta.json"), "utf8")); } catch {}
+          return sMeta.name || formatJid(sJid);
+        });
+        primaryGroups.push(row);
+      } else {
+        standaloneGroups.push(row);
+      }
+    }
+    // Sort: admins first within DMs; alphabetic by name within each
+    // section. Standalone groups and primary groups are merged for
+    // display under "Groups" because admin's mental model is "this is
+    // a group I'm in"; the secondaries-listing is the only thing that
+    // distinguishes a primary.
+    const byName = (a, b) => a.name.localeCompare(b.name);
+    dmUsers.sort((a, b) => Number(b.isAdmin) - Number(a.isAdmin) || byName(a, b));
+    standaloneGroups.sort(byName);
+    primaryGroups.sort(byName);
+    secondaryGroups.sort(byName);
+
+    const fmtRowMain = (r) => {
+      const badges = [];
+      if (r.isAdmin) badges.push("👑");
+      if (r.disabled) badges.push("🛑");
+      const b = badges.length ? ` ${badges.join(" ")}` : "";
+      return `\`${r.hash}\` · ${r.name}${b}`;
+    };
+    const fmtRowMeta = (r) => {
+      const balText = r.isAdmin ? "unlimited (admin)" : fmtGbp(r.balance);
+      return `  bal ${balText} · last ${r.lastSeen}`;
+    };
+
+    const lines = [];
+    const totals = `${dmUsers.length} user${dmUsers.length === 1 ? "" : "s"} · ${primaryGroups.length + standaloneGroups.length} group${primaryGroups.length + standaloneGroups.length === 1 ? "" : "s"} · ${secondaryGroups.length} bridged`;
+    lines.push(`📋 *Users & groups*  (${totals})`, "");
+
+    // 👤 DM users
+    lines.push(`👤 *Direct messages*  (${dmUsers.length})`);
+    if (dmUsers.length === 0) {
+      lines.push("  _none — share an /invite link to onboard_");
+    } else {
+      for (const r of dmUsers) {
+        lines.push(fmtRowMain(r));
+        lines.push(fmtRowMeta(r));
+      }
+    }
+    lines.push("");
+
+    // 👥 Groups: primaries with their secondaries listed underneath,
+    // then standalone groups. Both flavours have their own wallet.
+    const allGroups = [...primaryGroups, ...standaloneGroups].sort(byName);
+    lines.push(`👥 *Groups*  (${allGroups.length})`);
+    if (allGroups.length === 0) {
+      lines.push("  _none yet — /enable-group inside any group to register it_");
+    } else {
+      for (const r of allGroups) {
+        lines.push(fmtRowMain(r));
+        lines.push(fmtRowMeta(r));
+        if (r.secondaryNames && r.secondaryNames.length > 0) {
+          for (const sName of r.secondaryNames) {
+            lines.push(`  🔗 secondary: *${sName}*`);
+          }
         }
       }
-      rows.push({ hash, name, isAdmin: isAdminRow, isGroup, balance: u.balance || 0, lastSeen, linkedPrimary });
     }
-    rows.sort((a, b) =>
-      Number(b.isAdmin) - Number(a.isAdmin)
-      || Number(a.isGroup) - Number(b.isGroup)  // users above groups
-      || a.name.localeCompare(b.name)
-    );
-    const lines = [`👥 *Users* (${rows.length})`, ""];
-    if (rows.length === 0) lines.push("No users yet — share an /invite link.");
-    for (const r of rows) {
-      const badge = r.isAdmin ? " 👑" : (r.isGroup ? " 👥" : "");
-      if (r.linkedPrimary) {
-        // Bridged secondary — no wallet of its own, shows the bridge instead.
-        lines.push(`\`${r.hash}\` · ${r.name}${badge}`);
-        lines.push(`  🔗 routes into *${r.linkedPrimary}*`);
-      } else {
-        const balText = r.isAdmin ? "unlimited (admin)" : fmtGbp(r.balance);
-        lines.push(`\`${r.hash}\` · ${r.name}${badge}`);
-        lines.push(`  bal ${balText} · last ${r.lastSeen}`);
+    lines.push("");
+
+    // 🔗 Secondary groups — bridged, no wallet of their own, route
+    // into a primary. Listed separately so admin can scan "what's
+    // bridged into what" at a glance.
+    lines.push(`🔗 *Secondary groups (bridged)*  (${secondaryGroups.length})`);
+    if (secondaryGroups.length === 0) {
+      lines.push("  _none — use \`/connect-group <primary-hash>\` inside a group to bridge it_");
+    } else {
+      for (const r of secondaryGroups) {
+        lines.push(`\`${r.hash}\` · ${r.name}`);
+        lines.push(`  ↳ routes into *${r.primaryName}* · last ${r.lastSeen}`);
       }
     }
+
     try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch (e) { log(`/users reply failed: ${e}`); }
     try { await sock.readMessages([msg.key]); } catch {}
     return true;
@@ -4406,12 +4556,27 @@ async function connectWhatsApp() {
       let _isAdminTypingAsBot = false;
       if (msg.key.fromMe) {
         if (msg.key.id && selfSentIds.has(msg.key.id)) continue;
-        if (!rjid.endsWith("@g.us")) {
-          log(`fromMe-drop: non-group id=${msg.key.id} chat=${rjid}`);
+        // Self-chat: admin DMs the bot's own WhatsApp account from
+        // another device (the "Message yourself" feature, or DM-to-self
+        // from a linked desktop/web client). The chat_id can appear in
+        // either form depending on which client opened the chat:
+        //   - phone-number form: <PHONE>@s.whatsapp.net
+        //   - LID privacy form:  <bot-lid>@lid (whatever WhatsApp
+        //     assigned this account at pairing; visible as sock.user.lid)
+        // Treat exactly like fromMe-in-group: admin bypasses TOS and
+        // wallet, no trigger needed (DMs never need a trigger).
+        const _rjidUser = formatJid(rjid);
+        const _botLidUserPart = (sock?.user?.lid || "").split("@")[0].split(":")[0];
+        const isSelfChat = !rjid.endsWith("@g.us") && (
+          (!!PHONE && _rjidUser === String(PHONE))
+          || (!!_botLidUserPart && _rjidUser === _botLidUserPart)
+        );
+        if (!rjid.endsWith("@g.us") && !isSelfChat) {
+          log(`fromMe-drop: non-group non-self id=${msg.key.id} chat=${rjid}`);
           continue;
         }
         _isAdminTypingAsBot = true;
-        log(`fromMe-thru: group id=${msg.key.id} chat=${rjid} — admin typing from bot account`);
+        log(`fromMe-thru: ${isSelfChat ? "self-chat" : "group"} id=${msg.key.id} chat=${rjid} — admin typing from bot account`);
       }
       // Handle poll votes — match to pending permission polls
       if (msg.message.pollUpdateMessage) {
@@ -4510,6 +4675,13 @@ async function connectWhatsApp() {
       // Also run BEFORE the whitelist gate so the first /enable-group in a
       // fresh group can register it.
       if (jid.endsWith("@g.us")) {
+        // Tight dispatcher for /connect-group, /disconnect-group, and the
+        // connect-wizard digit replies. Kept separate from the broader
+        // handleGroupAdminCommands (which is just /enable-group, etc.)
+        // and from handleAdminUserCommands (which has DM-only commands
+        // we don't want leaking into group context).
+        const connectHandled = await handleGroupConnectCommands({ sock, msg, jid, participant });
+        if (connectHandled) continue;
         const groupAdminHandled = await handleGroupAdminCommands({ sock, msg, jid, participant });
         if (groupAdminHandled) continue;
       }
@@ -4573,7 +4745,14 @@ async function connectWhatsApp() {
         // @ai mention needed. The `/` prefix already says "this is a
         // command for the bot", matching every major chat product.
         const isSlashCommand = cleanText.trimStart().startsWith("/");
-        const isDirectMode = (access.directGroups || []).includes(jid);
+        // Bridged secondaries are implicitly /direct on — admin and
+        // staff in the secondary shouldn't have to @ai every message,
+        // since the whole purpose of bridging is "this room talks to
+        // the primary's bot". Without this, "Which step are we on?"
+        // typed in a secondary gets dropped because it has no trigger
+        // word, and admin would never get a reply.
+        const isBridgedSecondaryForTrigger = !!(access.groupLinks || {})[jid];
+        const isDirectMode = isBridgedSecondaryForTrigger || (access.directGroups || []).includes(jid);
         // Phase 1 quote-to-act used to let an admin's quote-reply to ANY
         // message (not just the bot's) act as an explicit invocation.
         // That made admin chitchat with other group members noisy: a
