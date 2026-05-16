@@ -463,6 +463,62 @@ const HEALTHY_THRESHOLD = 60 * 1000;
 // to know who to reply to). A secondary maps to exactly one primary;
 // a primary can have many secondaries (1:N).
 function defaultAccess() { return { allowFrom: [], allowGroups: false, allowedGroups: [], requireAllowFromInGroups: false, groupTrigger: "", groupLinks: {} }; }
+
+// Slash commands this bot recognises. In group chats the trigger
+// gate treats `/foo …` as a self-addressed trigger ONLY when `foo`
+// is in this set — otherwise the message is assumed to be intended
+// for a different bot sharing the group, and silently passes through
+// to the next gate (which usually drops it).
+//
+// Without this filter, ANY message starting with `/` triggered the
+// bot, because admin's fromMe-in-group messages bypass the
+// allowedGroups gate. So e.g. typing `/start` for some other bot in
+// a multi-bot group would also fire this bot, surprising the admin
+// with a session spawn in a group they never `/enable-group`d.
+//
+// DMs are NOT affected by this filter — the trigger gate only runs
+// for group messages. In DMs, the slash dispatcher handlers
+// (handleAdminUserCommands, handleInviteCommands, etc.) match by
+// regex on their own and emit informative replies for unknown
+// commands. BLOCKED_COMMANDS (/login, /logout, /doctor, …) are
+// likewise still warned on in DMs because they bypass this gate.
+//
+// MAINTENANCE: when you add a new slash command, also add the
+// root token here (no trailing args; lowercase; include the leading
+// slash). Missing entries silently no-op in groups. To audit:
+//   grep -oE '"\\\/[a-z-]+"' gateway.cjs lib/channel-slash.cjs | sort -u
+const OWN_SLASH_COMMANDS = new Set([
+  // User commands
+  "/help", "/balance", "/topup", "/redeem", "/receipts",
+  "/cckey", "/usage", "/domain", "/model", "/about",
+  "/clear", "/compact", "/cancel", "/invite",
+  // Admin user-management
+  "/users", "/rename", "/code-create",
+  "/disable", "/enable", "/disabled",
+  // Admin host/session
+  "/admin", "/sysinfo", "/nosleep", "/sleep", "/ramcap",
+  // Group bridging (typed inside groups)
+  "/connect-group", "/disconnect-group", "/connections",
+  // Group admin (typed inside groups)
+  "/enable-group", "/disable-group", "/trigger", "/group-token", "/direct",
+]);
+
+// Returns true iff `text` looks like a self-addressed slash command.
+// Extracts the first whitespace-delimited token, lowercases it,
+// strips any `@bot-suffix` rejection (see below), and looks it up in
+// OWN_SLASH_COMMANDS.
+//
+// Cross-bot disambiguation: Telegram (and some bridges) use
+// `/help@somebot` to explicitly target a specific bot. WhatsApp
+// doesn't bind us to a username, so any `@`-suffix on the command
+// token means "addressed to a specific OTHER bot" — refuse to fire
+// regardless of whether the root command is one of ours.
+function isOwnSlashCommand(text) {
+  const head = String(text || "").trimStart().split(/\s+/)[0].toLowerCase();
+  if (!head.startsWith("/")) return false;
+  if (head.includes("@")) return false;
+  return OWN_SLASH_COMMANDS.has(head);
+}
 function loadAccess() {
   try { return { ...defaultAccess(), ...JSON.parse(fs.readFileSync(ACCESS_FILE, "utf8")) }; }
   catch (err) { if (err.code === "ENOENT") return defaultAccess(); try { fs.renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`); } catch {} return defaultAccess(); }
@@ -3575,6 +3631,17 @@ function ensureProjectUser(userId, userJid) {
     fs.symlinkSync(adminGstack, userGstack);
     try { execFileSync("chmod", ["-R", "o+rX", adminGstack]); } catch {}
   }
+  // Share admin's slash commands so /ccm and any other admin-defined
+  // commands are usable from every isolation user's claude session.
+  // Symlinked because command files are plain markdown that Claude
+  // Code reads on session start — no per-file sync needed (unlike
+  // SKILL.md which has its own quirk).
+  const adminCommands = path.join(os.homedir(), ".claude", "commands");
+  const userCommands = path.join(claudeDir, "commands");
+  if (fs.existsSync(adminCommands) && !fs.existsSync(userCommands)) {
+    fs.symlinkSync(adminCommands, userCommands);
+    try { execFileSync("chmod", ["-R", "o+rX", adminCommands]); } catch {}
+  }
   // Copy skill SKILL.md files (Claude Code won't follow symlinked SKILL.md).
   // syncAdminSkills handles both initial copy and subsequent updates.
   syncAdminSkills(claudeDir, username);
@@ -4500,6 +4567,12 @@ function spawnUserSession(userId, userJid) {
     '"Bash(docker:*)"', '"Bash(ssh:*)"', '"Bash(scp:*)"',
     '"Bash(make:*)"', '"Bash(gcc:*)"', '"Bash(cargo:*)"', '"Bash(go:*)"',
     '"Bash(gh:*)"',
+    // ccm-back: detach the user's tmux client so they return to the
+    // ccm menu without killing this session. Backs the /ccm slash
+    // command. Safe because the wrapper script (at /usr/local/bin/
+    // ccm-back) only runs `tmux detach-client -s <current session>` —
+    // no destructive ops, no session-kill.
+    '"Bash(ccm-back:*)"',
   ].join(" ");
   let envPreamble;
   if (ISOLATION && !isAdmin) {
@@ -5153,9 +5226,13 @@ async function connectWhatsApp() {
         // Check if replying to a message from the bot
         const isReplyToBot = !!quotedCtx.stanzaId && isBotJid(quotedCtx.participant);
         // Slash commands ("/help", "/usage", …) are self-declaring — no
-        // @ai mention needed. The `/` prefix already says "this is a
-        // command for the bot", matching every major chat product.
-        const isSlashCommand = cleanText.trimStart().startsWith("/");
+        // @ai mention needed. The `/` prefix says "this is a command
+        // for A bot", matching every major chat product — but in
+        // multi-bot groups not every `/foo` is for US. Narrow the
+        // trigger to commands this bot actually owns (see
+        // OWN_SLASH_COMMANDS near defaultAccess); foreign-bot
+        // commands like `/start` pass through without firing us.
+        const isSlashCommand = isOwnSlashCommand(cleanText);
         // Bridged secondaries are implicitly /direct on — admin and
         // staff in the secondary shouldn't have to @ai every message,
         // since the whole purpose of bridging is "this room talks to
