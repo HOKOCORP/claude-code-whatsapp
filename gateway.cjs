@@ -5357,16 +5357,39 @@ async function connectWhatsApp() {
         const _gateUserId = sanitizeUserId(_gateChatJid);
         const _gate = checkUserLimit(_gateUserId);
         if (!_gate.allowed) {
-          if (!jid.endsWith("@g.us")) {
-            const reply = _gate.reason === "blocked"
-              ? "🔒 *Access restricted*\n\nThis account is currently blocked. Contact the admin if you need access."
-              : `💰 *Top up to continue*\n\n`
-                + `Your balance is ${fmtGbp(_gate.balance)}. A minimum of ${fmtGbp(_gate.minBalance)} is required to send messages.\n\n`
-                + `To top up:\n`
-                + `  • Reply with \`/redeem <CODE>\` if you have a top-up code\n`
-                + `  • Or contact the admin\n\n`
-                + `Pricing is in £ — same number as the underlying API cost in USD, with a 2× markup on the shared key. Bring your own Anthropic API key for a 1× service fee instead.`;
-            try { await sock.sendMessage(jid, { text: reply }); } catch {}
+          const isGroupChat = jid.endsWith("@g.us");
+          const blockReply = _gate.reason === "blocked"
+            ? "🔒 *Access restricted*\n\nThis account is currently blocked. Contact the admin if you need access."
+            : `💰 *Top up to continue*\n\n`
+              + `Balance is ${fmtGbp(_gate.balance)}. A minimum of ${fmtGbp(_gate.minBalance)} is required to send messages.\n\n`
+              + `To top up:\n`
+              + `  • Reply with \`/redeem <CODE>\` if you have a top-up code\n`
+              + `  • Or contact the admin\n\n`
+              + `Pricing is in £ — same number as the underlying API cost in USD, with a 2× markup on the shared key. Bring your own Anthropic API key for a 1× service fee instead.`;
+          if (!isGroupChat) {
+            // DMs: always inform the sender — there's exactly one
+            // recipient and they need to know why their message
+            // didn't get a reply.
+            try { await sock.sendMessage(jid, { text: blockReply }); } catch {}
+          } else {
+            // Groups: throttle to once per 24h, keyed on the WALLET
+            // owner (the group itself, or the primary if bridged).
+            // Without this, every group member triggers the bot to
+            // re-explain the balance shortfall, flooding the room.
+            // With it, the group sees the notice once per day until
+            // admin tops up — enough visibility to debug "why isn't
+            // the bot responding?" without spam.
+            const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+            const _walletUsage = loadUserUsage(_gateUserId);
+            const _noticeField = _gate.reason === "blocked"
+              ? "last_blocked_notice_at"
+              : "last_low_balance_notice_at";
+            const lastNotice = Date.parse(_walletUsage[_noticeField] || "") || 0;
+            if (Date.now() - lastNotice > ONE_DAY_MS) {
+              try { await sock.sendMessage(jid, { text: blockReply }); } catch {}
+              _walletUsage[_noticeField] = new Date().toISOString();
+              saveUserUsage(_gateUserId, _walletUsage);
+            }
           }
           log(`gate: blocked sender=${formatJid(_senderJid)} chat=${formatJid(jid)} reason=${_gate.reason} balance=${_gate.balance.toFixed(2)} mode=${_gate.mode}`);
           continue;
