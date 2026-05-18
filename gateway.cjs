@@ -5271,8 +5271,35 @@ async function connectWhatsApp() {
         );
         const isTosAgree = /^(i\s+)?agree\.?$/i.test(cleanText.trim());
         const isTosAcceptance = tosSentToThisSender && isTosAgree;
-        if (!isDirectMode && !isSlashCommand && !mentioned && !prefixed && !containsTrigger && !isReplyToBot && !isAdminQuoteReply && !isTosAcceptance) {
-          continue;
+
+        // Trigger gate.
+        //
+        // In allowed groups (run /enable-group at least once) any of
+        // the trigger signals fires the bot: /direct, slash, @ai
+        // mention, trigger word, quote-reply to bot, TOS acceptance.
+        //
+        // In groups the admin hasn't enabled, only slash commands
+        // fire. Reason: admin's fromMe-in-group messages bypass the
+        // allowedGroups gate (line 5100) so otherwise EVERY trigger
+        // signal in EVERY group the bot is in would fire — a
+        // quote-reply to a bot message from days ago, an @ai typed
+        // for some other purpose, an "agree" said in chat. Admin
+        // reported the bot replying in groups they explicitly chose
+        // not to enable; this scope-limits the surprise to commands
+        // that are unambiguously self-addressed (/foo where foo is
+        // one of OWN_SLASH_COMMANDS, see isOwnSlashCommand). The
+        // bootstrap path stays intact because /enable-group is one
+        // of those commands AND is handled by handleGroupAdminCommands
+        // upstream (line 5083) before this gate even runs.
+        const isAllowedGroup = (access.allowedGroups || []).includes(jid);
+        if (isAllowedGroup) {
+          if (!isDirectMode && !isSlashCommand && !mentioned && !prefixed && !containsTrigger && !isReplyToBot && !isAdminQuoteReply && !isTosAcceptance) {
+            continue;
+          }
+        } else {
+          if (!isSlashCommand) {
+            continue;
+          }
         }
       }
 
