@@ -1416,7 +1416,18 @@ async function handleInviteCommands({ sock, msg, jid }) {
       try { await sock.sendMessage(jid, { text: `❌ Single top-up capped at ${fmtGbp(MAX_TOPUP)}. Run multiple top-ups if you need more.` }); } catch {}
       return true;
     }
-    const MIN_TOPUP = 1;
+    // STRIPE_MIN_TOPUP_GBP gates the smallest top-up the operator will
+    // accept. Three reasons it exists:
+    //   1. Stripe's own GBP charge minimum is ~£0.30. Anything below
+    //      that fails at Stripe with a confusing error.
+    //   2. Fee economics — Stripe takes ~£0.20 + 1.5% per UK card
+    //      payment, so a £0.50 top-up is mostly fees, no service value.
+    //   3. Anti-confusion — if min_balance is £10 and user tops up £1,
+    //      they're still blocked. Setting MIN_TOPUP >= min_balance
+    //      means a single top-up actually unblocks the user.
+    // Defaults to £1 (preserves prior behaviour). Operator should raise
+    // to ≥ HARD_FLOOR_GBP / min_balance for the cleanest UX.
+    const MIN_TOPUP = Number(process.env.STRIPE_MIN_TOPUP_GBP) || 1;
     if (amount < MIN_TOPUP) {
       try { await sock.sendMessage(jid, { text: `❌ Minimum top-up is ${fmtGbp(MIN_TOPUP)}.` }); } catch {}
       return true;
