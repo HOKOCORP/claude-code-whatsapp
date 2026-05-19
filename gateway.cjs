@@ -187,6 +187,20 @@ function calcCallCost(usage, model) {
   return (inp * p.input + out * p.output + c5m * p.cache_5m + c1h * p.cache_1h + cr * p.cache_read) / 1e6;
 }
 
+// Lower bound on any min_balance setting (global or per-user). Below
+// this, a single heavy tool-use turn (typical £0.05–0.50, can spike
+// to £2–5 on large contexts with many tool calls) could overshoot
+// the entire wallet — the system charges AFTER the API call, so the
+// floor is the only protection against the user going hard-negative
+// and us absorbing the cost. £5 leaves headroom for a chunky turn
+// without being so high it's annoying for casual users. Override
+// per-host with HARD_FLOOR_GBP in ~/.env (e.g. "0" for trusted
+// internal-only deployments where the operator absorbs overshoot).
+const HARD_FLOOR_GBP = (() => {
+  const v = parseFloat(process.env.HARD_FLOOR_GBP);
+  return Number.isFinite(v) && v >= 0 ? v : 5.00;
+})();
+
 function loadUsageConfig() {
   try {
     const cfg = JSON.parse(fs.readFileSync(USAGE_LIMITS_FILE, "utf8"));
@@ -414,7 +428,14 @@ function checkUserLimit(userId) {
   const config = loadUsageConfig();
   const balance = usage.balance || 0;
   const warnAt = config.warn_balance;
-  const minBalance = config.min_balance;
+  // Per-user min override clamps against HARD_FLOOR_GBP so admin
+  // can't accidentally set a floor below the runaway-overshoot
+  // protection threshold. Fall back to the global default when no
+  // override is set. Stored as a number in usage.min_balance.
+  const userOverride = typeof usage.min_balance === "number" && Number.isFinite(usage.min_balance)
+    ? Math.max(HARD_FLOOR_GBP, usage.min_balance)
+    : null;
+  const minBalance = userOverride ?? config.min_balance;
   const mode = usage.mode || "api-shared";
 
   // Admin is unmetered — still track cost but never block. Multi-admin
@@ -496,7 +517,7 @@ const OWN_SLASH_COMMANDS = new Set([
   "/users", "/rename", "/code-create",
   "/disable", "/enable", "/disabled",
   // Admin host/session
-  "/admin", "/sysinfo", "/nosleep", "/sleep", "/ramcap",
+  "/admin", "/sysinfo", "/nosleep", "/sleep", "/ramcap", "/minbalance",
   // Group bridging (typed inside groups)
   "/connect-group", "/disconnect-group", "/connections",
   // Group admin (typed inside groups)
@@ -2186,6 +2207,7 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
   );
   const isNosleepCmd = lower === "/nosleep" || /^\/nosleep\s+/i.test(rawText);
   const isSleepCmd = lower === "/sleep" || /^\/sleep\s+/i.test(rawText);
+  const isMinBalanceCmd = lower === "/minbalance" || /^\/minbalance\s+/i.test(rawText);
   const isDisableCmd = /^\/disable\s+/i.test(rawText);
   const isEnableCmd = /^\/enable\s+/i.test(rawText);
   const isDisabledListCmd = lower === "/disabled";
@@ -2214,6 +2236,7 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
       && !isTopupWizardReply
       && !isNosleepCmd
       && !isSleepCmd
+      && !isMinBalanceCmd
       && !isDisableCmd
       && !isEnableCmd
       && !isDisabledListCmd
@@ -2614,6 +2637,125 @@ async function handleAdminUserCommands({ sock, msg, jid }) {
     if (wasPinned) parts.push("📌→💤 unpinned");
     parts.push(killed ? "🧊 hibernated" : "🧊 already cold");
     try { await sock.sendMessage(jid, { text: `${parts.join(" · ")} *${displayName}*. Next message will spawn a fresh session via \`claude --continue\`.` }); } catch {}
+    return true;
+  }
+
+  // ── /minbalance — view/set min-balance floor (global + per-user)
+  // Usage:
+  //   /minbalance                        — list global + per-user overrides
+  //   /minbalance global <amount>        — change global floor
+  //   /minbalance HASH <amount>          — set per-user override (≥ HARD_FLOOR_GBP)
+  //   /minbalance HASH default           — clear per-user override
+  // Per-user overrides clamp against HARD_FLOOR_GBP (see checkUserLimit)
+  // so admin can't accidentally drop a single user below the runaway-
+  // overshoot protection threshold. Set HARD_FLOOR_GBP=0 in ~/.env if
+  // you really need to allow zero (internal deployments only).
+  if (isMinBalanceCmd) {
+    try { await sock.readMessages([msg.key]); } catch {}
+    const globalMatch = /^\/minbalance\s+global\s+(\S+)\s*$/i.exec(rawText);
+    const userMatch   = /^\/minbalance\s+(\S+)\s+(\S+)\s*$/i.exec(rawText);
+    const bareMatch   = /^\/minbalance\s*$/i.test(rawText);
+
+    if (bareMatch) {
+      const cfg = loadUsageConfig();
+      let entries = [];
+      try { entries = fs.readdirSync(USERS_DIR); } catch {}
+      const overrides = [];
+      for (const uid of entries) {
+        const u = loadUserUsage(uid);
+        if (typeof u.min_balance !== "number") continue;
+        let meta = {};
+        try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, uid, "meta.json"), "utf8")); } catch { continue; }
+        const hash = displayHashFor(uid, meta);
+        const name = meta.name || meta.pushName || formatJid(meta.jid || uid);
+        const effective = Math.max(HARD_FLOOR_GBP, u.min_balance);
+        overrides.push(`\`${hash}\` · ${name}${meta.isGroup ? " 👥" : ""} → ${fmtGbp(effective)}${effective !== u.min_balance ? ` _(clamped from ${fmtGbp(u.min_balance)})_` : ""}`);
+      }
+      const lines = [
+        `💰 *Balance limits*`,
+        ``,
+        `Global default: ${fmtGbp(cfg.min_balance)}`,
+        `Hard floor: ${fmtGbp(HARD_FLOOR_GBP)} (override per-host: HARD_FLOOR_GBP in ~/.env)`,
+        ``,
+        `*Per-user overrides* (${overrides.length})`,
+      ];
+      if (overrides.length === 0) lines.push(`_none — all users use the global default_`);
+      else lines.push(...overrides);
+      lines.push(``, `Set global: \`/minbalance global <amount>\``);
+      lines.push(`Set per-user: \`/minbalance <hash> <amount>\``);
+      lines.push(`Clear per-user override: \`/minbalance <hash> default\``);
+      try { await sock.sendMessage(jid, { text: lines.join("\n") }); } catch {}
+      return true;
+    }
+
+    if (globalMatch) {
+      const amt = Number(globalMatch[1]);
+      if (!Number.isFinite(amt) || amt < 0) {
+        try { await sock.sendMessage(jid, { text: `❌ Amount must be a non-negative number.` }); } catch {}
+        return true;
+      }
+      if (amt < HARD_FLOOR_GBP) {
+        try { await sock.sendMessage(jid, { text: `❌ Minimum allowed is ${fmtGbp(HARD_FLOOR_GBP)}. Lower would risk overshoot on a single tool-use turn. Set \`HARD_FLOOR_GBP\` in \`~/.env\` to override.` }); } catch {}
+        return true;
+      }
+      // Merge into existing limits.json (preserve warn_balance).
+      let cfg = {};
+      try { cfg = JSON.parse(fs.readFileSync(USAGE_LIMITS_FILE, "utf8")); } catch {}
+      cfg.min_balance = amt;
+      try { fs.mkdirSync(path.dirname(USAGE_LIMITS_FILE), { recursive: true }); } catch {}
+      fs.writeFileSync(USAGE_LIMITS_FILE, JSON.stringify(cfg, null, 2) + "\n");
+      log(`minbalance: global → ${fmtGbp(amt)} by ${formatJid(jid)}`);
+      try { await sock.sendMessage(jid, { text: `✅ Global minimum balance set to ${fmtGbp(amt)}. Users without per-user overrides will now need at least this much to send messages.` }); } catch {}
+      return true;
+    }
+
+    if (userMatch) {
+      const hash = userMatch[1];
+      const valueArg = userMatch[2].toLowerCase();
+      const target = findUserByHashPrefix(hash);
+      if (!target) {
+        try { await sock.sendMessage(jid, { text: `❌ No unique user matched \`${hash}\`. Use 4+ chars from /users.` }); } catch {}
+        return true;
+      }
+      const u = loadUserUsage(target.userId);
+      let meta = {}; try { meta = JSON.parse(fs.readFileSync(path.join(USERS_DIR, target.userId, "meta.json"), "utf8")); } catch {}
+      const displayName = meta.name || meta.pushName || formatJid(meta.jid || target.userId);
+      if (valueArg === "default" || valueArg === "clear" || valueArg === "reset") {
+        if (typeof u.min_balance !== "number") {
+          try { await sock.sendMessage(jid, { text: `ℹ️ *${displayName}* already uses the global default.` }); } catch {}
+          return true;
+        }
+        delete u.min_balance;
+        saveUserUsage(target.userId, u);
+        const cfg = loadUsageConfig();
+        log(`minbalance: ${target.username || target.userId} → default by ${formatJid(jid)}`);
+        try { await sock.sendMessage(jid, { text: `✅ Cleared per-user override for *${displayName}*. Now uses global default ${fmtGbp(cfg.min_balance)}.` }); } catch {}
+        return true;
+      }
+      const amt = Number(valueArg);
+      if (!Number.isFinite(amt) || amt < 0) {
+        try { await sock.sendMessage(jid, { text: `❌ Amount must be a non-negative number, or \`default\` to clear the override.` }); } catch {}
+        return true;
+      }
+      if (amt < HARD_FLOOR_GBP) {
+        try { await sock.sendMessage(jid, { text: `❌ Minimum allowed is ${fmtGbp(HARD_FLOOR_GBP)}. Lower would risk overshoot on a single tool-use turn. Set \`HARD_FLOOR_GBP\` in \`~/.env\` to override.` }); } catch {}
+        return true;
+      }
+      u.min_balance = amt;
+      saveUserUsage(target.userId, u);
+      log(`minbalance: ${target.username || target.userId} → ${fmtGbp(amt)} by ${formatJid(jid)}`);
+      try { await sock.sendMessage(jid, { text: `✅ Per-user minimum for *${displayName}* set to ${fmtGbp(amt)}.` }); } catch {}
+      return true;
+    }
+
+    try { await sock.sendMessage(jid, { text:
+      `Usage:\n`
+      + `  \`/minbalance\` — list global + per-user overrides\n`
+      + `  \`/minbalance global <amount>\` — change global floor\n`
+      + `  \`/minbalance <hash> <amount>\` — set per-user override\n`
+      + `  \`/minbalance <hash> default\` — clear per-user override\n\n`
+      + `Hard floor: ${fmtGbp(HARD_FLOOR_GBP)} (no setting below this).`
+    }); } catch {}
     return true;
   }
 
